@@ -1,0 +1,42 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Model weights & checkpoints (large binary artifacts)
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.pth
+*.onnx
+
+# Release binary copied to repo root by build.ps1
+/veloxc.exe
+
+# Native build artifacts from emitted C99/CUDA
+*.obj
+*.o
+*.exe
+*.exp
+*.lib
+*.pdb
+*.ilk
+
+# Python caches / virtual environments (research scripts only)
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.mypy_cache/
+
+# Benchmark & GPU harness outputs
+/bench/results/raw/
+/gpu/build/
+
+# Local environment
+.env
+.vscode/
+.idea/
+
+# Multi-agent orchestration scratch state
+/.agents/

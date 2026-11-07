@@ -1,0 +1,179 @@
+// ============================================================================
+// Velox Reference Model: Nanbeige-4.3-33B High-Throughput Dense Architecture
+// File: examples/nanbeige_33b.vlx
+// Target Hardware: 4x NVIDIA H100 Node (320 GiB aggregate HBM3 VRAM, TP=4)
+// ============================================================================
+
+target hardware {
+    device: "nvidia_h100_node";
+    vram_capacity: 320 * GiB;
+    compute_capability: 9.0;
+    safety_factor: 0.95;
+}
+
+model Nanbeige_33B<
+    const B_MAX: usize = 4,
+    const S_MAX: usize = 65536,
+    const VOCAB: usize = 156992,
+    const HIDDEN_DIM: usize = 6144,
+    const INTERMEDIATE_DIM: usize = 16384,
+    const NUM_LAYERS: usize = 60,
+    const NUM_HEADS: usize = 48,
+    const NUM_KV_HEADS: usize = 8,
+    const HEAD_DIM: usize = 128,
+    const TP: usize = 4
+> {
+    // Model Weights (Sharded across TP=4)
+    @vram_immutable weight w_embed: Tensor<[VOCAB, HIDDEN_DIM], f16> = 
+        safetensors("nanbeige-33b.safetensors", "model.embed_tokens.weight");
+
+    @vram_immutable weight w_q: Tensor<[NUM_LAYERS, HIDDEN_DIM, 6144 / TP], f16> = 
+        safetensors("nanbeige-33b.safetensors", "model.layers.self_attn.q_proj.weight");
+    @vram_immutable weight w_k: Tensor<[NUM_LAYERS, HIDDEN_DIM, 1024 / TP], f16> = 
+        safetensors("nanbeige-33b.safetensors", "model.layers.self_attn.k_proj.weight");
+    @vram_immutable weight w_v: Tensor<[NUM_LAYERS, HIDDEN_DIM, 1024 / TP], f16> = 
+        safetensors("nanbeige-33b.safetensors", "model.layers.self_attn.v_proj.weight");
+    @vram_immutable weight w_o: Tensor<[NUM_LAYERS, 6144 / TP, HIDDEN_DIM], f16> = 
+        safetensors("nanbeige-33b.safetensors", "model.layers.self_attn.o_proj.weight");
+
+    @vram_immutable weight w_gate: Tensor<[NUM_LAYERS, HIDDEN_DIM, INTERMEDIATE_DIM / TP], f16> = 
+        safetensors("nanbeige-33b.safetensors", "model.layers.mlp.gate_proj.weight");
+    @vram_immutable weight w_up: Tensor<[NUM_LAYERS, HIDDEN_DIM, INTERMEDIATE_DIM / TP], f16> = 
+        safetensors("nanbeige-33b.safetensors", "model.layers.mlp.up_proj.weight");
+    @vram_immutable weight w_down: Tensor<[NUM_LAYERS, INTERMEDIATE_DIM / TP, HIDDEN_DIM], f16> = 
+        safetensors("nanbeige-33b.safetensors", "model.layers.mlp.down_proj.weight");
+
+    @vram_immutable weight w_input_norm: Tensor<[NUM_LAYERS, HIDDEN_DIM], f16> = 
+        safetensors("nanbeige-33b.safetensors", "model.layers.input_layernorm.weight");
+    @vram_immutable weight w_post_norm: Tensor<[NUM_LAYERS, HIDDEN_DIM], f16> = 
+        safetensors("nanbeige-33b.safetensors", "model.layers.post_attention_layernorm.weight");
+    @vram_immutable weight w_norm: Tensor<[HIDDEN_DIM], f16> = 
+        safetensors("nanbeige-33b.safetensors", "model.norm.weight");
+    @vram_immutable weight w_head: Tensor<[HIDDEN_DIM, VOCAB], f16> = 
+        safetensors("nanbeige-33b.safetensors", "lm_head.weight");
+
+    // Native Virtual Memory Key-Value Cache (Low-Level CUDA VMM 2MB Physical Pages)
+    let mut kv_vmm: VirtualContiguousKV<NUM_LAYERS, NUM_KV_HEADS / TP, HEAD_DIM, S_MAX, f16>;
+
+    // Speculative Tree Drafting State Block
+    let mut tree_block: SpeculativeTreeBlock<64, 6, HEAD_DIM, f16>;
+
+    // Pipeline 1: Full Sequence Prefill
+    scope prefill<const B: usize, const S: usize>(
+        tokens: Tensor<[B, S], u32>
+    ) -> Tensor<[B, 1], u32> {
+        let mut h = embed(tokens, w_embed);
+
+        for l in 0..NUM_LAYERS {
+            let norm_x = rmsnorm(h, w_input_norm[l]);
+            let q = norm_x @ w_q[l];
+            let k = norm_x @ w_k[l];
+            let v = norm_x @ w_v[l];
+
+            let attn_context = flash_prefill(q, k, v, &mut kv_vmm, l);
+            h += attn_context @ w_o[l];
+
+            let mlp_norm = rmsnorm(h, w_post_norm[l]);
+            h += swiglu(mlp_norm, w_gate[l], w_up[l], w_down[l]);
+        }
+
+        let out_norm = rmsnorm(h, w_norm);
+        let logits = out_norm[:, S - 1, :] @ w_head;
+        return sample_argmax(logits);
+    }
+
+    // Pipeline 2: Interleaved Chunked Prefill (Sarathi-Serve)
+    scope chunked_prefill<const CHUNK_SIZE: usize = 512, const B_DEC: usize = 16>(
+        chunk_tokens: Tensor<[1, CHUNK_SIZE], u32>,
+        decode_tokens: Tensor<[B_DEC, 1], u32>
+    ) -> (Tensor<[1, 1], u32>, Tensor<[B_DEC, 1], u32>) {
+        // Compute chunked prefill GEMM piggybacked with batch decode GEMV
+        let h_chunk = embed(chunk_tokens, w_embed);
+        let h_decode = embed(decode_tokens, w_embed);
+
+        for l in 0..NUM_LAYERS {
+            let norm_chunk = rmsnorm(h_chunk, w_input_norm[l]);
+            let norm_decode = rmsnorm(h_decode, w_input_norm[l]);
+
+            let q_c = norm_chunk @ w_q[l];
+            let k_c = norm_chunk @ w_k[l];
+            let v_c = norm_chunk @ w_v[l];
+
+            let q_d = norm_decode @ w_q[l];
+
+            // Fused kernel evaluates chunk prefill and decode attention simultaneously
+            let (attn_c, attn_d) = flash_chunked_piggyback(q_c, k_c, v_c, q_d, &mut kv_vmm, l);
+            h_chunk += attn_c @ w_o[l];
+            h_decode += attn_d @ w_o[l];
+
+            let mlp_c = rmsnorm(h_chunk, w_post_norm[l]);
+            let mlp_d = rmsnorm(h_decode, w_post_norm[l]);
+            h_chunk += swiglu(mlp_c, w_gate[l], w_up[l], w_down[l]);
+            h_decode += swiglu(mlp_d, w_gate[l], w_up[l], w_down[l]);
+        }
+
+        let next_chunk_token = sample_argmax(rmsnorm(h_chunk, w_norm)[:, CHUNK_SIZE - 1, :] @ w_head);
+        let next_dec_tokens = sample_argmax(rmsnorm(h_decode, w_norm) @ w_head);
+        return (next_chunk_token, next_dec_tokens);
+    }
+
+    // Pipeline 3: Standard Single-Token Decode
+    scope decode<const B: usize>(
+        next_token: Tensor<[B, 1], u32>,
+        step: usize
+    ) -> Tensor<[B, 1], u32> {
+        let mut h = embed(next_token, w_embed);
+
+        for l in 0..NUM_LAYERS {
+            let norm_x = rmsnorm(h, w_input_norm[l]);
+            let q = norm_x @ w_q[l];
+            let k = norm_x @ w_k[l];
+            let v = norm_x @ w_v[l];
+
+            let mut slot = kv_vmm.borrow_slot_mut(0, step);
+            slot.write(l, k, v);
+
+            let attn_context = flash_decode(q, &kv_vmm, l);
+            h += attn_context @ w_o[l];
+
+            let mlp_norm = rmsnorm(h, w_post_norm[l]);
+            h += swiglu(mlp_norm, w_gate[l], w_up[l], w_down[l]);
+        }
+
+        let out_norm = rmsnorm(h, w_norm);
+        let logits = out_norm @ w_head;
+        return sample_argmax(logits);
+    }
+
+    // Pipeline 4: Speculative Tree Verification (SpecInfer / EAGLE-2)
+    scope speculative_verify(
+        seq_id: usize,
+        tree: &mut SpeculativeTreeBlock<64, 6, HEAD_DIM, f16>
+    ) -> SpeculativePath<6> {
+        // Synthesize 2D Non-Causal Attention Mask from Candidate DAG
+        let tree_mask = tree.synthesize_tree_mask();
+        let candidate_tokens = tree.get_candidate_tokens();
+        let mut h = embed(candidate_tokens, w_embed);
+
+        for l in 0..NUM_LAYERS {
+            let norm_x = rmsnorm(h, w_input_norm[l]);
+            let q = norm_x @ w_q[l];
+            let k = norm_x @ w_k[l];
+            let v = norm_x @ w_v[l];
+
+            // Evaluate non-causal tree attention across all candidate branches
+            let attn_tree = flash_tree_attention(q, k, v, tree_mask, &kv_vmm, l);
+            h += attn_tree @ w_o[l];
+
+            let mlp_norm = rmsnorm(h, w_post_norm[l]);
+            h += swiglu(mlp_norm, w_gate[l], w_up[l], w_down[l]);
+        }
+
+        let verification_logits = rmsnorm(h, w_norm) @ w_head;
+        let accepted_path = tree.resolve_best_path(verification_logits);
+
+        // Commit accepted candidate tokens into authoritative KV cache (O(L) path compaction)
+        tree.commit_accepted_path(&mut kv_vmm, accepted_path);
+        return accepted_path;
+    }
+}

@@ -1,0 +1,154 @@
+// ============================================================================
+// Velox Reference Model: DeepSeek-V3 Multi-Head Latent Attention (MLA) & MoE
+// File: examples/deepseek_v3_mla.vlx
+// Target Hardware: 16x NVIDIA H100 SXM5 Cluster (1280 GiB HBM3 VRAM, EP=16, TP=2)
+// ============================================================================
+
+target hardware {
+    device: "nvidia_h100_sxm5_cluster";
+    vram_capacity: 1280 * GiB;
+    compute_capability: 9.0;
+    safety_factor: 0.95;
+}
+
+model DeepSeek_V3_MLA<
+    const B_MAX: usize = 32,
+    const S_MAX: usize = 8192,
+    const VOCAB: usize = 129280,
+    const HIDDEN_DIM: usize = 7168,
+    const NUM_LAYERS: usize = 61,
+    const NUM_HEADS: usize = 128,
+    const HEAD_DIM: usize = 128,
+    const LATENT_KV_DIM: usize = 512,
+    const ROPE_DIM: usize = 64,
+    const Q_LATENT_DIM: usize = 1536,
+    const NUM_ROUTED_EXPERTS: usize = 256,
+    const NUM_SHARED_EXPERTS: usize = 1,
+    const TOP_K: usize = 8,
+    const EXPERT_INTERMEDIATE_DIM: usize = 2048
+> {
+    // Model Weights (Native FP8 with Matrix Absorption)
+    @vram_immutable weight w_embed: Tensor<[VOCAB, HIDDEN_DIM], fp8_e4m3> = 
+        safetensors("deepseek-v3.safetensors", "model.embed_tokens.weight");
+
+    // MLA Projections
+    @vram_immutable weight w_dq: Tensor<[NUM_LAYERS, HIDDEN_DIM, Q_LATENT_DIM], fp8_e4m3> = 
+        safetensors("deepseek-v3.safetensors", "model.layers.self_attn.q_a_proj.weight");
+    @vram_immutable weight w_uq: Tensor<[NUM_LAYERS, Q_LATENT_DIM, NUM_HEADS * HEAD_DIM], fp8_e4m3> = 
+        safetensors("deepseek-v3.safetensors", "model.layers.self_attn.q_b_proj.weight");
+    @vram_immutable weight w_qr: Tensor<[NUM_LAYERS, Q_LATENT_DIM, NUM_HEADS * ROPE_DIM], fp8_e4m3> = 
+        safetensors("deepseek-v3.safetensors", "model.layers.self_attn.q_rope_proj.weight");
+
+    @vram_immutable weight w_dkv: Tensor<[NUM_LAYERS, HIDDEN_DIM, LATENT_KV_DIM], fp8_e4m3> = 
+        safetensors("deepseek-v3.safetensors", "model.layers.self_attn.kv_a_proj_with_mqa.weight");
+    @vram_immutable weight w_kr: Tensor<[NUM_LAYERS, HIDDEN_DIM, ROPE_DIM], fp8_e4m3> = 
+        safetensors("deepseek-v3.safetensors", "model.layers.self_attn.k_rope_proj.weight");
+    @vram_immutable weight w_uk: Tensor<[NUM_LAYERS, LATENT_KV_DIM, NUM_HEADS * HEAD_DIM], fp8_e4m3> = 
+        safetensors("deepseek-v3.safetensors", "model.layers.self_attn.k_b_proj.weight");
+    @vram_immutable weight w_uv: Tensor<[NUM_LAYERS, LATENT_KV_DIM, NUM_HEADS * HEAD_DIM], fp8_e4m3> = 
+        safetensors("deepseek-v3.safetensors", "model.layers.self_attn.v_b_proj.weight");
+    @vram_immutable weight w_o: Tensor<[NUM_LAYERS, NUM_HEADS * HEAD_DIM, HIDDEN_DIM], fp8_e4m3> = 
+        safetensors("deepseek-v3.safetensors", "model.layers.self_attn.o_proj.weight");
+
+    // Pre-Computed Absorbed Weights (Offline Matrix Absorption eliminates full KV decompression)
+    @vram_immutable weight w_absorbed_q: Tensor<[NUM_LAYERS, NUM_HEADS, LATENT_KV_DIM, HEAD_DIM], fp8_e4m3> = 
+        absorb_mla_q(w_uq, w_uk);
+    @vram_immutable weight w_absorbed_o: Tensor<[NUM_LAYERS, NUM_HEADS, HEAD_DIM, HIDDEN_DIM], fp8_e4m3> = 
+        absorb_mla_v(w_o, w_uv);
+
+    // MoE Routing Gate & Routed Expert Slices
+    @vram_immutable weight w_moe_gate: Tensor<[NUM_LAYERS, HIDDEN_DIM, NUM_ROUTED_EXPERTS], f32> = 
+        safetensors("deepseek-v3.safetensors", "model.layers.moe.gate.weight");
+    @vram_immutable weight w_routed_experts: Tensor<[NUM_LAYERS, NUM_ROUTED_EXPERTS, HIDDEN_DIM, EXPERT_INTERMEDIATE_DIM], fp8_e4m3> = 
+        safetensors("deepseek-v3.safetensors", "model.layers.moe.experts.weight");
+    @vram_immutable weight w_shared_expert: Tensor<[NUM_LAYERS, HIDDEN_DIM, EXPERT_INTERMEDIATE_DIM * 2], fp8_e4m3> = 
+        safetensors("deepseek-v3.safetensors", "model.layers.moe.shared_expert.weight");
+
+    // Normalizations & Head
+    @vram_immutable weight w_input_norm: Tensor<[NUM_LAYERS, HIDDEN_DIM], fp8_e4m3> = 
+        safetensors("deepseek-v3.safetensors", "model.layers.input_layernorm.weight");
+    @vram_immutable weight w_post_norm: Tensor<[NUM_LAYERS, HIDDEN_DIM], fp8_e4m3> = 
+        safetensors("deepseek-v3.safetensors", "model.layers.post_attention_layernorm.weight");
+    @vram_immutable weight w_norm: Tensor<[HIDDEN_DIM], fp8_e4m3> = 
+        safetensors("deepseek-v3.safetensors", "model.norm.weight");
+    @vram_immutable weight w_head: Tensor<[HIDDEN_DIM, VOCAB], fp8_e4m3> = 
+        safetensors("deepseek-v3.safetensors", "lm_head.weight");
+
+    // Native Compressed Latent Key-Value Cache Pool
+    let mut kv_latent: LatentKVCache<NUM_LAYERS, LATENT_KV_DIM, ROPE_DIM, fp8_e4m3>;
+
+    // Execution Pipeline: Prefill Phase
+    scope prefill<const B: usize, const S: usize>(
+        tokens: Tensor<[B, S], u32>
+    ) -> Tensor<[B, 1], u32> {
+        let mut h = embed(tokens, w_embed);
+
+        for l in 0..NUM_LAYERS {
+            let norm_x = rmsnorm(h, w_input_norm[l]);
+            
+            // MLA Latent Projections
+            let c_kv = norm_x @ w_dkv[l];
+            let k_r = norm_x @ w_kr[l];
+            let c_q = norm_x @ w_dq[l];
+            let q_c = c_q @ w_uq[l];
+            let q_r = c_q @ w_qr[l];
+
+            // Append compressed representation into Latent KV Pool
+            kv_latent.append_latent(0, S, c_kv, k_r);
+
+            // Compute attention
+            let attn_context = flash_prefill(q_c, c_kv, c_kv, &mut kv_latent, l);
+            h += attn_context @ w_o[l];
+
+            // MoE Block Routing
+            let mlp_norm = rmsnorm(h, w_post_norm[l]);
+            let (top_indices, top_weights) = moe_gate_topk(mlp_norm, w_moe_gate[l]);
+            
+            // Dynamic capacity-bounded expert routing (gamma_cap = 2.0)
+            let routed_out = moe_dispatch_topk(mlp_norm, top_indices, top_weights, w_routed_experts[l], capacity_factor = 2.0);
+            let shared_out = swiglu(mlp_norm, w_shared_expert[l]);
+            h += routed_out + shared_out;
+        }
+
+        let out_norm = rmsnorm(h, w_norm);
+        let logits = out_norm[:, S - 1, :] @ w_head;
+        return sample_argmax(logits);
+    }
+
+    // Execution Pipeline: Decode Phase with Offline Matrix Absorption
+    scope decode<const B: usize>(
+        next_token: Tensor<[B, 1], u32>,
+        step: usize
+    ) -> Tensor<[B, 1], u32> {
+        let mut h = embed(next_token, w_embed);
+
+        for l in 0..NUM_LAYERS {
+            let norm_x = rmsnorm(h, w_input_norm[l]);
+
+            // Decode projects directly into compressed latent space
+            let c_kv = norm_x @ w_dkv[l];
+            let k_r = norm_x @ w_kr[l];
+            let c_q = norm_x @ w_dq[l];
+            let q_r = c_q @ w_qr[l];
+
+            let mut slot = kv_latent.borrow_slot_mut(0, step);
+            slot.write(l, c_kv, k_r);
+
+            // Absorbed WGMMA attention: keys and values are NEVER decompressed into HBM!
+            let q_absorbed = c_q @ w_absorbed_q[l];
+            let attn_out = mla_decode_absorbed(q_absorbed, q_r, &kv_latent, l);
+            h += attn_out @ w_absorbed_o[l];
+
+            // MoE Dispatch
+            let mlp_norm = rmsnorm(h, w_post_norm[l]);
+            let (top_indices, top_weights) = moe_gate_topk(mlp_norm, w_moe_gate[l]);
+            let routed_out = moe_dispatch_topk(mlp_norm, top_indices, top_weights, w_routed_experts[l], capacity_factor = 2.0);
+            let shared_out = swiglu(mlp_norm, w_shared_expert[l]);
+            h += routed_out + shared_out;
+        }
+
+        let out_norm = rmsnorm(h, w_norm);
+        let logits = out_norm @ w_head;
+        return sample_argmax(logits);
+    }
+}

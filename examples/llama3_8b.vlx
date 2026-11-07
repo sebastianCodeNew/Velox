@@ -1,0 +1,108 @@
+// ============================================================================
+// Velox Reference Model: Meta Llama-3-8B Architecture
+// File: examples/llama3_8b.vlx
+// Target Hardware: NVIDIA A100-SXM4-80GB (80 GiB HBM2e VRAM)
+// ============================================================================
+
+target hardware {
+    device: "nvidia_a100_80gb";
+    vram_capacity: 80 * GiB;
+    compute_capability: 8.0;
+    safety_factor: 0.95;
+}
+
+model Llama3_8B<
+    const B_MAX: usize = 16,
+    const S_MAX: usize = 4096,
+    const VOCAB: usize = 128256,
+    const HIDDEN_DIM: usize = 4096,
+    const INTERMEDIATE_DIM: usize = 14336,
+    const NUM_LAYERS: usize = 32,
+    const NUM_HEADS: usize = 32,
+    const NUM_KV_HEADS: usize = 8,
+    const HEAD_DIM: usize = 128
+> {
+    // Model Weights (Direct zero-copy safetensors memory mapping)
+    @vram_immutable weight w_embed: Tensor<[VOCAB, HIDDEN_DIM], f16> = 
+        safetensors("llama-3-8b.safetensors", "model.embed_tokens.weight");
+
+    @vram_immutable weight w_q: Tensor<[NUM_LAYERS, HIDDEN_DIM, 4096], f16> = 
+        safetensors("llama-3-8b.safetensors", "model.layers.self_attn.q_proj.weight");
+    @vram_immutable weight w_k: Tensor<[NUM_LAYERS, HIDDEN_DIM, 1024], f16> = 
+        safetensors("llama-3-8b.safetensors", "model.layers.self_attn.k_proj.weight");
+    @vram_immutable weight w_v: Tensor<[NUM_LAYERS, HIDDEN_DIM, 1024], f16> = 
+        safetensors("llama-3-8b.safetensors", "model.layers.self_attn.v_proj.weight");
+    @vram_immutable weight w_o: Tensor<[NUM_LAYERS, 4096, HIDDEN_DIM], f16> = 
+        safetensors("llama-3-8b.safetensors", "model.layers.self_attn.o_proj.weight");
+
+    @vram_immutable weight w_gate: Tensor<[NUM_LAYERS, HIDDEN_DIM, INTERMEDIATE_DIM], f16> = 
+        safetensors("llama-3-8b.safetensors", "model.layers.mlp.gate_proj.weight");
+    @vram_immutable weight w_up: Tensor<[NUM_LAYERS, HIDDEN_DIM, INTERMEDIATE_DIM], f16> = 
+        safetensors("llama-3-8b.safetensors", "model.layers.mlp.up_proj.weight");
+    @vram_immutable weight w_down: Tensor<[NUM_LAYERS, INTERMEDIATE_DIM, HIDDEN_DIM], f16> = 
+        safetensors("llama-3-8b.safetensors", "model.layers.mlp.down_proj.weight");
+
+    @vram_immutable weight w_input_norm: Tensor<[NUM_LAYERS, HIDDEN_DIM], f16> = 
+        safetensors("llama-3-8b.safetensors", "model.layers.input_layernorm.weight");
+    @vram_immutable weight w_post_norm: Tensor<[NUM_LAYERS, HIDDEN_DIM], f16> = 
+        safetensors("llama-3-8b.safetensors", "model.layers.post_attention_layernorm.weight");
+    @vram_immutable weight w_norm: Tensor<[HIDDEN_DIM], f16> = 
+        safetensors("llama-3-8b.safetensors", "model.norm.weight");
+    @vram_immutable weight w_lm_head: Tensor<[HIDDEN_DIM, VOCAB], f16> = 
+        safetensors("llama-3-8b.safetensors", "lm_head.weight");
+
+    // Native Paged Key-Value Cache Pool (2.0 MiB hardware Huge Page alignment)
+    let mut kv: PagedKVCache<NUM_LAYERS, NUM_KV_HEADS, HEAD_DIM, 16, f16>;
+
+    // Execution Pipeline: Prefill Phase (Full-prompt causal self-attention)
+    scope prefill<const B: usize, const S: usize>(
+        tokens: Tensor<[B, S], u32>
+    ) -> Tensor<[B, 1], u32> {
+        let mut h = embed(tokens, w_embed);
+
+        for l in 0..NUM_LAYERS {
+            let norm_x = rmsnorm(h, w_input_norm[l], eps = 1e-5);
+            let q = norm_x @ w_q[l];
+            let k = norm_x @ w_k[l];
+            let v = norm_x @ w_v[l];
+
+            let attn_context = flash_prefill(q, k, v, &mut kv, l);
+            h += attn_context @ w_o[l];
+
+            let mlp_norm = rmsnorm(h, w_post_norm[l], eps = 1e-5);
+            h += swiglu(mlp_norm, w_gate[l], w_up[l], w_down[l]);
+        }
+
+        let out_norm = rmsnorm(h, w_norm, eps = 1e-5);
+        let final_logits = out_norm[:, S - 1, :] @ w_lm_head;
+        return sample_argmax(final_logits);
+    }
+
+    // Execution Pipeline: Decode Phase (Sub-80us latency-bounded autoregression)
+    scope decode<const B: usize>(
+        next_token: Tensor<[B, 1], u32>,
+        step: usize
+    ) -> Tensor<[B, 1], u32> {
+        let mut h = embed(next_token, w_embed);
+
+        for l in 0..NUM_LAYERS {
+            let norm_x = rmsnorm(h, w_input_norm[l], eps = 1e-5);
+            let q = norm_x @ w_q[l];
+            let k = norm_x @ w_k[l];
+            let v = norm_x @ w_v[l];
+
+            let mut slot = kv.borrow_slot_mut(0, step);
+            slot.write(l, k, v);
+
+            let attn_context = flash_decode(q, &kv, l);
+            h += attn_context @ w_o[l];
+
+            let mlp_norm = rmsnorm(h, w_post_norm[l], eps = 1e-5);
+            h += swiglu(mlp_norm, w_gate[l], w_up[l], w_down[l]);
+        }
+
+        let out_norm = rmsnorm(h, w_norm, eps = 1e-5);
+        let final_logits = out_norm @ w_lm_head;
+        return sample_argmax(final_logits);
+    }
+}

@@ -1,0 +1,116 @@
+// ============================================================================
+// Velox Reference Model: Alibaba Qwen2-72B Architecture
+// File: examples/qwen2_72b.vlx
+// Target Hardware: 8x NVIDIA H100 Cluster (640 GiB HBM3 VRAM, TP=8)
+// ============================================================================
+
+target hardware {
+    device: "nvidia_h100_cluster";
+    vram_capacity: 640 * GiB;
+    compute_capability: 9.0;
+    safety_factor: 0.95;
+}
+
+model Qwen2_72B<
+    const B_MAX: usize = 8,
+    const S_MAX: usize = 8192,
+    const VOCAB: usize = 152064,
+    const HIDDEN_DIM: usize = 8192,
+    const INTERMEDIATE_DIM: usize = 29568,
+    const NUM_LAYERS: usize = 80,
+    const NUM_HEADS: usize = 64,
+    const NUM_KV_HEADS: usize = 8,
+    const HEAD_DIM: usize = 128
+> {
+    // Model Weights (Tied Word Embeddings shared between input and LM head)
+    @vram_immutable weight w_embed: Tensor<[VOCAB, HIDDEN_DIM], f16> = 
+        safetensors("qwen2-72b.safetensors", "model.embed_tokens.weight");
+
+    // Attention Projections with Explicit Bias Tensors
+    @vram_immutable weight w_q: Tensor<[NUM_LAYERS, HIDDEN_DIM, 8192], f16> = 
+        safetensors("qwen2-72b.safetensors", "model.layers.self_attn.q_proj.weight");
+    @vram_immutable weight b_q: Tensor<[NUM_LAYERS, 8192], f16> = 
+        safetensors("qwen2-72b.safetensors", "model.layers.self_attn.q_proj.bias");
+    @vram_immutable weight w_k: Tensor<[NUM_LAYERS, HIDDEN_DIM, 1024], f16> = 
+        safetensors("qwen2-72b.safetensors", "model.layers.self_attn.k_proj.weight");
+    @vram_immutable weight b_k: Tensor<[NUM_LAYERS, 1024], f16> = 
+        safetensors("qwen2-72b.safetensors", "model.layers.self_attn.k_proj.bias");
+    @vram_immutable weight w_v: Tensor<[NUM_LAYERS, HIDDEN_DIM, 1024], f16> = 
+        safetensors("qwen2-72b.safetensors", "model.layers.self_attn.v_proj.weight");
+    @vram_immutable weight b_v: Tensor<[NUM_LAYERS, 1024], f16> = 
+        safetensors("qwen2-72b.safetensors", "model.layers.self_attn.v_proj.bias");
+    @vram_immutable weight w_o: Tensor<[NUM_LAYERS, 8192, HIDDEN_DIM], f16> = 
+        safetensors("qwen2-72b.safetensors", "model.layers.self_attn.o_proj.weight");
+
+    // SwiGLU MLP Weights
+    @vram_immutable weight w_gate: Tensor<[NUM_LAYERS, HIDDEN_DIM, INTERMEDIATE_DIM], f16> = 
+        safetensors("qwen2-72b.safetensors", "model.layers.mlp.gate_proj.weight");
+    @vram_immutable weight w_up: Tensor<[NUM_LAYERS, HIDDEN_DIM, INTERMEDIATE_DIM], f16> = 
+        safetensors("qwen2-72b.safetensors", "model.layers.mlp.up_proj.weight");
+    @vram_immutable weight w_down: Tensor<[NUM_LAYERS, INTERMEDIATE_DIM, HIDDEN_DIM], f16> = 
+        safetensors("qwen2-72b.safetensors", "model.layers.mlp.down_proj.weight");
+
+    // Layer Normalizations
+    @vram_immutable weight w_input_norm: Tensor<[NUM_LAYERS, HIDDEN_DIM], f16> = 
+        safetensors("qwen2-72b.safetensors", "model.layers.input_layernorm.weight");
+    @vram_immutable weight w_post_norm: Tensor<[NUM_LAYERS, HIDDEN_DIM], f16> = 
+        safetensors("qwen2-72b.safetensors", "model.layers.post_attention_layernorm.weight");
+    @vram_immutable weight w_norm: Tensor<[HIDDEN_DIM], f16> = 
+        safetensors("qwen2-72b.safetensors", "model.norm.weight");
+
+    // Native Paged Key-Value Cache Pool
+    let mut kv: PagedKVCache<NUM_LAYERS, NUM_KV_HEADS, HEAD_DIM, 16, f16>;
+
+    // Execution Pipeline: Prefill Phase
+    scope prefill<const B: usize, const S: usize>(
+        tokens: Tensor<[B, S], u32>
+    ) -> Tensor<[B, 1], u32> {
+        let mut h = embed(tokens, w_embed);
+
+        for l in 0..NUM_LAYERS {
+            let norm_x = rmsnorm(h, w_input_norm[l], eps = 1e-6);
+            let q = (norm_x @ w_q[l]) + b_q[l];
+            let k = (norm_x @ w_k[l]) + b_k[l];
+            let v = (norm_x @ w_v[l]) + b_v[l];
+
+            let attn_context = flash_prefill(q, k, v, &mut kv, l);
+            h += attn_context @ w_o[l];
+
+            let mlp_norm = rmsnorm(h, w_post_norm[l], eps = 1e-6);
+            h += swiglu(mlp_norm, w_gate[l], w_up[l], w_down[l]);
+        }
+
+        let out_norm = rmsnorm(h, w_norm, eps = 1e-6);
+        // Tied word embeddings: reuse w_embed transpose as LM head projection
+        let logits = out_norm[:, S - 1, :] @ w_embed.T;
+        return sample_argmax(logits);
+    }
+
+    // Execution Pipeline: Decode Phase
+    scope decode<const B: usize>(
+        next_token: Tensor<[B, 1], u32>,
+        step: usize
+    ) -> Tensor<[B, 1], u32> {
+        let mut h = embed(next_token, w_embed);
+
+        for l in 0..NUM_LAYERS {
+            let norm_x = rmsnorm(h, w_input_norm[l], eps = 1e-6);
+            let q = (norm_x @ w_q[l]) + b_q[l];
+            let k = (norm_x @ w_k[l]) + b_k[l];
+            let v = (norm_x @ w_v[l]) + b_v[l];
+
+            let mut slot = kv.borrow_slot_mut(0, step);
+            slot.write(l, k, v);
+
+            let attn_context = flash_decode(q, &kv, l);
+            h += attn_context @ w_o[l];
+
+            let mlp_norm = rmsnorm(h, w_post_norm[l], eps = 1e-6);
+            h += swiglu(mlp_norm, w_gate[l], w_up[l], w_down[l]);
+        }
+
+        let out_norm = rmsnorm(h, w_norm, eps = 1e-6);
+        let logits = out_norm @ w_embed.T;
+        return sample_argmax(logits);
+    }
+}

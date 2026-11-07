@@ -1,0 +1,116 @@
+// ============================================================================
+// Velox Reference Model: SmolLM-135M / TinyStories Architecture
+// File: examples/tinystories_smollm.vlx
+// Target Hardware: NVIDIA GeForce RTX 3050 Laptop (4096 MiB VRAM)
+// ============================================================================
+
+target hardware {
+    device: "nvidia_rtx_3050_laptop";
+    vram_capacity: 4096 * MiB;
+    compute_capability: 8.6;
+    safety_factor: 0.95;
+}
+
+model SmolLM_135M<
+    const B_MAX: usize = 8,
+    const S_MAX: usize = 2048,
+    const VOCAB: usize = 49152,
+    const HIDDEN_DIM: usize = 576,
+    const INTERMEDIATE_DIM: usize = 1536,
+    const NUM_LAYERS: usize = 30,
+    const NUM_HEADS: usize = 9,
+    const NUM_KV_HEADS: usize = 3,
+    const HEAD_DIM: usize = 64
+> {
+    // Model Parameter Weights (Mapped directly via zero-copy safetensors)
+    @vram_immutable weight w_embed: Tensor<[VOCAB, HIDDEN_DIM], f16> = 
+        safetensors("smollm-135m.safetensors", "model.embed_tokens.weight");
+
+    @vram_immutable weight w_q: Tensor<[NUM_LAYERS, HIDDEN_DIM, 576], f16> = 
+        safetensors("smollm-135m.safetensors", "model.layers.q_proj.weight");
+    @vram_immutable weight w_k: Tensor<[NUM_LAYERS, HIDDEN_DIM, 192], f16> = 
+        safetensors("smollm-135m.safetensors", "model.layers.k_proj.weight");
+    @vram_immutable weight w_v: Tensor<[NUM_LAYERS, HIDDEN_DIM, 192], f16> = 
+        safetensors("smollm-135m.safetensors", "model.layers.v_proj.weight");
+    @vram_immutable weight w_out: Tensor<[NUM_LAYERS, 576, HIDDEN_DIM], f16> = 
+        safetensors("smollm-135m.safetensors", "model.layers.o_proj.weight");
+
+    @vram_immutable weight w_gate: Tensor<[NUM_LAYERS, HIDDEN_DIM, INTERMEDIATE_DIM], f16> = 
+        safetensors("smollm-135m.safetensors", "model.layers.gate_proj.weight");
+    @vram_immutable weight w_up: Tensor<[NUM_LAYERS, HIDDEN_DIM, INTERMEDIATE_DIM], f16> = 
+        safetensors("smollm-135m.safetensors", "model.layers.up_proj.weight");
+    @vram_immutable weight w_down: Tensor<[NUM_LAYERS, INTERMEDIATE_DIM, HIDDEN_DIM], f16> = 
+        safetensors("smollm-135m.safetensors", "model.layers.down_proj.weight");
+
+    @vram_immutable weight w_attn_norm: Tensor<[NUM_LAYERS, HIDDEN_DIM], f16> = 
+        safetensors("smollm-135m.safetensors", "model.layers.input_layernorm.weight");
+    @vram_immutable weight w_mlp_norm: Tensor<[NUM_LAYERS, HIDDEN_DIM], f16> = 
+        safetensors("smollm-135m.safetensors", "model.layers.post_attention_layernorm.weight");
+    @vram_immutable weight w_final_norm: Tensor<[HIDDEN_DIM], f16> = 
+        safetensors("smollm-135m.safetensors", "model.norm.weight");
+    @vram_immutable weight w_head: Tensor<[HIDDEN_DIM, VOCAB], f16> = 
+        safetensors("smollm-135m.safetensors", "lm_head.weight");
+
+    // Native Paged Key-Value Cache Pool (Block size 16)
+    let mut kv_cache: PagedKVCache<NUM_LAYERS, NUM_KV_HEADS, HEAD_DIM, 16, f16>;
+
+    // Execution Pipeline: Prefill Phase (High-throughput compute-bound prompt encoding)
+    scope prefill<const B: usize, const S: usize>(
+        tokens: Tensor<[B, S], u32>
+    ) -> Tensor<[B, 1], u32> {
+        let mut hidden = embed(tokens, w_embed);
+
+        for l in 0..NUM_LAYERS {
+            let norm_x = rmsnorm(hidden, w_attn_norm[l]);
+            let q = norm_x @ w_q[l];
+            let k = norm_x @ w_k[l];
+            let v = norm_x @ w_v[l];
+            
+            let attn_out = flash_prefill(q, k, v, &mut kv_cache, l);
+            hidden += attn_out @ w_out[l];
+
+            let mlp_norm_x = rmsnorm(hidden, w_mlp_norm[l]);
+            let gate = mlp_norm_x @ w_gate[l];
+            let up = mlp_norm_x @ w_up[l];
+            let act = silu(gate) * up;
+            hidden += act @ w_down[l];
+        }
+
+        let final_norm = rmsnorm(hidden, w_final_norm);
+        let last_hidden = final_norm[:, S - 1, :];
+        let logits = last_hidden @ w_head;
+        return sample_argmax(logits);
+    }
+
+    // Execution Pipeline: Decode Phase (Bandwidth-bound single-token generation)
+    scope decode<const B: usize>(
+        token: Tensor<[B, 1], u32>,
+        step: usize
+    ) -> Tensor<[B, 1], u32> {
+        let mut hidden = embed(token, w_embed);
+
+        for l in 0..NUM_LAYERS {
+            let norm_x = rmsnorm(hidden, w_attn_norm[l]);
+            let q = norm_x @ w_q[l];
+            let k = norm_x @ w_k[l];
+            let v = norm_x @ w_v[l];
+
+            // In-place borrow and commit to sequence slot
+            let mut slot = kv_cache.borrow_slot_mut(0, step);
+            slot.write(l, k, v);
+
+            let attn_out = flash_decode(q, &kv_cache, l);
+            hidden += attn_out @ w_out[l];
+
+            let mlp_norm_x = rmsnorm(hidden, w_mlp_norm[l]);
+            let gate = mlp_norm_x @ w_gate[l];
+            let up = mlp_norm_x @ w_up[l];
+            let act = silu(gate) * up;
+            hidden += act @ w_down[l];
+        }
+
+        let final_norm = rmsnorm(hidden, w_final_norm);
+        let logits = final_norm @ w_head;
+        return sample_argmax(logits);
+    }
+}

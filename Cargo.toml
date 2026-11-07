@@ -1,0 +1,24 @@
+[package]
+name = "veloxc"
+version = "0.1.0"
+edition = "2021"
+authors = ["Velox Systems Engineering Team"]
+description = "Native optimizing compiler frontend for the Velox LLM serving language"
+
+[lib]
+name = "veloxc"
+path = "src/lib.rs"
+
+[[bin]]
+name = "veloxc"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[dependencies]
+# Zero external dependencies (std only)
