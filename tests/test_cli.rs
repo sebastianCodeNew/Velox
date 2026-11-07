@@ -462,3 +462,96 @@ fn test_cli_subprocess_reference_models() {
         );
     }
 }
+
+// ============================================================================
+// 10. Step 17 Unified Multi-Backend Inference Tests
+// ============================================================================
+
+#[test]
+fn test_cli_backend_flags_parsing_direct() {
+    let (code, _, stderr) = call_cli(&[
+        "--run",
+        "--backend",
+        "invalid_backend",
+        "examples/tinystories_smollm.vlx",
+    ]);
+    assert_eq!(code, EXIT_USAGE_ERROR);
+    assert!(stderr.contains("invalid choice: 'invalid_backend'"));
+}
+
+#[test]
+fn test_cli_run_rust_backend_with_tokens_parity() {
+    let weights = Path::new("smollm-135m.safetensors");
+    if !weights.exists() {
+        return;
+    }
+
+    let (code, stdout, stderr) = call_cli(&[
+        "--run",
+        "--backend",
+        "rust",
+        "--tokens",
+        "1,504,346",
+        "--steps",
+        "4",
+        "examples/tinystories_smollm.vlx",
+    ]);
+
+    assert_eq!(code, EXIT_SUCCESS, "stderr: {stderr}");
+    assert!(stdout.contains("Parity 4-token check   : PASSED [359, 253, 4028, 282]"));
+    assert!(stdout.contains("Generated Tokens (4)   : [359, 253, 4028, 282]"));
+    assert!(stdout.contains("Dynamic Heap Allocs    : 0"));
+}
+
+#[test]
+fn test_cli_run_rust_backend_with_prompt_text() {
+    let weights = Path::new("smollm-135m.safetensors");
+    let tok_file = Path::new("tokenizer.json");
+    if !weights.exists() || !tok_file.exists() {
+        return;
+    }
+
+    let (code, stdout, stderr) = call_cli(&[
+        "--run",
+        "--backend",
+        "rust",
+        "--prompt",
+        "The you",
+        "--steps",
+        "4",
+        "examples/tinystories_smollm.vlx",
+    ]);
+
+    assert_eq!(code, EXIT_SUCCESS, "stderr: {stderr}");
+    assert!(stdout.contains("Parity 4-token check   : PASSED [359, 253, 4028, 282]"));
+    assert!(stdout.contains(" are a member of"));
+}
+
+#[test]
+fn test_cli_run_rust_backend_benchmark_mode() {
+    let weights = Path::new("smollm-135m.safetensors");
+    if !weights.exists() {
+        return;
+    }
+
+    let (code, stdout, stderr) = call_cli(&[
+        "--run",
+        "--backend",
+        "rust",
+        "--tokens",
+        "1,504,346",
+        "--steps",
+        "4",
+        "--benchmark",
+        "--warmup",
+        "1",
+        "examples/tinystories_smollm.vlx",
+    ]);
+
+    assert_eq!(code, EXIT_SUCCESS, "stderr: {stderr}");
+    assert!(stdout.contains("VELOX SOTA ROOFLINE INFERENCE BENCHMARK REPORT"));
+    assert!(stdout.contains("TTFT (Prefill Latency)"));
+    assert!(stdout.contains("Decode Latency"));
+    assert!(stdout.contains("Dynamic Heap Allocs    : 0"));
+}
+

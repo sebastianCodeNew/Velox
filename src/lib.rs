@@ -18,6 +18,7 @@ pub mod optimizer;
 pub mod parser;
 pub mod runtime;
 pub mod sema;
+pub mod tokenizer;
 pub mod tokens;
 pub mod types;
 
@@ -64,6 +65,7 @@ pub use sema::{
     EvaluatedType, FourierMotzkinSolver, SemanticAnalyzer, SymbolicDim, TypedActivation,
     TypedKVCache, TypedModel, TypedProgram, TypedScope, TypedWeight,
 };
+pub use tokenizer::{build_byte_to_unicode, StreamingDecoder, Tokenizer};
 pub use tokens::{Token, TokenType};
 pub use types::{
     parse_memory_capacity, AbsorbKind, AssignmentOperator, BinaryOperator, DmaDirection,

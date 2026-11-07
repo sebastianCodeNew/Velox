@@ -9,6 +9,7 @@
 *.pt
 *.pth
 *.onnx
+tokenizer.json
 
 # Release binary copied to repo root by build.ps1
 /veloxc.exe

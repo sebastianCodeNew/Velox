@@ -518,6 +518,10 @@ int main(int argc, char** argv) {
     uint32_t next_tok = h_ring[(prompt_len - 1) & 1023ULL];
     if (steps > 0) {
         generated_tokens[0] = next_tok;
+        if (verbose) {
+            printf("[Step 0] Token: %u\n", next_tok);
+            fflush(stdout);
+        }
     }
 
     // 6. Autoregressive Decode Phase (strictly 0 dynamic allocations on GPU & CPU)
@@ -549,6 +553,7 @@ int main(int argc, char** argv) {
                     generated_tokens[s] = next_tok;
                     if (verbose) {
                         printf("[Step %zu] Token: %u\n", s, next_tok);
+                        fflush(stdout);
                     }
                 }
                 cudaEventRecord(ev_decode_stop, stream);
@@ -567,6 +572,7 @@ int main(int argc, char** argv) {
                 generated_tokens[s] = next_tok;
                 if (verbose) {
                     printf("[Step %zu] Token: %u\n", s, next_tok);
+                    fflush(stdout);
                 }
             }
 

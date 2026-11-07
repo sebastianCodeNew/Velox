@@ -1452,12 +1452,14 @@ impl VeloxStaticExecutionEngine {
     }
 
     /// Runs prefill over `prompt_tokens` and generates `num_new_tokens` autoregressively
-    /// into `output_buffer` with strictly zero dynamic heap allocations.
-    pub fn generate_greedy_into(
+    /// into `output_buffer` with strictly zero dynamic heap allocations, invoking `on_token(step, token_id)`
+    /// for each generated token in real time.
+    pub fn generate_greedy_streaming<F: FnMut(usize, u32)>(
         &mut self,
         prompt_tokens: &[u32],
         num_new_tokens: usize,
         output_buffer: &mut [u32],
+        mut on_token: F,
     ) -> usize {
         assert!(!prompt_tokens.is_empty(), "Prompt tokens must not be empty");
         assert!(output_buffer.len() >= num_new_tokens);
@@ -1476,13 +1478,27 @@ impl VeloxStaticExecutionEngine {
         }
 
         output_buffer[0] = next_tok;
+        on_token(0, next_tok);
+
         for step in 1..num_new_tokens {
             next_tok = self.forward_step(next_tok, pos);
             pos += 1;
             output_buffer[step] = next_tok;
+            on_token(step, next_tok);
         }
 
         num_new_tokens
+    }
+
+    /// Runs prefill over `prompt_tokens` and generates `num_new_tokens` autoregressively
+    /// into `output_buffer` with strictly zero dynamic heap allocations.
+    pub fn generate_greedy_into(
+        &mut self,
+        prompt_tokens: &[u32],
+        num_new_tokens: usize,
+        output_buffer: &mut [u32],
+    ) -> usize {
+        self.generate_greedy_streaming(prompt_tokens, num_new_tokens, output_buffer, |_, _| {})
     }
 }
 

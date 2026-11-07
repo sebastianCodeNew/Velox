@@ -347,6 +347,10 @@ int main(int argc, char** argv) {
 
     if (steps > 0) {
         generated_tokens[0] = next_tok;
+        if (verbose) {
+            printf("[Step 0] Token: %u\n", next_tok);
+            fflush(stdout);
+        }
     }
 
     // 6. Autoregressive Decode Phase (strictly 0 heap allocations)
@@ -359,6 +363,7 @@ int main(int argc, char** argv) {
         generated_tokens[s] = next_tok;
         if (verbose) {
             printf("[Step %zu] Token: %u\n", s, next_tok);
+            fflush(stdout);
         }
     }
     double decode_ms = (steps > 1) ? timer_ms_since(t_decode_start) : 0.0;

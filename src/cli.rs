@@ -17,10 +17,12 @@ use crate::runtime::{TransformerConfig, VeloxStaticExecutionEngine};
 use crate::sema::SemanticAnalyzer;
 use crate::tokens::{Token, TokenType};
 use crate::types::AbsorbKind;
+use crate::tokenizer::{StreamingDecoder, Tokenizer};
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 // ============================================================================
 // Deterministic Exit Code Constants
@@ -60,6 +62,38 @@ impl OutputFormat {
     }
 }
 
+/// Execution backend for model generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionBackend {
+    Auto,
+    Cuda,
+    C99,
+    Rust,
+}
+
+impl ExecutionBackend {
+    #[must_use]
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "cuda" => Some(Self::Cuda),
+            "c99" => Some(Self::C99),
+            "rust" => Some(Self::Rust),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Cuda => "cuda",
+            Self::C99 => "c99",
+            Self::Rust => "rust",
+        }
+    }
+}
+
 /// Parsed command-line flags and positional options.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CliArgs {
@@ -72,9 +106,15 @@ pub struct CliArgs {
     pub emit_cuda: bool,
     pub emit_ir: bool,
     pub run_model: bool,
+    pub backend: ExecutionBackend,
     pub weights_path: Option<String>,
+    pub tokenizer_path: Option<String>,
+    pub prompt_text: Option<String>,
     pub prompt_tokens: Vec<u32>,
     pub steps: usize,
+    pub benchmark: bool,
+    pub warmup: usize,
+    pub threads: Option<usize>,
     pub format: OutputFormat,
     pub no_color: bool,
     pub output: Option<String>,
@@ -93,9 +133,15 @@ impl Default for CliArgs {
             emit_cuda: false,
             emit_ir: false,
             run_model: false,
+            backend: ExecutionBackend::Rust,
             weights_path: None,
-            prompt_tokens: vec![1],
-            steps: 8,
+            tokenizer_path: None,
+            prompt_text: None,
+            prompt_tokens: vec![1, 504, 346],
+            steps: 32,
+            benchmark: false,
+            warmup: 0,
+            threads: None,
             format: OutputFormat::Text,
             no_color: false,
             output: None,
@@ -182,6 +228,77 @@ pub fn parse_cli_args(raw_args: &[String]) -> Result<CliAction, String> {
             idx += 1;
         } else if arg == "-V" {
             return Ok(CliAction::Version);
+        } else if arg == "--backend" {
+            if idx + 1 >= args.len() {
+                return Err("error: flag '--backend' requires an argument (cuda, c99, rust, auto)".to_string());
+            }
+            let choice = &args[idx + 1];
+            match ExecutionBackend::from_str_opt(choice) {
+                Some(b) => cli_args.backend = b,
+                None => {
+                    return Err(format!(
+                        "error: argument --backend: invalid choice: '{choice}' (choose from 'cuda', 'c99', 'rust', 'auto')"
+                    ));
+                }
+            }
+            idx += 2;
+        } else if let Some(choice) = arg.strip_prefix("--backend=") {
+            match ExecutionBackend::from_str_opt(choice) {
+                Some(b) => cli_args.backend = b,
+                None => {
+                    return Err(format!(
+                        "error: argument --backend: invalid choice: '{choice}' (choose from 'cuda', 'c99', 'rust', 'auto')"
+                    ));
+                }
+            }
+            idx += 1;
+        } else if arg == "--prompt" {
+            if idx + 1 >= args.len() {
+                return Err("error: flag '--prompt' requires a string argument".to_string());
+            }
+            cli_args.prompt_text = Some(args[idx + 1].clone());
+            idx += 2;
+        } else if let Some(p_text) = arg.strip_prefix("--prompt=") {
+            cli_args.prompt_text = Some(p_text.to_string());
+            idx += 1;
+        } else if arg == "--tokenizer" {
+            if idx + 1 >= args.len() {
+                return Err("error: flag '--tokenizer' requires a path argument".to_string());
+            }
+            cli_args.tokenizer_path = Some(args[idx + 1].clone());
+            idx += 2;
+        } else if let Some(t_path) = arg.strip_prefix("--tokenizer=") {
+            cli_args.tokenizer_path = Some(t_path.to_string());
+            idx += 1;
+        } else if arg == "--benchmark" {
+            cli_args.benchmark = true;
+            idx += 1;
+        } else if arg == "--warmup" {
+            if idx + 1 >= args.len() {
+                return Err("error: flag '--warmup' requires an integer argument".to_string());
+            }
+            cli_args.warmup = args[idx + 1]
+                .parse::<usize>()
+                .map_err(|_| format!("error: invalid integer for --warmup: '{}'", args[idx + 1]))?;
+            idx += 2;
+        } else if let Some(w_str) = arg.strip_prefix("--warmup=") {
+            cli_args.warmup = w_str
+                .parse::<usize>()
+                .map_err(|_| format!("error: invalid integer for --warmup: '{w_str}'"))?;
+            idx += 1;
+        } else if arg == "--threads" {
+            if idx + 1 >= args.len() {
+                return Err("error: flag '--threads' requires an integer argument".to_string());
+            }
+            cli_args.threads = Some(args[idx + 1]
+                .parse::<usize>()
+                .map_err(|_| format!("error: invalid integer for --threads: '{}'", args[idx + 1]))?);
+            idx += 2;
+        } else if let Some(t_str) = arg.strip_prefix("--threads=") {
+            cli_args.threads = Some(t_str
+                .parse::<usize>()
+                .map_err(|_| format!("error: invalid integer for --threads: '{t_str}'"))?);
+            idx += 1;
         } else if arg == "--weights" {
             if idx + 1 >= args.len() {
                 return Err("error: flag '--weights' requires an argument".to_string());
@@ -191,13 +308,16 @@ pub fn parse_cli_args(raw_args: &[String]) -> Result<CliAction, String> {
         } else if let Some(w_path) = arg.strip_prefix("--weights=") {
             cli_args.weights_path = Some(w_path.to_string());
             idx += 1;
-        } else if arg == "--tokens" {
+        } else if arg == "--tokens" || arg == "--prompt-tokens" {
             if idx + 1 >= args.len() {
-                return Err("error: flag '--tokens' requires a comma-separated token list".to_string());
+                return Err(format!("error: flag '{arg}' requires a comma-separated token list"));
             }
             cli_args.prompt_tokens = parse_token_list(&args[idx + 1])?;
             idx += 2;
         } else if let Some(tok_str) = arg.strip_prefix("--tokens=") {
+            cli_args.prompt_tokens = parse_token_list(tok_str)?;
+            idx += 1;
+        } else if let Some(tok_str) = arg.strip_prefix("--prompt-tokens=") {
             cli_args.prompt_tokens = parse_token_list(tok_str)?;
             idx += 1;
         } else if arg == "--steps" {
@@ -258,15 +378,22 @@ pub fn parse_cli_args(raw_args: &[String]) -> Result<CliAction, String> {
     }
 
     if positional_files.is_empty() {
-        return Err("error: the following arguments are required: input_file".to_string());
-    }
-
-    if positional_files.len() > 1 {
+        if cli_args.run_model {
+            let default_model = "examples/tinystories_smollm.vlx";
+            if Path::new(default_model).exists() {
+                cli_args.input_file = default_model.to_string();
+            } else {
+                return Err("error: the following arguments are required: input_file".to_string());
+            }
+        } else {
+            return Err("error: the following arguments are required: input_file".to_string());
+        }
+    } else if positional_files.len() > 1 {
         let extra = &positional_files[1..];
         return Err(format!("error: unrecognized arguments: {}", extra.join(" ")));
+    } else {
+        cli_args.input_file = positional_files.remove(0);
     }
-
-    cli_args.input_file = positional_files.remove(0);
     Ok(CliAction::Run(cli_args))
 }
 
@@ -308,9 +435,16 @@ options:
   --emit-c               Emit standalone zero-allocation ANSI C99 source (.c).
   --emit-cuda            Emit standalone zero-allocation NVIDIA CUDA source (.cu).
   --run                  Execute model natively using zero-copy safetensors mmap.
+  --backend <backend>    Execution backend: cuda, c99, rust, auto (default: auto).
+  --prompt \"<text>\"      Input text prompt (encoded via native BPE tokenizer).
+  --tokens <ids>         Comma-separated input prompt token IDs for --run.
+  --prompt-tokens <ids>  Alias for --tokens.
+  --steps <N>            Number of tokens to generate during --run (default: 32).
   --weights <path>       Override path to .safetensors weights file for --run.
-  --tokens <id1,id2...>  Comma-separated input prompt token IDs for --run.
-  --steps <N>            Number of tokens to generate during --run (default: 8).
+  --tokenizer <path>     Path to tokenizer.json (default: tokenizer.json).
+  --benchmark            Print detailed inference latency, throughput, and allocations.
+  --warmup <N>           Number of warmup iterations before benchmark timing.
+  --threads <N>          Number of threads for CPU execution (sets OMP_NUM_THREADS).
   --dump-ast             Parse source and serialize AST to stdout or output file.
   --dump-tokens          Tokenize source and print token stream to stdout.
   --format {text,json}   Output format for AST serialization (default: text).
@@ -318,6 +452,170 @@ options:
   -o, --output <path>    Write generated artifact to the specified output file.
   --verbose              Enable verbose validation logs.
 "
+}
+
+/// Locates a pre-compiled runner executable across candidate directory locations.
+pub fn find_runner_binary(binary_name: &str) -> Option<PathBuf> {
+    // 1. Direct path in src/runners
+    let p1 = Path::new("src").join("runners").join(binary_name);
+    if p1.exists() {
+        return Some(p1);
+    }
+    // 2. Direct path in current working directory
+    let p2 = Path::new(binary_name);
+    if p2.exists() {
+        return Some(p2.to_path_buf());
+    }
+    // 3. Executable-relative paths
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(parent) = exe_path.parent() {
+            let p3 = parent.join(binary_name);
+            if p3.exists() {
+                return Some(p3);
+            }
+            let p4 = parent.join("src").join("runners").join(binary_name);
+            if p4.exists() {
+                return Some(p4);
+            }
+            if let Some(grandparent) = parent.parent() {
+                let p5 = grandparent.join(binary_name);
+                if p5.exists() {
+                    return Some(p5);
+                }
+                let p6 = grandparent.join("src").join("runners").join(binary_name);
+                if p6.exists() {
+                    return Some(p6);
+                }
+                if let Some(great_grandparent) = grandparent.parent() {
+                    let p7 = great_grandparent.join(binary_name);
+                    if p7.exists() {
+                        return Some(p7);
+                    }
+                    let p8 = great_grandparent.join("src").join("runners").join(binary_name);
+                    if p8.exists() {
+                        return Some(p8);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Dispatches execution to a standalone compiled C99 or CUDA runner process,
+/// streaming tokens to stdout and parsing the output report.
+pub fn run_external_runner(
+    runner_path: &Path,
+    weights_path: &str,
+    prompt_tokens: &[u32],
+    steps: usize,
+    threads_opt: Option<usize>,
+    mut streaming_decoder_opt: Option<StreamingDecoder>,
+    verbose: bool,
+    benchmark: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<i32, i32> {
+    let mut cmd = Command::new(runner_path);
+    cmd.arg("--weights").arg(weights_path);
+
+    let tokens_str = prompt_tokens
+        .iter()
+        .map(|t| t.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    cmd.arg("--tokens").arg(&tokens_str);
+    cmd.arg("--steps").arg(steps.to_string());
+    cmd.arg("--verbose");
+
+    if let Some(threads) = threads_opt {
+        cmd.env("OMP_NUM_THREADS", threads.to_string());
+    }
+
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(err) => {
+            let _ = writeln!(
+                stderr,
+                "veloxc: failed to execute runner '{:?}': {}",
+                runner_path, err
+            );
+            return Err(EXIT_IO_ERROR);
+        }
+    };
+
+    let mut captured_lines = Vec::new();
+    let mut generated_tokens = Vec::new();
+    let mut streamed_any = false;
+
+    if let Some(child_stdout) = child.stdout.take() {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(child_stdout);
+        for line_res in reader.lines() {
+            let line = match line_res {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+
+            // Detect step tokens: "[Step <S>] Token: <ID>"
+            if let Some(step_part) = line.strip_prefix("[Step ") {
+                if let Some(idx_token) = step_part.find("] Token: ") {
+                    let tok_str = step_part[idx_token + 9..].trim();
+                    if let Ok(tok_id) = tok_str.parse::<u32>() {
+                        generated_tokens.push(tok_id);
+                        if let Some(ref mut dec) = streaming_decoder_opt {
+                            let text_chunk = dec.decode_token(tok_id);
+                            let _ = write!(stdout, "{text_chunk}");
+                            let _ = stdout.flush();
+                            streamed_any = true;
+                        } else if verbose {
+                            let _ = writeln!(stdout, "{line}");
+                            let _ = stdout.flush();
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            captured_lines.push(line);
+        }
+    }
+
+    let status = match child.wait() {
+        Ok(s) => s,
+        Err(err) => {
+            let _ = writeln!(stderr, "veloxc: error waiting for runner process: {}", err);
+            return Err(EXIT_IO_ERROR);
+        }
+    };
+
+    if let Some(ref mut dec) = streaming_decoder_opt {
+        let flush_chunk = dec.flush();
+        if !flush_chunk.is_empty() {
+            let _ = write!(stdout, "{flush_chunk}");
+            let _ = stdout.flush();
+            streamed_any = true;
+        }
+        if streamed_any {
+            let _ = writeln!(stdout);
+        }
+    }
+
+    // Print captured execution / benchmark report from runner
+    if benchmark || verbose || streaming_decoder_opt.is_none() {
+        for line in &captured_lines {
+            let _ = writeln!(stdout, "{line}");
+        }
+    }
+
+    if status.success() {
+        Ok(EXIT_SUCCESS)
+    } else {
+        Err(status.code().unwrap_or(EXIT_COMPILATION_ERROR))
+    }
 }
 
 // ============================================================================
@@ -940,6 +1238,7 @@ fn execute_compilation(
     }
 
     // 12. Steps 8 & 9: Zero-Copy Native Runtime Execution (--run)
+    // 12. Steps 8, 9 & 17: Zero-Copy Native Multi-Backend Serving Execution (--run)
     if cli_args.run_model {
         let Some(first_model) = typed_program.models.first() else {
             let _ = writeln!(stderr, "veloxc: runtime error: no model declared in {}", cli_args.input_file);
@@ -958,7 +1257,101 @@ fn execute_compilation(
             "smollm-135m.safetensors".to_string()
         };
 
-        let max_seq_required = (cli_args.prompt_tokens.len() + cli_args.steps + 16).max(64);
+        // Resolve tokenizer.json path
+        let tokenizer_path = if let Some(ref t_path) = cli_args.tokenizer_path {
+            Some(PathBuf::from(t_path))
+        } else if Path::new("tokenizer.json").exists() {
+            Some(PathBuf::from("tokenizer.json"))
+        } else {
+            let candidate = Path::new(&weights_file).with_file_name("tokenizer.json");
+            if candidate.exists() {
+                Some(candidate)
+            } else {
+                None
+            }
+        };
+
+        let tokenizer_opt = if let Some(ref t_path) = tokenizer_path {
+            Tokenizer::from_file(t_path).ok()
+        } else {
+            None
+        };
+
+        // Resolve prompt token sequence
+        let prompt_tokens = if let Some(ref prompt_text) = cli_args.prompt_text {
+            if let Some(ref tok) = tokenizer_opt {
+                let mut enc = tok.encode(prompt_text);
+                // Prepend chat start token 1 if not present and prompt doesn't start with special tag
+                if !enc.starts_with(&[1]) && !prompt_text.starts_with("<|") {
+                    enc.insert(0, 1);
+                }
+                enc
+            } else {
+                let _ = writeln!(
+                    stderr,
+                    "veloxc: runtime error: tokenizer.json not found (required to encode --prompt). Specify --tokenizer <path> or use --tokens <id1,id2...>."
+                );
+                return EXIT_IO_ERROR;
+            }
+        } else {
+            cli_args.prompt_tokens.clone()
+        };
+
+        // Resolve execution backend
+        let effective_backend = match cli_args.backend {
+            ExecutionBackend::Auto => {
+                if find_runner_binary("velox_cuda_runner.exe").is_some() {
+                    ExecutionBackend::Cuda
+                } else if find_runner_binary("velox_c99_runner.exe").is_some() {
+                    ExecutionBackend::C99
+                } else {
+                    ExecutionBackend::Rust
+                }
+            }
+            other => other,
+        };
+
+        // Multi-backend dispatch: External Standalone Runner (CUDA / C99)
+        if effective_backend == ExecutionBackend::Cuda || effective_backend == ExecutionBackend::C99 {
+            let runner_name = if effective_backend == ExecutionBackend::Cuda {
+                "velox_cuda_runner.exe"
+            } else {
+                "velox_c99_runner.exe"
+            };
+
+            let runner_path = match find_runner_binary(runner_name) {
+                Some(p) => p,
+                None => {
+                    let _ = writeln!(
+                        stderr,
+                        "veloxc: runtime error: runner executable '{}' not found. Please compile runners using src/runners/build_runners.bat or use --backend rust.",
+                        runner_name
+                    );
+                    return EXIT_IO_ERROR;
+                }
+            };
+
+            let streaming_decoder_opt = tokenizer_opt.as_ref().map(|t| t.streaming_decoder());
+
+            match run_external_runner(
+                &runner_path,
+                &weights_file,
+                &prompt_tokens,
+                cli_args.steps,
+                cli_args.threads,
+                streaming_decoder_opt,
+                cli_args.verbose,
+                cli_args.benchmark,
+                stdout,
+                stderr,
+            ) {
+                Ok(code) => return code,
+                Err(code) => return code,
+            }
+        }
+
+        // Native In-Process Rust Execution Engine
+        let max_seq_required = (prompt_tokens.len() + cli_args.steps + 16).max(64);
         let config = TransformerConfig::from_typed_model(first_model, max_seq_required);
 
         let mut engine = match VeloxStaticExecutionEngine::load_safetensors(&weights_file, config) {
@@ -973,15 +1366,69 @@ fn execute_compilation(
             }
         };
 
+        // Warmup iterations if requested
+        if cli_args.warmup > 0 {
+            let mut warmup_buf = vec![0u32; cli_args.steps];
+            for _ in 0..cli_args.warmup {
+                engine.generate_greedy_into(&prompt_tokens, cli_args.steps, &mut warmup_buf);
+            }
+        }
+
         let mut generated_tokens = vec![0u32; cli_args.steps];
-        // Measure (not assume) heap allocator traffic across the full prefill + decode loop.
+        let t_start = std::time::Instant::now();
+        let mut t_prefill_stop = None;
+
         let (written, inference_heap_allocs) = crate::alloc_counter::count_allocations(|| {
-            engine.generate_greedy_into(&cli_args.prompt_tokens, cli_args.steps, &mut generated_tokens)
+            engine.generate_greedy_streaming(
+                &prompt_tokens,
+                cli_args.steps,
+                &mut generated_tokens,
+                |step, _tok_id| {
+                    if step == 0 {
+                        t_prefill_stop = Some(std::time::Instant::now());
+                    }
+                },
+            )
         });
         generated_tokens.truncate(written);
+        let t_end = std::time::Instant::now();
 
-        let mut full_sequence = Vec::with_capacity(cli_args.prompt_tokens.len() + generated_tokens.len());
-        full_sequence.extend_from_slice(&cli_args.prompt_tokens);
+        // Real-time streaming output to stdout
+        if let Some(ref tok) = tokenizer_opt {
+            let mut dec = tok.streaming_decoder();
+            for &tok_id in &generated_tokens {
+                let text_chunk = dec.decode_token(tok_id);
+                let _ = write!(stdout, "{text_chunk}");
+                let _ = stdout.flush();
+            }
+            let flush_chunk = dec.flush();
+            if !flush_chunk.is_empty() {
+                let _ = write!(stdout, "{flush_chunk}");
+                let _ = stdout.flush();
+            }
+            let _ = writeln!(stdout);
+        } else if cli_args.verbose {
+            for (step, &tok_id) in generated_tokens.iter().enumerate() {
+                let _ = writeln!(stdout, "[Step {step}] Token: {tok_id}");
+                let _ = stdout.flush();
+            }
+        }
+
+        let prefill_ms = t_prefill_stop
+            .unwrap_or(t_end)
+            .duration_since(t_start)
+            .as_secs_f64()
+            * 1000.0;
+        let total_ms = t_end.duration_since(t_start).as_secs_f64() * 1000.0;
+        let decode_ms = if total_ms > prefill_ms { total_ms - prefill_ms } else { 0.0 };
+        let decode_tok_per_sec = if cli_args.steps > 1 && decode_ms > 0.0 {
+            ((cli_args.steps - 1) as f64 * 1000.0) / decode_ms
+        } else {
+            0.0
+        };
+
+        let mut full_sequence = Vec::with_capacity(prompt_tokens.len() + generated_tokens.len());
+        full_sequence.extend_from_slice(&prompt_tokens);
         full_sequence.extend_from_slice(&generated_tokens);
 
         // Find top-5 logits from final token step
@@ -994,17 +1441,33 @@ fn execute_compilation(
         top5.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         top5.truncate(5);
 
+        const EXPECTED_32: [u32; 32] = [
+            359, 253, 4028, 282, 260, 1773, 30, 198, 26501, 368, 281, 260, 1773, 198, 20255, 3726,
+            288, 9517, 253, 12301, 198, 19161, 354, 12301, 198, 19161, 354, 12301, 198, 2683, 416, 722,
+        ];
+        let match_4 = prompt_tokens == [1, 504, 346]
+            && generated_tokens.len() >= 4
+            && generated_tokens[..4] == EXPECTED_32[..4];
+        let match_32 = prompt_tokens == [1, 504, 346]
+            && generated_tokens.len() >= 32
+            && generated_tokens[..32] == EXPECTED_32[..32];
+
         let mut report = String::new();
         let _ = writeln!(report, "================================================================================");
-        let _ = writeln!(report, "VELOX ZERO-COPY NATIVE RUNTIME EXECUTION REPORT");
+        if cli_args.benchmark {
+            let _ = writeln!(report, "VELOX SOTA ROOFLINE INFERENCE BENCHMARK REPORT");
+        } else {
+            let _ = writeln!(report, "VELOX ZERO-COPY NATIVE RUNTIME EXECUTION REPORT");
+        }
         let _ = writeln!(report, "================================================================================");
         let _ = writeln!(report, "Model                  : {}", first_model.name);
+        let _ = writeln!(report, "Backend                : Native Rust AVX2/FMA3 on Host CPU");
         let _ = writeln!(report, "Safetensors Weights    : {} (Zero-Copy Win32 Memory Mapped)", weights_file);
         let _ = writeln!(
             report,
             "Prompt Tokens ({})      : {:?}",
-            cli_args.prompt_tokens.len(),
-            cli_args.prompt_tokens
+            prompt_tokens.len(),
+            prompt_tokens
         );
         let _ = writeln!(
             report,
@@ -1013,15 +1476,47 @@ fn execute_compilation(
             generated_tokens
         );
         let _ = writeln!(report, "Full Token Sequence    : {:?}", full_sequence);
-        let _ = writeln!(report, "Final Step Top-5 Logits:");
-        for (rank, (tok_id, logit_val)) in top5.iter().enumerate() {
-            let _ = writeln!(report, "  #{}: token_id={} logit={:.6}", rank + 1, tok_id, logit_val);
+        if let Some(ref tok) = tokenizer_opt {
+            let decoded_text = tok.decode(&generated_tokens);
+            let _ = writeln!(report, "Decoded Output Text    : {:?}", decoded_text);
+        }
+        if cli_args.benchmark {
+            let _ = writeln!(report, "TTFT (Prefill Latency) : {:.3} ms", prefill_ms);
+            if cli_args.steps > 1 {
+                let _ = writeln!(
+                    report,
+                    "Decode Latency ({} tok): {:.3} ms ({:.2} tok/s, {:.3} ms/tok)",
+                    cli_args.steps - 1,
+                    decode_ms,
+                    decode_tok_per_sec,
+                    decode_ms / (cli_args.steps - 1) as f64
+                );
+            }
+            let _ = writeln!(report, "Total Inference Time   : {:.3} ms", total_ms);
         }
         let _ = writeln!(
             report,
             "Dynamic Heap Allocs    : {} (measured by Velox counting allocator over prefill + decode)",
             inference_heap_allocs
         );
+        let _ = writeln!(report, "Final Step Top-5 Logits:");
+        for (rank, (tok_id, logit_val)) in top5.iter().enumerate() {
+            let _ = writeln!(report, "  #{}: token_id={} logit={:.6}", rank + 1, tok_id, logit_val);
+        }
+        if cli_args.steps >= 4 {
+            let _ = writeln!(
+                report,
+                "Parity 4-token check   : {}",
+                if match_4 { "PASSED [359, 253, 4028, 282]" } else { "FAILED" }
+            );
+        }
+        if cli_args.steps >= 32 {
+            let _ = writeln!(
+                report,
+                "Parity 32-token check  : {}",
+                if match_32 { "PASSED (Exact match with Velox Rust CPU reference)" } else { "FAILED" }
+            );
+        }
         let _ = writeln!(report, "================================================================================");
 
         if let Err(io_code) = write_output_text(&report, cli_args.output.as_deref(), stdout, stderr) {
@@ -1157,5 +1652,67 @@ mod tests {
     #[test]
     fn test_parse_missing_input_file() {
         assert!(parse_cli_args(&[]).is_err());
+    }
+
+    #[test]
+    fn test_parse_backend_options() {
+        let args_cuda = vec!["--run".to_string(), "--backend".to_string(), "cuda".to_string(), "model.vlx".to_string()];
+        match parse_cli_args(&args_cuda) {
+            Ok(CliAction::Run(cli)) => {
+                assert!(cli.run_model);
+                assert_eq!(cli.backend, ExecutionBackend::Cuda);
+            }
+            other => panic!("Unexpected action: {other:?}"),
+        }
+
+        let args_c99 = vec!["--run".to_string(), "--backend=c99".to_string(), "model.vlx".to_string()];
+        match parse_cli_args(&args_c99) {
+            Ok(CliAction::Run(cli)) => {
+                assert!(cli.run_model);
+                assert_eq!(cli.backend, ExecutionBackend::C99);
+            }
+            other => panic!("Unexpected action: {other:?}"),
+        }
+
+        let args_rust = vec!["--run".to_string(), "--backend".to_string(), "rust".to_string(), "model.vlx".to_string()];
+        match parse_cli_args(&args_rust) {
+            Ok(CliAction::Run(cli)) => {
+                assert!(cli.run_model);
+                assert_eq!(cli.backend, ExecutionBackend::Rust);
+            }
+            other => panic!("Unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_prompt_and_benchmark_options() {
+        let args = vec![
+            "--run".to_string(),
+            "--backend".to_string(),
+            "rust".to_string(),
+            "--prompt".to_string(),
+            "The you".to_string(),
+            "--steps".to_string(),
+            "4".to_string(),
+            "--benchmark".to_string(),
+            "--warmup".to_string(),
+            "1".to_string(),
+            "--threads".to_string(),
+            "8".to_string(),
+            "examples/tinystories_smollm.vlx".to_string(),
+        ];
+        match parse_cli_args(&args) {
+            Ok(CliAction::Run(cli)) => {
+                assert!(cli.run_model);
+                assert_eq!(cli.backend, ExecutionBackend::Rust);
+                assert_eq!(cli.prompt_text, Some("The you".to_string()));
+                assert_eq!(cli.steps, 4);
+                assert!(cli.benchmark);
+                assert_eq!(cli.warmup, 1);
+                assert_eq!(cli.threads, Some(8));
+                assert_eq!(cli.input_file, "examples/tinystories_smollm.vlx");
+            }
+            other => panic!("Unexpected action: {other:?}"),
+        }
     }
 }
