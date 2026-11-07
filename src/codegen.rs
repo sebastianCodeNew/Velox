@@ -2060,7 +2060,13 @@ impl CodeGenerator {
 
         // --- 1.11 Step 15: Vectorized FP16 (__half2) & Marlin LOP3 INT4 (w4a16) Kernels ---
         let _ = writeln!(out, "__device__ __forceinline__ uint32_t velox_ptx_lop3_0xEA(uint32_t a, uint32_t b, uint32_t c) {{");
+        let _ = writeln!(out, "#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)");
+        let _ = writeln!(out, "    uint32_t result;");
+        let _ = writeln!(out, "    asm(\"lop3.b32 %0, %1, %2, %3, 0xEA;\" : \"=r\"(result) : \"r\"(a), \"r\"(b), \"r\"(c));");
+        let _ = writeln!(out, "    return result;");
+        let _ = writeln!(out, "#else");
         let _ = writeln!(out, "    return (a & b) | c;");
+        let _ = writeln!(out, "#endif");
         let _ = writeln!(out, "}}");
         let _ = writeln!(out);
         let _ = writeln!(out, "__device__ __forceinline__ half2 velox_u32_as_half2(uint32_t v) {{");
@@ -2090,19 +2096,37 @@ impl CodeGenerator {
         let _ = writeln!(out);
         let _ = writeln!(out, "__device__ __forceinline__ float velox_warp_dot_f16(const __half* __restrict__ row_w, const float* __restrict__ x, size_t dim, size_t lane_id) {{");
         let _ = writeln!(out, "    float acc = 0.0f;");
-        let _ = writeln!(out, "    const size_t steps = dim / 128ULL;");
+        let _ = writeln!(out, "    const size_t steps = dim / 256ULL;");
         let _ = writeln!(out, "    for (size_t s = 0; s < steps; ++s) {{");
-        let _ = writeln!(out, "        const size_t k_offset = s * 128ULL + (lane_id * 4ULL);");
-        let _ = writeln!(out, "        const uint2 w_u2 = __ldg(reinterpret_cast<const uint2*>(&row_w[k_offset]));");
-        let _ = writeln!(out, "        const float4 in_v = *reinterpret_cast<const float4*>(&x[k_offset]);");
-        let _ = writeln!(out, "        const float2 w01 = __half22float2(velox_u32_as_half2(w_u2.x));");
-        let _ = writeln!(out, "        const float2 w23 = __half22float2(velox_u32_as_half2(w_u2.y));");
-        let _ = writeln!(out, "        acc += in_v.x * w01.x + in_v.y * w01.y + in_v.z * w23.x + in_v.w * w23.y;");
+        let _ = writeln!(out, "        const size_t k_offset = s * 256ULL + (lane_id * 8ULL);");
+        let _ = writeln!(out, "        const uint4 w_u4 = __ldg(reinterpret_cast<const uint4*>(&row_w[k_offset]));");
+        let _ = writeln!(out, "        const float4 in0 = *reinterpret_cast<const float4*>(&x[k_offset]);");
+        let _ = writeln!(out, "        const float4 in1 = *reinterpret_cast<const float4*>(&x[k_offset + 4ULL]);");
+        let _ = writeln!(out, "        const float2 w01 = __half22float2(velox_u32_as_half2(w_u4.x));");
+        let _ = writeln!(out, "        const float2 w23 = __half22float2(velox_u32_as_half2(w_u4.y));");
+        let _ = writeln!(out, "        const float2 w45 = __half22float2(velox_u32_as_half2(w_u4.z));");
+        let _ = writeln!(out, "        const float2 w67 = __half22float2(velox_u32_as_half2(w_u4.w));");
+        let _ = writeln!(out, "        acc += in0.x * w01.x + in0.y * w01.y + in0.z * w23.x + in0.w * w23.y");
+        let _ = writeln!(out, "             + in1.x * w45.x + in1.y * w45.y + in1.z * w67.x + in1.w * w67.y;");
         let _ = writeln!(out, "    }}");
-        let _ = writeln!(out, "    const size_t tail_start = steps * 128ULL;");
-        let _ = writeln!(out, "    const size_t remaining_f4 = (dim - tail_start) / 4ULL;");
+        let _ = writeln!(out, "    const size_t tail_start = steps * 256ULL;");
+        let _ = writeln!(out, "    const size_t remaining_f8 = (dim - tail_start) / 8ULL;");
+        let _ = writeln!(out, "    if (lane_id < remaining_f8) {{");
+        let _ = writeln!(out, "        const size_t k_offset = tail_start + (lane_id * 8ULL);");
+        let _ = writeln!(out, "        const uint4 w_u4 = __ldg(reinterpret_cast<const uint4*>(&row_w[k_offset]));");
+        let _ = writeln!(out, "        const float4 in0 = *reinterpret_cast<const float4*>(&x[k_offset]);");
+        let _ = writeln!(out, "        const float4 in1 = *reinterpret_cast<const float4*>(&x[k_offset + 4ULL]);");
+        let _ = writeln!(out, "        const float2 w01 = __half22float2(velox_u32_as_half2(w_u4.x));");
+        let _ = writeln!(out, "        const float2 w23 = __half22float2(velox_u32_as_half2(w_u4.y));");
+        let _ = writeln!(out, "        const float2 w45 = __half22float2(velox_u32_as_half2(w_u4.z));");
+        let _ = writeln!(out, "        const float2 w67 = __half22float2(velox_u32_as_half2(w_u4.w));");
+        let _ = writeln!(out, "        acc += in0.x * w01.x + in0.y * w01.y + in0.z * w23.x + in0.w * w23.y");
+        let _ = writeln!(out, "             + in1.x * w45.x + in1.y * w45.y + in1.z * w67.x + in1.w * w67.y;");
+        let _ = writeln!(out, "    }}");
+        let _ = writeln!(out, "    const size_t tail_start_4 = tail_start + remaining_f8 * 8ULL;");
+        let _ = writeln!(out, "    const size_t remaining_f4 = (dim - tail_start_4) / 4ULL;");
         let _ = writeln!(out, "    if (lane_id < remaining_f4) {{");
-        let _ = writeln!(out, "        const size_t k_offset = tail_start + (lane_id * 4ULL);");
+        let _ = writeln!(out, "        const size_t k_offset = tail_start_4 + (lane_id * 4ULL);");
         let _ = writeln!(out, "        const uint2 w_u2 = __ldg(reinterpret_cast<const uint2*>(&row_w[k_offset]));");
         let _ = writeln!(out, "        const float4 in_v = *reinterpret_cast<const float4*>(&x[k_offset]);");
         let _ = writeln!(out, "        const float2 w01 = __half22float2(velox_u32_as_half2(w_u2.x));");
@@ -2975,5 +2999,29 @@ mod tests {
         assert!(cu_code.contains("state->token = winner;"));
         assert!(cu_code.contains("state->step = step + 1ULL;"));
     }
+
+    #[test]
+    fn test_codegen_vectorized_fp16_and_marlin_lop3_int4() {
+        let file = "examples/tinystories_smollm.vlx";
+        let src = std::fs::read_to_string(file).unwrap();
+        let mut parser = Parser::from_source(&src, file).unwrap();
+        let prog = parser.parse().unwrap();
+        let typed = SemanticAnalyzer::new().analyze(&prog).unwrap();
+        let plans = StaticMemoryPlanner::new().plan_program(&typed).unwrap();
+        let mut modules = lower_program_to_vir(&typed, &plans);
+        optimize_vir_module(&mut modules[0]);
+
+        let cu_code = CodeGenerator::emit_cuda(&modules[0]);
+        // 1. Explicit PTX inline assembly for Ampere sm_86 lop3.b32
+        assert!(cu_code.contains("asm(\"lop3.b32 %0, %1, %2, %3, 0xEA;\" : \"=r\"(result) : \"r\"(a), \"r\"(b), \"r\"(c));"));
+        // 2. 128-bit vectorized uint4 loads in FP16 dot product
+        assert!(cu_code.contains("const uint4 w_u4 = __ldg(reinterpret_cast<const uint4*>(&row_w[k_offset]));"));
+        // 3. Marlin INT4 group-64 kernels
+        assert!(cu_code.contains("velox_marlin_dot8_q4"));
+        assert!(cu_code.contains("velox_warp_dot_q4"));
+        assert!(cu_code.contains("velox_cuda_f32_to_f16_kernel"));
+        assert!(cu_code.contains("velox_cuda_quantize_q4_group64_kernel"));
+    }
 }
+
 

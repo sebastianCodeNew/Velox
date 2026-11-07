@@ -1168,7 +1168,13 @@ __global__ void __launch_bounds__(256) velox_cuda_final_norm_argmax(
 }
 
 __device__ __forceinline__ uint32_t velox_ptx_lop3_0xEA(uint32_t a, uint32_t b, uint32_t c) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
+    uint32_t result;
+    asm("lop3.b32 %0, %1, %2, %3, 0xEA;" : "=r"(result) : "r"(a), "r"(b), "r"(c));
+    return result;
+#else
     return (a & b) | c;
+#endif
 }
 
 __device__ __forceinline__ half2 velox_u32_as_half2(uint32_t v) {
@@ -1198,19 +1204,37 @@ __device__ __forceinline__ float velox_marlin_dot8_q4(uint32_t packed, half2 sm_
 
 __device__ __forceinline__ float velox_warp_dot_f16(const __half* __restrict__ row_w, const float* __restrict__ x, size_t dim, size_t lane_id) {
     float acc = 0.0f;
-    const size_t steps = dim / 128ULL;
+    const size_t steps = dim / 256ULL;
     for (size_t s = 0; s < steps; ++s) {
-        const size_t k_offset = s * 128ULL + (lane_id * 4ULL);
-        const uint2 w_u2 = __ldg(reinterpret_cast<const uint2*>(&row_w[k_offset]));
-        const float4 in_v = *reinterpret_cast<const float4*>(&x[k_offset]);
-        const float2 w01 = __half22float2(velox_u32_as_half2(w_u2.x));
-        const float2 w23 = __half22float2(velox_u32_as_half2(w_u2.y));
-        acc += in_v.x * w01.x + in_v.y * w01.y + in_v.z * w23.x + in_v.w * w23.y;
+        const size_t k_offset = s * 256ULL + (lane_id * 8ULL);
+        const uint4 w_u4 = __ldg(reinterpret_cast<const uint4*>(&row_w[k_offset]));
+        const float4 in0 = *reinterpret_cast<const float4*>(&x[k_offset]);
+        const float4 in1 = *reinterpret_cast<const float4*>(&x[k_offset + 4ULL]);
+        const float2 w01 = __half22float2(velox_u32_as_half2(w_u4.x));
+        const float2 w23 = __half22float2(velox_u32_as_half2(w_u4.y));
+        const float2 w45 = __half22float2(velox_u32_as_half2(w_u4.z));
+        const float2 w67 = __half22float2(velox_u32_as_half2(w_u4.w));
+        acc += in0.x * w01.x + in0.y * w01.y + in0.z * w23.x + in0.w * w23.y
+             + in1.x * w45.x + in1.y * w45.y + in1.z * w67.x + in1.w * w67.y;
     }
-    const size_t tail_start = steps * 128ULL;
-    const size_t remaining_f4 = (dim - tail_start) / 4ULL;
+    const size_t tail_start = steps * 256ULL;
+    const size_t remaining_f8 = (dim - tail_start) / 8ULL;
+    if (lane_id < remaining_f8) {
+        const size_t k_offset = tail_start + (lane_id * 8ULL);
+        const uint4 w_u4 = __ldg(reinterpret_cast<const uint4*>(&row_w[k_offset]));
+        const float4 in0 = *reinterpret_cast<const float4*>(&x[k_offset]);
+        const float4 in1 = *reinterpret_cast<const float4*>(&x[k_offset + 4ULL]);
+        const float2 w01 = __half22float2(velox_u32_as_half2(w_u4.x));
+        const float2 w23 = __half22float2(velox_u32_as_half2(w_u4.y));
+        const float2 w45 = __half22float2(velox_u32_as_half2(w_u4.z));
+        const float2 w67 = __half22float2(velox_u32_as_half2(w_u4.w));
+        acc += in0.x * w01.x + in0.y * w01.y + in0.z * w23.x + in0.w * w23.y
+             + in1.x * w45.x + in1.y * w45.y + in1.z * w67.x + in1.w * w67.y;
+    }
+    const size_t tail_start_4 = tail_start + remaining_f8 * 8ULL;
+    const size_t remaining_f4 = (dim - tail_start_4) / 4ULL;
     if (lane_id < remaining_f4) {
-        const size_t k_offset = tail_start + (lane_id * 4ULL);
+        const size_t k_offset = tail_start_4 + (lane_id * 4ULL);
         const uint2 w_u2 = __ldg(reinterpret_cast<const uint2*>(&row_w[k_offset]));
         const float4 in_v = *reinterpret_cast<const float4*>(&x[k_offset]);
         const float2 w01 = __half22float2(velox_u32_as_half2(w_u2.x));
