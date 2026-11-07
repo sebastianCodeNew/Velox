@@ -511,6 +511,10 @@ int main(int argc, char** argv) {
     float ttft_gpu_ms = 0.0f;
     cudaEventElapsedTime(&ttft_gpu_ms, ev_prefill_start, ev_prefill_stop);
 
+    // Fetch step 0 token 359 target logit immediately after prefill phase completes
+    float step0_token_359_logit = 0.0f;
+    cudaMemcpy(&step0_token_359_logit, (const float*)ctx.activation_arena + 359, sizeof(float), cudaMemcpyDeviceToHost);
+
     uint32_t next_tok = h_ring[(prompt_len - 1) & 1023ULL];
     if (steps > 0) {
         generated_tokens[0] = next_tok;
@@ -641,17 +645,29 @@ int main(int argc, char** argv) {
 
     if (quant_mode == VELOX_QUANT_Q4_0) {
         if (steps >= 4) {
-            printf("Parity 4-token check   : PASSED (Marlin INT4 w4a16 execution valid, 0 dynamic allocations)\n");
+            if (match_4) {
+                printf("Parity 4-token check   : PASSED [359, 253, 4028, 282]\n");
+            } else {
+                printf("Parity 4-token check   : DIVERGED [%u, %u, %u, %u] (INT4 quantization noise vs FP32)\n",
+                       generated_tokens[0], generated_tokens[1], generated_tokens[2], generated_tokens[3]);
+            }
         } else {
             printf("Parity 4-token check   : SKIPPED (fewer than 4 steps requested: %zu)\n", steps);
         }
 
         if (steps >= 32) {
-            printf("Parity 32-token check  : PASSED (Quantized INT4 32-token sequence generated)\n");
+            if (match_32) {
+                printf("Parity 32-token check  : PASSED (Exact match with Velox Rust CPU reference)\n");
+            } else {
+                printf("Parity 32-token check  : DIVERGED (INT4 quantization noise vs FP32)\n");
+            }
         } else {
             printf("Parity 32-token check  : SKIPPED (fewer than 32 steps requested: %zu)\n", steps);
         }
-        printf("Accuracy Metric Check  : PASSED (Step 0 target logit error <= 0.03 relative to FP32 reference)\n");
+
+        float delta = fabsf(step0_token_359_logit - 18.586565f);
+        printf("Accuracy Metric Check  : %s (Step 0 target logit error = %.6f relative to FP32 reference)\n",
+               delta <= 0.03f ? "PASSED" : "FAILED", delta);
     } else {
         if (steps >= 4) {
             printf("Parity 4-token check   : %s\n", match_4 ? "PASSED [359, 253, 4028, 282]" : "FAILED");
@@ -683,8 +699,13 @@ int main(int argc, char** argv) {
     win32_safetensors_close(&st_map);
 
     int exit_code = 0;
-    if (quant_mode == VELOX_QUANT_Q4_0) {
-        exit_code = 0;
+    cudaError_t last_err = cudaGetLastError();
+    if (last_err != cudaSuccess) {
+        fprintf(stderr, "CUDA error detected: %s\n", cudaGetErrorString(last_err));
+        exit_code = 1;
+    } else if (quant_mode == VELOX_QUANT_Q4_0) {
+        float delta = fabsf(step0_token_359_logit - 18.586565f);
+        exit_code = (delta <= 0.03f) ? 0 : 2;
     } else if (steps >= 32) {
         exit_code = (match_4 && match_32) ? 0 : 2;
     } else if (steps >= 4) {
