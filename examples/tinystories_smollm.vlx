@@ -23,32 +23,32 @@ model SmolLM_135M<
     const HEAD_DIM: usize = 64
 > {
     // Model Parameter Weights (Mapped directly via zero-copy safetensors)
-    @vram_immutable weight w_embed: Tensor<[VOCAB, HIDDEN_DIM], f16> = 
+    @vram_immutable weight w_embed: Tensor<[VOCAB, HIDDEN_DIM], f32> = 
         safetensors("smollm-135m.safetensors", "model.embed_tokens.weight");
 
-    @vram_immutable weight w_q: Tensor<[NUM_LAYERS, HIDDEN_DIM, 576], f16> = 
+    @vram_immutable weight w_q: Tensor<[NUM_LAYERS, HIDDEN_DIM, 576], f32> = 
         safetensors("smollm-135m.safetensors", "model.layers.q_proj.weight");
-    @vram_immutable weight w_k: Tensor<[NUM_LAYERS, HIDDEN_DIM, 192], f16> = 
+    @vram_immutable weight w_k: Tensor<[NUM_LAYERS, HIDDEN_DIM, 192], f32> = 
         safetensors("smollm-135m.safetensors", "model.layers.k_proj.weight");
-    @vram_immutable weight w_v: Tensor<[NUM_LAYERS, HIDDEN_DIM, 192], f16> = 
+    @vram_immutable weight w_v: Tensor<[NUM_LAYERS, HIDDEN_DIM, 192], f32> = 
         safetensors("smollm-135m.safetensors", "model.layers.v_proj.weight");
-    @vram_immutable weight w_out: Tensor<[NUM_LAYERS, 576, HIDDEN_DIM], f16> = 
+    @vram_immutable weight w_out: Tensor<[NUM_LAYERS, 576, HIDDEN_DIM], f32> = 
         safetensors("smollm-135m.safetensors", "model.layers.o_proj.weight");
 
-    @vram_immutable weight w_gate: Tensor<[NUM_LAYERS, HIDDEN_DIM, INTERMEDIATE_DIM], f16> = 
+    @vram_immutable weight w_gate: Tensor<[NUM_LAYERS, HIDDEN_DIM, INTERMEDIATE_DIM], f32> = 
         safetensors("smollm-135m.safetensors", "model.layers.gate_proj.weight");
-    @vram_immutable weight w_up: Tensor<[NUM_LAYERS, HIDDEN_DIM, INTERMEDIATE_DIM], f16> = 
+    @vram_immutable weight w_up: Tensor<[NUM_LAYERS, HIDDEN_DIM, INTERMEDIATE_DIM], f32> = 
         safetensors("smollm-135m.safetensors", "model.layers.up_proj.weight");
-    @vram_immutable weight w_down: Tensor<[NUM_LAYERS, INTERMEDIATE_DIM, HIDDEN_DIM], f16> = 
+    @vram_immutable weight w_down: Tensor<[NUM_LAYERS, INTERMEDIATE_DIM, HIDDEN_DIM], f32> = 
         safetensors("smollm-135m.safetensors", "model.layers.down_proj.weight");
 
-    @vram_immutable weight w_attn_norm: Tensor<[NUM_LAYERS, HIDDEN_DIM], f16> = 
+    @vram_immutable weight w_attn_norm: Tensor<[NUM_LAYERS, HIDDEN_DIM], f32> = 
         safetensors("smollm-135m.safetensors", "model.layers.input_layernorm.weight");
-    @vram_immutable weight w_mlp_norm: Tensor<[NUM_LAYERS, HIDDEN_DIM], f16> = 
+    @vram_immutable weight w_mlp_norm: Tensor<[NUM_LAYERS, HIDDEN_DIM], f32> = 
         safetensors("smollm-135m.safetensors", "model.layers.post_attention_layernorm.weight");
-    @vram_immutable weight w_final_norm: Tensor<[HIDDEN_DIM], f16> = 
+    @vram_immutable weight w_final_norm: Tensor<[HIDDEN_DIM], f32> = 
         safetensors("smollm-135m.safetensors", "model.norm.weight");
-    @vram_immutable weight w_head: Tensor<[HIDDEN_DIM, VOCAB], f16> = 
+    @vram_immutable weight w_head: Tensor<[HIDDEN_DIM, VOCAB], f32> = 
         safetensors("smollm-135m.safetensors", "lm_head.weight");
 
     // Native Paged Key-Value Cache Pool (Block size 16)

@@ -1,0 +1,593 @@
+{
+  "timestamp_utc": "2026-11-07T13:08:17Z",
+  "agent": "teamwork_challenger_m3_1",
+  "negative_tests": {
+    "bench_harness_output_flag": {
+      "command": "C:\\Users\\user\\AppData\\Local\\Programs\\Python\\Python312\\python.exe C:\\Sebastian\\Project\\Velox\\benchmarks\\run_empirical_benchmarks.py --warmup 1 --metered 5 --output benchmarks/verify_test_records.json",
+      "exit_code": 0,
+      "stdout": "================================================================================\nVELOX EMPIRICAL BENCHMARK SUITE - AUTOMATED 4-WAY EVALUATION\nModel       : SmolLM-135M (smollm-135m.safetensors, 538,090,408 bytes)\nGPU Target  : NVIDIA GeForce RTX 3050 Laptop GPU (4096 MiB VRAM)\nWarmup Runs : 1 per target\nMetered Runs: 5 per target (Total 6 runs each)\n================================================================================\n\n>>> Running Target: Velox Emitted CUDA Standalone Runner on NVIDIA GeForce RTX 3050 Laptop GPU (sm_86)\n  Executing 1 unmetered warmup runs to stabilize JIT/OS caches...\n    Warmup [1/1]: TTFT=217.7ms, Tok/s=14.61, Parity=MATCH\n  Executing 5 metered evaluation runs...\n    Run [ 1/5]: TTFT=195.68ms | Throughput=14.59 tok/s | StepLat=68.52ms | Parity=MATCH\n    Run [ 2/5]: TTFT=195.65ms | Throughput=14.57 tok/s | StepLat=68.66ms | Parity=MATCH\n    Run [ 3/5]: TTFT=195.87ms | Throughput=14.59 tok/s | StepLat=68.52ms | Parity=MATCH\n    Run [ 4/5]: TTFT=195.75ms | Throughput=14.59 tok/s | StepLat=68.53ms | Parity=MATCH\n    Run [ 5/5]: TTFT=195.60ms | Throughput=14.61 tok/s | StepLat=68.47ms | Parity=MATCH\n\n>>> Running Target: Velox Emitted C99 Standalone Runner (MSVC /O2) on Host CPU\n  Executing 1 unmetered warmup runs to stabilize JIT/OS caches...\n    Warmup [1/1]: TTFT=205.3ms, Tok/s=14.41, Parity=MATCH\n  Executing 5 metered evaluation runs...\n    Run [ 1/5]: TTFT=223.81ms | Throughput=13.49 tok/s | StepLat=74.12ms | Parity=MATCH\n    Run [ 2/5]: TTFT=218.40ms | Throughput=12.10 tok/s | StepLat=82.65ms | Parity=MATCH\n    Run [ 3/5]: TTFT=227.51ms | Throughput=12.81 tok/s | StepLat=78.03ms | Parity=MATCH\n    Run [ 4/5]: TTFT=224.98ms | Throughput=13.24 tok/s | StepLat=75.54ms | Parity=MATCH\n    Run [ 5/5]: TTFT=182.97ms | Throughput=17.35 tok/s | StepLat=57.65ms | Parity=MATCH\n\n>>> Running Target: Velox Native Rust Zero-Copy CPU Runtime (veloxc.exe --run)\n  Executing 1 unmetered warmup runs to stabilize JIT/OS caches...\n    Warmup [1/1]: TTFT=472.6ms, Tok/s=11.03, Parity=MATCH\n  Executing 5 metered evaluation runs...\n    Run [ 1/5]: TTFT=472.64ms | Throughput= 9.55 tok/s | StepLat=104.70ms | Parity=MATCH\n    Run [ 2/5]: TTFT=472.64ms | Throughput= 9.12 tok/s | StepLat=109.62ms | Parity=MATCH\n    Run [ 3/5]: TTFT=472.64ms | Throughput= 8.95 tok/s | StepLat=111.79ms | Parity=MATCH\n    Run [ 4/5]: TTFT=472.64ms | Throughput=13.37 tok/s | StepLat=74.77ms | Parity=MATCH\n    Run [ 5/5]: TTFT=472.64ms | Throughput=15.80 tok/s | StepLat=63.28ms | Parity=MATCH\n\n>>> Running Target: Baseline Reference Forward Pass (NumPy Float32, un-fused layer execution)\n  Executing 1 unmetered warmup runs to stabilize JIT/OS caches...\n    Warmup [1/1]: TTFT=268.4ms, Tok/s=8.50, Parity=MATCH\n  Executing 5 metered evaluation runs...\n    Run [ 1/5]: TTFT=187.26ms | Throughput=15.53 tok/s | StepLat=64.39ms | Parity=MATCH\n    Run [ 2/5]: TTFT=209.45ms | Throughput=14.97 tok/s | StepLat=66.80ms | Parity=MATCH\n    Run [ 3/5]: TTFT=191.30ms | Throughput=14.90 tok/s | StepLat=67.13ms | Parity=MATCH\n    Run [ 4/5]: TTFT=182.38ms | Throughput=15.18 tok/s | StepLat=65.89ms | Parity=MATCH\n    Run [ 5/5]: TTFT=197.12ms | Throughput=14.70 tok/s | StepLat=68.02ms | Parity=MATCH\n\n================================================================================\nBENCHMARK COMPLETED SUCCESSFULLY! Raw records written to: C:\\Sebastian\\Project\\Velox\\benchmarks\\verify_test_records.json\n================================================================================\n\n-------------------------------------------------------------------------------------------------------------------\nTarget Execution Engine          | TTFT (ms)        | Throughput (tok/s)   | Step Lat (p50/p99) | VRAM Net   | Parity \n-------------------------------------------------------------------------------------------------------------------\nVelox Emitted CUDA Standalone Ru | 195.71 +/- 0.10  | 14.59 +/- 0.01       | 68.52 / 68.65      | 1182.5 MiB | MATCH  \nVelox Emitted C99 Standalone Run | 215.53 +/- 18.51 | 13.80 +/- 2.05       | 75.54 / 82.46      | 0.0 MiB    | MATCH  \nVelox Native Rust Zero-Copy CPU  | 472.64 +/- 0.00  | 11.36 +/- 3.08       | 104.70 / 111.70    | 0.0 MiB    | MATCH  \nBaseline Reference Forward Pass  | 193.50 +/- 10.43 | 15.06 +/- 0.32       | 66.80 / 67.99      | 0.0 MiB    | MATCH  \n-------------------------------------------------------------------------------------------------------------------",
+      "stderr": "",
+      "has_defect": false,
+      "verdict": "PASSED",
+      "detail": "run_empirical_benchmarks.py does not define '--output' CLI argument in argparse, causing immediate crash."
+    },
+    "bench_harness_invalid_flag": {
+      "command": "C:\\Users\\user\\AppData\\Local\\Programs\\Python\\Python312\\python.exe C:\\Sebastian\\Project\\Velox\\benchmarks\\run_empirical_benchmarks.py --invalid-option-xyz",
+      "exit_code": 2,
+      "handled_gracefully": true,
+      "verdict": "PASSED"
+    },
+    "veloxc_missing_weights": {
+      "command": "C:\\Sebastian\\Project\\Velox\\veloxc.exe --run --weights nonexistent_weights.safetensors --tokens 1,504,346 --steps 4 C:\\Sebastian\\Project\\Velox\\examples\\tinystories_smollm.vlx",
+      "exit_code": 2,
+      "stdout": "",
+      "stderr": "veloxc: runtime error loading safetensors 'nonexistent_weights.safetensors': Safetensors file not found: nonexistent_weights.safetensors",
+      "handled_gracefully": true,
+      "verdict": "PASSED"
+    },
+    "veloxc_invalid_flag": {
+      "command": "C:\\Sebastian\\Project\\Velox\\veloxc.exe --bogus-flag C:\\Sebastian\\Project\\Velox\\examples\\tinystories_smollm.vlx",
+      "exit_code": 3,
+      "handled_gracefully": true,
+      "verdict": "PASSED"
+    },
+    "veloxc_invalid_steps": {
+      "command": "C:\\Sebastian\\Project\\Velox\\veloxc.exe --run --weights C:\\Sebastian\\Project\\Velox\\smollm-135m.safetensors --tokens 1,504,346 --steps invalid_number C:\\Sebastian\\Project\\Velox\\examples\\tinystories_smollm.vlx",
+      "exit_code": 3,
+      "handled_gracefully": true,
+      "verdict": "PASSED"
+    },
+    "cuda_runner_missing_weights": {
+      "command": "C:\\Sebastian\\Project\\Velox\\src\\runners\\velox_cuda_runner.exe --weights nonexistent_weights.safetensors",
+      "exit_code": 1,
+      "handled_gracefully": true,
+      "verdict": "PASSED"
+    },
+    "c99_runner_missing_weights": {
+      "command": "C:\\Sebastian\\Project\\Velox\\src\\runners\\velox_c99_runner.exe --weights nonexistent_weights.safetensors",
+      "exit_code": 1,
+      "handled_gracefully": true,
+      "verdict": "PASSED"
+    }
+  },
+  "boundary_steps_4_tests": {
+    "velox_emitted_cuda": {
+      "tokens": [
+        359,
+        253,
+        4028,
+        282
+      ],
+      "match": true,
+      "exit_code": 0,
+      "exit_code_note": "Exit code 2 is expected when steps < 32 because runner checks 32-token parity only when steps >= 32"
+    },
+    "velox_emitted_c99": {
+      "tokens": [
+        359,
+        253,
+        4028,
+        282
+      ],
+      "match": true,
+      "exit_code": 0,
+      "exit_code_note": "Exit code 2 is expected when steps < 32"
+    },
+    "velox_native_rust": {
+      "tokens": [
+        359,
+        253,
+        4028,
+        282
+      ],
+      "match": true,
+      "exit_code": 0
+    },
+    "baseline_numpy_reference": {
+      "tokens": [
+        359,
+        253,
+        4028,
+        282
+      ],
+      "match": true
+    },
+    "all_targets_4_token_parity": true
+  },
+  "verification_5runs_records": {
+    "benchmark_metadata": {
+      "timestamp_utc": "2026-11-07T13:08:10.396828+00:00",
+      "model_name": "SmolLM-135M",
+      "weights_file": "smollm-135m.safetensors",
+      "weights_sha256": "c7a387d6fe81ca6dd304aeb809bda3932ff1bbef3ca41c9484502f2f448dc093",
+      "weights_size_bytes": 538090408,
+      "prompt_tokens": [
+        1,
+        504,
+        346
+      ],
+      "decode_steps": 32,
+      "warmup_runs": 1,
+      "metered_runs": 5,
+      "hardware": {
+        "gpu_name": "NVIDIA GeForce RTX 3050 Laptop GPU",
+        "gpu_vram_total_mib": 4096.0,
+        "gpu_driver_version": "595.79",
+        "cuda_toolkit_version": "11.2",
+        "compute_capability": "8.6",
+        "cpu_name": "12th Gen Intel(R) Core(TM) i5-12500H",
+        "host_os": "Windows 11 (64bit)",
+        "system_ram_gib": 15.68,
+        "python_version": "3.12.10"
+      }
+    },
+    "targets": {
+      "velox_emitted_cuda": {
+        "target_description": "Velox Emitted CUDA Standalone Runner on NVIDIA GeForce RTX 3050 Laptop GPU (sm_86)",
+        "ttft_ms": {
+          "mean": 195.7124,
+          "stddev": 0.1033,
+          "min": 195.603,
+          "max": 195.869,
+          "p50": 195.684,
+          "p90": 195.823,
+          "p99": 195.8644
+        },
+        "decode_throughput_tok_per_sec": {
+          "mean": 14.59,
+          "stddev": 0.0141,
+          "min": 14.57,
+          "max": 14.61,
+          "p50": 14.59,
+          "p90": 14.602,
+          "p99": 14.6092
+        },
+        "per_step_latency_ms": {
+          "mean": 68.5382,
+          "stddev": 0.0703,
+          "min": 68.469,
+          "max": 68.657,
+          "p50": 68.521,
+          "p90": 68.6046,
+          "p99": 68.6518
+        },
+        "all_step_samples_stats": {
+          "mean": 68.5382,
+          "stddev": 0.0631,
+          "min": 68.469,
+          "max": 68.657,
+          "p50": 68.521,
+          "p90": 68.657,
+          "p99": 68.657
+        },
+        "peak_vram_mib": {
+          "baseline": 134.0,
+          "peak": 1316.5,
+          "net": 1182.5
+        },
+        "peak_host_ram_mib": {
+          "working_set": 623.86
+        },
+        "dynamic_heap_allocations": 0,
+        "token_parity": true,
+        "generated_tokens": [
+          359,
+          253,
+          4028,
+          282,
+          260,
+          1773,
+          30,
+          198,
+          26501,
+          368,
+          281,
+          260,
+          1773,
+          198,
+          20255,
+          3726,
+          288,
+          9517,
+          253,
+          12301,
+          198,
+          19161,
+          354,
+          12301,
+          198,
+          19161,
+          354,
+          12301,
+          198,
+          2683,
+          416,
+          722
+        ],
+        "sample_count": 5
+      },
+      "velox_emitted_c99": {
+        "target_description": "Velox Emitted C99 Standalone Runner (MSVC /O2) on Host CPU",
+        "ttft_ms": {
+          "mean": 215.5318,
+          "stddev": 18.5069,
+          "min": 182.965,
+          "max": 227.512,
+          "p50": 223.807,
+          "p90": 226.4976,
+          "p99": 227.4106
+        },
+        "decode_throughput_tok_per_sec": {
+          "mean": 13.798,
+          "stddev": 2.0544,
+          "min": 12.1,
+          "max": 17.35,
+          "p50": 13.24,
+          "p90": 15.806,
+          "p99": 17.1956
+        },
+        "per_step_latency_ms": {
+          "mean": 73.5974,
+          "stddev": 9.4862,
+          "min": 57.65,
+          "max": 82.648,
+          "p50": 75.538,
+          "p90": 80.8024,
+          "p99": 82.4634
+        },
+        "all_step_samples_stats": {
+          "mean": 73.5974,
+          "stddev": 8.5122,
+          "min": 57.65,
+          "max": 82.648,
+          "p50": 75.538,
+          "p90": 82.648,
+          "p99": 82.648
+        },
+        "peak_vram_mib": {
+          "baseline": 0.0,
+          "peak": 0.0,
+          "net": 0.0
+        },
+        "peak_host_ram_mib": {
+          "working_set": 1902.76
+        },
+        "dynamic_heap_allocations": 0,
+        "token_parity": true,
+        "generated_tokens": [
+          359,
+          253,
+          4028,
+          282,
+          260,
+          1773,
+          30,
+          198,
+          26501,
+          368,
+          281,
+          260,
+          1773,
+          198,
+          20255,
+          3726,
+          288,
+          9517,
+          253,
+          12301,
+          198,
+          19161,
+          354,
+          12301,
+          198,
+          19161,
+          354,
+          12301,
+          198,
+          2683,
+          416,
+          722
+        ],
+        "sample_count": 5
+      },
+      "velox_native_rust": {
+        "target_description": "Velox Native Rust Zero-Copy CPU Runtime (veloxc.exe --run)",
+        "ttft_ms": {
+          "mean": 472.637,
+          "stddev": 0.0,
+          "min": 472.637,
+          "max": 472.637,
+          "p50": 472.637,
+          "p90": 472.637,
+          "p99": 472.637
+        },
+        "decode_throughput_tok_per_sec": {
+          "mean": 11.358,
+          "stddev": 3.0763,
+          "min": 8.95,
+          "max": 15.8,
+          "p50": 9.55,
+          "p90": 14.828,
+          "p99": 15.7028
+        },
+        "per_step_latency_ms": {
+          "mean": 92.8308,
+          "stddev": 22.2575,
+          "min": 63.276,
+          "max": 111.787,
+          "p50": 104.701,
+          "p90": 110.919,
+          "p99": 111.7002
+        },
+        "all_step_samples_stats": {
+          "mean": 92.8307,
+          "stddev": 19.9724,
+          "min": 63.2756,
+          "max": 111.7867,
+          "p50": 104.701,
+          "p90": 111.7867,
+          "p99": 111.7867
+        },
+        "peak_vram_mib": {
+          "baseline": 0.0,
+          "peak": 0.0,
+          "net": 0.0
+        },
+        "peak_host_ram_mib": {
+          "working_set": 520.89
+        },
+        "dynamic_heap_allocations": 0,
+        "token_parity": true,
+        "generated_tokens": [
+          359,
+          253,
+          4028,
+          282,
+          260,
+          1773,
+          30,
+          198,
+          26501,
+          368,
+          281,
+          260,
+          1773,
+          198,
+          20255,
+          3726,
+          288,
+          9517,
+          253,
+          12301,
+          198,
+          19161,
+          354,
+          12301,
+          198,
+          19161,
+          354,
+          12301,
+          198,
+          2683,
+          416,
+          722
+        ],
+        "sample_count": 5
+      },
+      "baseline_numpy_reference": {
+        "target_description": "Baseline Reference Forward Pass (NumPy Float32, un-fused layer execution)",
+        "ttft_ms": {
+          "mean": 193.5002,
+          "stddev": 10.4262,
+          "min": 182.382,
+          "max": 209.448,
+          "p50": 191.297,
+          "p90": 204.5148,
+          "p99": 208.9547
+        },
+        "decode_throughput_tok_per_sec": {
+          "mean": 15.056,
+          "stddev": 0.3156,
+          "min": 14.7,
+          "max": 15.53,
+          "p50": 14.97,
+          "p90": 15.39,
+          "p99": 15.516
+        },
+        "per_step_latency_ms": {
+          "mean": 66.444,
+          "stddev": 1.3807,
+          "min": 64.387,
+          "max": 68.022,
+          "p50": 66.796,
+          "p90": 67.6648,
+          "p99": 67.9863
+        },
+        "all_step_samples_stats": {
+          "mean": 66.4438,
+          "stddev": 3.9334,
+          "min": 59.351,
+          "max": 87.461,
+          "p50": 65.667,
+          "p90": 71.2126,
+          "p99": 76.9462
+        },
+        "peak_vram_mib": {
+          "baseline": 0.0,
+          "peak": 0.0,
+          "net": 0.0
+        },
+        "peak_host_ram_mib": {
+          "working_set": 1089.73
+        },
+        "dynamic_heap_allocations": 13440,
+        "token_parity": true,
+        "generated_tokens": [
+          359,
+          253,
+          4028,
+          282,
+          260,
+          1773,
+          30,
+          198,
+          26501,
+          368,
+          281,
+          260,
+          1773,
+          198,
+          20255,
+          3726,
+          288,
+          9517,
+          253,
+          12301,
+          198,
+          19161,
+          354,
+          12301,
+          198,
+          19161,
+          354,
+          12301,
+          198,
+          2683,
+          416,
+          722
+        ],
+        "sample_count": 5
+      }
+    },
+    "comparative_speedups": {
+      "cuda_vs_numpy_throughput_ratio": 0.969,
+      "c99_vs_numpy_throughput_ratio": 0.9164,
+      "c99_vs_rust_throughput_ratio": 1.2148,
+      "rust_vs_numpy_throughput_ratio": 0.7544,
+      "c99_ttft_speedup_vs_cuda": 0.908,
+      "c99_ttft_speedup_vs_numpy": 0.8978
+    }
+  },
+  "statistical_consistency": {
+    "velox_emitted_cuda": {
+      "ttft_ms": {
+        "master_30run_mean": 196.0142,
+        "master_30run_stddev": 0.679,
+        "verify_5run_mean": 195.7124,
+        "verify_5run_stddev": 0.1033,
+        "pct_difference": 0.15,
+        "is_consistent": true
+      },
+      "decode_throughput_tok_per_sec": {
+        "master_30run_mean": 14.5733,
+        "master_30run_stddev": 0.0471,
+        "verify_5run_mean": 14.59,
+        "verify_5run_stddev": 0.0141,
+        "pct_difference": 0.11,
+        "is_consistent": true
+      },
+      "per_step_latency_ms": {
+        "master_30run_mean": 68.6185,
+        "master_30run_stddev": 0.2184,
+        "verify_5run_mean": 68.5382,
+        "verify_5run_stddev": 0.0703,
+        "pct_difference": 0.12,
+        "is_consistent": true
+      },
+      "token_parity_verified": true,
+      "heap_allocations_match": true
+    },
+    "velox_emitted_c99": {
+      "ttft_ms": {
+        "master_30run_mean": 156.5872,
+        "master_30run_stddev": 8.3182,
+        "verify_5run_mean": 215.5318,
+        "verify_5run_stddev": 18.5069,
+        "pct_difference": 37.64,
+        "is_consistent": false
+      },
+      "decode_throughput_tok_per_sec": {
+        "master_30run_mean": 18.9917,
+        "master_30run_stddev": 0.5011,
+        "verify_5run_mean": 13.798,
+        "verify_5run_stddev": 2.0544,
+        "pct_difference": 27.35,
+        "is_consistent": false
+      },
+      "per_step_latency_ms": {
+        "master_30run_mean": 52.6909,
+        "master_30run_stddev": 1.4151,
+        "verify_5run_mean": 73.5974,
+        "verify_5run_stddev": 9.4862,
+        "pct_difference": 39.68,
+        "is_consistent": false
+      },
+      "token_parity_verified": true,
+      "heap_allocations_match": true
+    },
+    "velox_native_rust": {
+      "ttft_ms": {
+        "master_30run_mean": 341.8632,
+        "master_30run_stddev": 29.8665,
+        "verify_5run_mean": 472.637,
+        "verify_5run_stddev": 0.0,
+        "pct_difference": 38.25,
+        "is_consistent": false
+      },
+      "decode_throughput_tok_per_sec": {
+        "master_30run_mean": 14.7653,
+        "master_30run_stddev": 0.7246,
+        "verify_5run_mean": 11.358,
+        "verify_5run_stddev": 3.0763,
+        "pct_difference": 23.08,
+        "is_consistent": false
+      },
+      "per_step_latency_ms": {
+        "master_30run_mean": 67.8853,
+        "master_30run_stddev": 3.4424,
+        "verify_5run_mean": 92.8308,
+        "verify_5run_stddev": 22.2575,
+        "pct_difference": 36.75,
+        "is_consistent": false
+      },
+      "token_parity_verified": true,
+      "heap_allocations_match": true
+    },
+    "baseline_numpy_reference": {
+      "ttft_ms": {
+        "master_30run_mean": 184.0161,
+        "master_30run_stddev": 18.9622,
+        "verify_5run_mean": 193.5002,
+        "verify_5run_stddev": 10.4262,
+        "pct_difference": 5.15,
+        "is_consistent": true
+      },
+      "decode_throughput_tok_per_sec": {
+        "master_30run_mean": 15.5597,
+        "master_30run_stddev": 0.3647,
+        "verify_5run_mean": 15.056,
+        "verify_5run_stddev": 0.3156,
+        "pct_difference": 3.24,
+        "is_consistent": true
+      },
+      "per_step_latency_ms": {
+        "master_30run_mean": 64.3003,
+        "master_30run_stddev": 1.5254,
+        "verify_5run_mean": 66.444,
+        "verify_5run_stddev": 1.3807,
+        "pct_difference": 3.33,
+        "is_consistent": true
+      },
+      "token_parity_verified": true,
+      "heap_allocations_match": true
+    }
+  },
+  "overall_summary": {
+    "token_parity_4_steps": true,
+    "token_parity_32_steps": true,
+    "metrics_consistent_with_baseline": false,
+    "zero_heap_alloc_invariant": true,
+    "harness_output_flag_defect": false,
+    "verdict": "REQUEST_CHANGES"
+  }
+}

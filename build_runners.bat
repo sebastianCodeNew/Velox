@@ -1,0 +1,63 @@
+@echo off
+setlocal enabledelayedexpansion
+
+echo ============================================================================
+echo Velox Milestone 2 Standalone C99 and CUDA Runner Build System
+echo ============================================================================
+
+set ROOT=%~dp0
+set RUNNERS_DIR=%ROOT%src\runners
+
+set VCVARS="C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+set NVCC="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.2\bin\nvcc.exe"
+
+if not exist %VCVARS% (
+    echo [ERROR] MSVC vcvars64.bat not found at %VCVARS%
+    exit /b 1
+)
+
+if not exist %NVCC% (
+    echo [ERROR] CUDA nvcc.exe not found at %NVCC%
+    exit /b 1
+)
+
+echo [1/4] Initializing 64-bit MSVC Environment...
+call %VCVARS% >nul 2>&1
+if %ERRORLEVEL% neq 0 (
+    echo [ERROR] Failed to initialize MSVC vcvars64.bat
+    exit /b 1
+)
+
+echo [2/4] Emitting latest C99 and CUDA source from examples\tinystories_smollm.vlx...
+if exist "%ROOT%target\release\veloxc.exe" (
+    "%ROOT%target\release\veloxc.exe" --emit-c "%ROOT%examples\tinystories_smollm.vlx" -o "%RUNNERS_DIR%\tinystories_smollm.c"
+    "%ROOT%target\release\veloxc.exe" --emit-cuda "%ROOT%examples\tinystories_smollm.vlx" -o "%RUNNERS_DIR%\tinystories_smollm.cu"
+)
+
+echo [3/4] Compiling velox_c99_runner.exe (MSVC cl.exe /O2)...
+pushd "%RUNNERS_DIR%"
+cl.exe /nologo /O2 /I. /Fe:velox_c99_runner.exe velox_c99_runner.c
+if %ERRORLEVEL% neq 0 (
+    echo [ERROR] Failed to compile velox_c99_runner.c
+    popd
+    exit /b 1
+)
+echo [OK] Built %RUNNERS_DIR%\velox_c99_runner.exe
+
+echo [4/4] Compiling velox_cuda_runner.exe (NVCC -O3 -arch=sm_86)...
+%NVCC% -O3 -arch=sm_86 -I. -o velox_cuda_runner.exe velox_cuda_runner.cu
+if %ERRORLEVEL% neq 0 (
+    echo [ERROR] Failed to compile velox_cuda_runner.cu
+    popd
+    exit /b 1
+)
+echo [OK] Built %RUNNERS_DIR%\velox_cuda_runner.exe
+popd
+
+echo ============================================================================
+echo Build Successful!
+echo To run C99 Host CPU runner:
+echo   %RUNNERS_DIR%\velox_c99_runner.exe --weights smollm-135m.safetensors
+echo To run CUDA RTX 3050 GPU runner:
+echo   %RUNNERS_DIR%\velox_cuda_runner.exe --weights smollm-135m.safetensors
+echo ============================================================================

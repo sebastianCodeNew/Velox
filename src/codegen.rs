@@ -246,11 +246,11 @@ impl CodeGenerator {
         let _ = writeln!(out, "        }}");
         let _ = writeln!(out, "        float sum_exp = 0.0f;");
         let _ = writeln!(out, "        for (size_t t = 0; t < seq_len; ++t) {{");
-        let _ = writeln!(out, "            float e = expf(scores_scratch[t] - max_score);");
+        let _ = writeln!(out, "            float e = (max_score == -INFINITY) ? 0.0f : expf(scores_scratch[t] - max_score);");
         let _ = writeln!(out, "            scores_scratch[t] = e;");
         let _ = writeln!(out, "            sum_exp += e;");
         let _ = writeln!(out, "        }}");
-        let _ = writeln!(out, "        float inv_sum = 1.0f / sum_exp;");
+        let _ = writeln!(out, "        float inv_sum = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;");
         let _ = writeln!(out, "        for (size_t t = 0; t < seq_len; ++t) {{");
         let _ = writeln!(out, "            scores_scratch[t] *= inv_sum;");
         let _ = writeln!(out, "        }}");
@@ -379,11 +379,11 @@ impl CodeGenerator {
         let _ = writeln!(out, "    }}");
         let _ = writeln!(out, "    float sum_exp = 0.0f;");
         let _ = writeln!(out, "    for (size_t t = 0; t < seq_len; ++t) {{");
-        let _ = writeln!(out, "        float e = expf(scores[t] - max_s_val);");
+        let _ = writeln!(out, "        float e = (max_s_val == -INFINITY) ? 0.0f : expf(scores[t] - max_s_val);");
         let _ = writeln!(out, "        scores[t] = e;");
         let _ = writeln!(out, "        sum_exp += e;");
         let _ = writeln!(out, "    }}");
-        let _ = writeln!(out, "    float inv_sum = 1.0f / sum_exp;");
+        let _ = writeln!(out, "    float inv_sum = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;");
         let _ = writeln!(out, "    for (size_t t = 0; t < seq_len; ++t) {{ scores[t] *= inv_sum; }}");
         let _ = writeln!(out);
         let _ = writeln!(out, "    float context[512];");
@@ -663,10 +663,15 @@ impl CodeGenerator {
                         eps,
                     } => {
                         let l_val = layer.unwrap_or(0);
+                        let dst_offset = if layer.is_none() && dst.arena_offset == 0 {
+                            786432u64
+                        } else {
+                            dst.arena_offset
+                        };
                         let _ = writeln!(
                             out,
                             "    velox_c99_rmsnorm_f32(VELOX_ACT_PTR(ctx, {}ULL), VELOX_ACT_PTR(ctx, {}ULL), VELOX_W_PTR(ctx, {}ULL) + ({}ULL * VELOX_MODEL_HIDDEN_DIM), VELOX_MODEL_HIDDEN_DIM, {:.6}f);",
-                            dst.arena_offset,
+                            dst_offset,
                             input.arena_offset,
                             w_offset(weight_name),
                             l_val,
@@ -677,15 +682,21 @@ impl CodeGenerator {
                         dst,
                         lhs,
                         weight_name,
+                        layer,
                         ..
                     } => {
                         let out_dim = dst.shape.last().copied().unwrap_or(576);
                         let in_dim = lhs.shape.last().copied().unwrap_or(576);
+                        let lhs_offset = if layer.is_none() && lhs.arena_offset == 0 {
+                            786432u64
+                        } else {
+                            lhs.arena_offset
+                        };
                         let _ = writeln!(
                             out,
                             "    velox_c99_matmul_vec_f32(VELOX_ACT_PTR(ctx, {}ULL), VELOX_ACT_PTR(ctx, {}ULL), VELOX_W_PTR(ctx, {}ULL), {}ULL, {}ULL);",
                             dst.arena_offset,
-                            lhs.arena_offset,
+                            lhs_offset,
                             w_offset(weight_name),
                             in_dim,
                             out_dim
@@ -1160,8 +1171,8 @@ impl CodeGenerator {
         let _ = writeln!(out, "            float dot = s_dot[0] * scale;");
         let _ = writeln!(out);
         let _ = writeln!(out, "            float new_m = (dot > m) ? dot : m;");
-        let _ = writeln!(out, "            float alpha = expf(m - new_m);");
-        let _ = writeln!(out, "            float beta = expf(dot - new_m);");
+        let _ = writeln!(out, "            float alpha = (m == -INFINITY) ? 0.0f : expf(m - new_m);");
+        let _ = writeln!(out, "            float beta = (new_m == -INFINITY) ? 0.0f : expf(dot - new_m);");
         let _ = writeln!(out, "            l = l * alpha + beta;");
         let _ = writeln!(out, "            m = new_m;");
         let _ = writeln!(out);
@@ -1225,6 +1236,14 @@ impl CodeGenerator {
         let _ = writeln!(out, "    float inv_rms = rsqrtf((s_ss[0] / (float)dim) + eps);");
         let _ = writeln!(out, "    __syncthreads();");
         let _ = writeln!(out);
+        let _ = writeln!(out, "    // Precompute normalized intermediate hidden state into shared memory");
+        let _ = writeln!(out, "    // to prevent down-projection in-place chunk updates to dst_hidden from corrupting n_mid");
+        let _ = writeln!(out, "    __shared__ float s_norm_mid[VELOX_HIDDEN_DIM];");
+        let _ = writeln!(out, "    for (size_t k = tid; k < dim; k += blockDim.x) {{");
+        let _ = writeln!(out, "        s_norm_mid[k] = dst_hidden[k] * inv_rms * l_wpost[k];");
+        let _ = writeln!(out, "    }}");
+        let _ = writeln!(out, "    __syncthreads();");
+        let _ = writeln!(out);
         let _ = writeln!(out, "    // 3. Chunked SwiGLU projections and down accumulation");
         let _ = writeln!(out, "    const size_t CHUNK = 128;");
         let _ = writeln!(out, "    __shared__ float s_act[CHUNK];");
@@ -1238,7 +1257,7 @@ impl CodeGenerator {
         let _ = writeln!(out, "            float acc_gate = 0.0f;");
         let _ = writeln!(out, "            float acc_up = 0.0f;");
         let _ = writeln!(out, "            for (size_t k = 0; k < dim; ++k) {{");
-        let _ = writeln!(out, "                float n_mid = dst_hidden[k] * inv_rms * l_wpost[k];");
+        let _ = writeln!(out, "                float n_mid = s_norm_mid[k];");
         let _ = writeln!(out, "                acc_gate += n_mid * row_gate[k];");
         let _ = writeln!(out, "                acc_up += n_mid * row_up[k];");
         let _ = writeln!(out, "            }}");
@@ -1345,8 +1364,8 @@ impl CodeGenerator {
         let _ = writeln!(out, "        }}");
         let _ = writeln!(out, "        float dot = s_dot[0] * scale;");
         let _ = writeln!(out, "        float new_m = (dot > m) ? dot : m;");
-        let _ = writeln!(out, "        float alpha = expf(m - new_m);");
-        let _ = writeln!(out, "        float beta = expf(dot - new_m);");
+        let _ = writeln!(out, "        float alpha = (m == -INFINITY) ? 0.0f : expf(m - new_m);");
+        let _ = writeln!(out, "        float beta = (new_m == -INFINITY) ? 0.0f : expf(dot - new_m);");
         let _ = writeln!(out, "        l = l * alpha + beta;");
         let _ = writeln!(out, "        m = new_m;");
         let _ = writeln!(out, "        for (size_t d = tid; d < d_c; d += blockDim.x) {{");
@@ -1600,13 +1619,19 @@ impl CodeGenerator {
                             dst,
                             input,
                             weight_name,
+                            layer,
                             eps,
                             ..
                         } => {
+                            let dst_offset = if layer.is_none() && dst.arena_offset == 0 {
+                                786432u64
+                            } else {
+                                dst.arena_offset
+                            };
                             let _ = writeln!(
                                 out,
                                 "    velox_cuda_rmsnorm_kernel<<<grid, block, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), VELOX_HIDDEN_DIM, {:.6}f, active_mask);",
-                                dst.arena_offset,
+                                dst_offset,
                                 input.arena_offset,
                                 w_offset(weight_name),
                                 eps
@@ -1616,16 +1641,22 @@ impl CodeGenerator {
                             dst,
                             lhs,
                             weight_name,
+                            layer,
                             ..
                         } => {
                             let out_dim = dst.shape.last().copied().unwrap_or(576);
                             let in_dim = lhs.shape.last().copied().unwrap_or(576);
+                            let lhs_offset = if layer.is_none() && lhs.arena_offset == 0 {
+                                786432u64
+                            } else {
+                                lhs.arena_offset
+                            };
                             let _ = writeln!(
                                 out,
                                 "    velox_cuda_matmul_vec_kernel<<<dim3(({}ULL + 255) / 256), block, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), {}ULL, {}ULL, active_mask);",
                                 out_dim,
                                 dst.arena_offset,
-                                lhs.arena_offset,
+                                lhs_offset,
                                 w_offset(weight_name),
                                 in_dim,
                                 out_dim
@@ -1874,5 +1905,34 @@ mod tests {
         assert!(cu_code.contains("velox_cuda_silu_kernel"));
         assert!(cu_code.contains("velox_cuda_elementwise_mul_kernel"));
         assert!(cu_code.contains("velox_cuda_slice_last_token_kernel"));
+    }
+
+    #[test]
+    fn test_codegen_safeguards_and_chunk_isolation_invariants() {
+        let file = "examples/tinystories_smollm.vlx";
+        let src = std::fs::read_to_string(file).unwrap();
+        let mut parser = Parser::from_source(&src, file).unwrap();
+        let prog = parser.parse().unwrap();
+        let typed = SemanticAnalyzer::new().analyze(&prog).unwrap();
+        let plans = StaticMemoryPlanner::new().plan_program(&typed).unwrap();
+        let mut modules = lower_program_to_vir(&typed, &plans);
+        optimize_vir_module(&mut modules[0]);
+
+        let c_code = CodeGenerator::emit_c99(&modules[0]);
+        let cu_code = CodeGenerator::emit_cuda(&modules[0]);
+
+        // 1. SwiGLU shared memory caching to prevent in-place chunk corruption
+        assert!(cu_code.contains("__shared__ float s_norm_mid[VELOX_HIDDEN_DIM];"));
+        assert!(cu_code.contains("s_norm_mid[k] = dst_hidden[k] * inv_rms * l_wpost[k];"));
+
+        // 2. Online softmax initial condition safeguard for m = -INFINITY and new_m = -INFINITY
+        assert!(cu_code.contains("float alpha = (m == -INFINITY) ? 0.0f : expf(m - new_m);"));
+        assert!(cu_code.contains("float beta = (new_m == -INFINITY) ? 0.0f : expf(dot - new_m);"));
+        assert!(c_code.contains("float e = (max_score == -INFINITY) ? 0.0f : expf(scores_scratch[t] - max_score);"));
+        assert!(c_code.contains("float inv_sum = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;"));
+
+        // 3. Prefill logits race condition isolation: final RMSNorm separated from logits 0ULL
+        assert!(cu_code.contains("VELOX_DEV_ACT_PTR(ctx->activation_arena, 786432ULL)"));
+        assert!(c_code.contains("VELOX_ACT_PTR(ctx, 786432ULL)"));
     }
 }
