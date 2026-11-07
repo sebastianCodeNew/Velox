@@ -151,10 +151,59 @@ static bool safetensors_find_tensor(
 }
 
 // --- Weight Streaming to Device VRAM (One-Time at Startup) -------------------
+static bool stream_tensor_converted(
+    uint8_t* d_weight_arena,
+    uint8_t* d_staging_buf,
+    size_t dst_fp32_off,
+    const uint8_t* host_src,
+    size_t byte_len,
+    uint32_t quant_mode,
+    cudaStream_t stream
+) {
+    if (quant_mode == VELOX_QUANT_FP32 || dst_fp32_off >= VELOX_W_NORM_START_FP32) {
+        size_t actual_off = dst_fp32_off;
+        if (quant_mode == VELOX_QUANT_FP16 && dst_fp32_off >= VELOX_W_NORM_START_FP32) {
+            actual_off = (VELOX_W_NORM_START_FP32 >> 1) + (dst_fp32_off - VELOX_W_NORM_START_FP32);
+        } else if (quant_mode == VELOX_QUANT_Q4_0 && dst_fp32_off >= VELOX_W_NORM_START_FP32) {
+            actual_off = 75644928ULL + (dst_fp32_off - VELOX_W_NORM_START_FP32);
+        }
+        cudaMemcpyAsync(d_weight_arena + actual_off, host_src, byte_len, cudaMemcpyHostToDevice, stream);
+        return true;
+    }
+
+    const size_t max_chunk = 67108864ULL; // 64 MiB staging chunk (fits inside 90 MiB d_kv_cache)
+    size_t done = 0;
+    while (done < byte_len) {
+        size_t chunk = byte_len - done;
+        if (chunk > max_chunk) chunk = max_chunk;
+        cudaMemcpyAsync(d_staging_buf, host_src + done, chunk, cudaMemcpyHostToDevice, stream);
+        size_t cur_fp32_off = dst_fp32_off + done;
+        size_t num_floats = chunk / sizeof(float);
+        if (quant_mode == VELOX_QUANT_FP16) {
+            velox_cuda_f32_to_f16_kernel<<<1024, 256, 0, stream>>>(
+                (__half*)(d_weight_arena + (cur_fp32_off >> 1)),
+                (const float*)d_staging_buf,
+                num_floats
+            );
+        } else if (quant_mode == VELOX_QUANT_Q4_0) {
+            velox_cuda_quantize_q4_group64_kernel<<<1024, 256, 0, stream>>>(
+                (uint32_t*)(d_weight_arena + (cur_fp32_off >> 3)),
+                ((half2*)(d_weight_arena + 67239936ULL)) + (cur_fp32_off >> 8),
+                (const float*)d_staging_buf,
+                num_floats >> 6
+            );
+        }
+        done += chunk;
+    }
+    return true;
+}
+
 static bool stream_weights_to_device(
     uint8_t* d_weight_arena,
+    uint8_t* d_staging_buf,
     size_t weight_arena_bytes,
     const Win32SafetensorsMap* st,
+    uint32_t quant_mode,
     cudaStream_t stream
 ) {
     size_t src_off = 0, len = 0;
@@ -164,7 +213,7 @@ static bool stream_weights_to_device(
         fprintf(stderr, "Error: missing model.embed_tokens.weight in safetensors\n");
         return false;
     }
-    cudaMemcpyAsync(d_weight_arena + VELOX_W_OFFSET_W_EMBED, st->base_ptr + src_off, len, cudaMemcpyHostToDevice, stream);
+    stream_tensor_converted(d_weight_arena, d_staging_buf, VELOX_W_OFFSET_W_EMBED, st->base_ptr + src_off, len, quant_mode, stream);
 
     // 2. Transformer layers (0..29)
     for (size_t l = 0; l < 30; ++l) {
@@ -173,47 +222,47 @@ static bool stream_weights_to_device(
         // Q projection
         snprintf(key, sizeof(key), "model.layers.%zu.self_attn.q_proj.weight", l);
         if (!safetensors_find_tensor(st, key, &src_off, &len)) return false;
-        cudaMemcpyAsync(d_weight_arena + VELOX_W_OFFSET_W_Q + l * (576 * 576 * sizeof(float)), st->base_ptr + src_off, len, cudaMemcpyHostToDevice, stream);
+        stream_tensor_converted(d_weight_arena, d_staging_buf, VELOX_W_OFFSET_W_Q + l * (576 * 576 * sizeof(float)), st->base_ptr + src_off, len, quant_mode, stream);
 
         // K projection
         snprintf(key, sizeof(key), "model.layers.%zu.self_attn.k_proj.weight", l);
         if (!safetensors_find_tensor(st, key, &src_off, &len)) return false;
-        cudaMemcpyAsync(d_weight_arena + VELOX_W_OFFSET_W_K + l * (192 * 576 * sizeof(float)), st->base_ptr + src_off, len, cudaMemcpyHostToDevice, stream);
+        stream_tensor_converted(d_weight_arena, d_staging_buf, VELOX_W_OFFSET_W_K + l * (192 * 576 * sizeof(float)), st->base_ptr + src_off, len, quant_mode, stream);
 
         // V projection
         snprintf(key, sizeof(key), "model.layers.%zu.self_attn.v_proj.weight", l);
         if (!safetensors_find_tensor(st, key, &src_off, &len)) return false;
-        cudaMemcpyAsync(d_weight_arena + VELOX_W_OFFSET_W_V + l * (192 * 576 * sizeof(float)), st->base_ptr + src_off, len, cudaMemcpyHostToDevice, stream);
+        stream_tensor_converted(d_weight_arena, d_staging_buf, VELOX_W_OFFSET_W_V + l * (192 * 576 * sizeof(float)), st->base_ptr + src_off, len, quant_mode, stream);
 
         // Out projection
         snprintf(key, sizeof(key), "model.layers.%zu.self_attn.o_proj.weight", l);
         if (!safetensors_find_tensor(st, key, &src_off, &len)) return false;
-        cudaMemcpyAsync(d_weight_arena + VELOX_W_OFFSET_W_OUT + l * (576 * 576 * sizeof(float)), st->base_ptr + src_off, len, cudaMemcpyHostToDevice, stream);
+        stream_tensor_converted(d_weight_arena, d_staging_buf, VELOX_W_OFFSET_W_OUT + l * (576 * 576 * sizeof(float)), st->base_ptr + src_off, len, quant_mode, stream);
 
         // Gate projection
         snprintf(key, sizeof(key), "model.layers.%zu.mlp.gate_proj.weight", l);
         if (!safetensors_find_tensor(st, key, &src_off, &len)) return false;
-        cudaMemcpyAsync(d_weight_arena + VELOX_W_OFFSET_W_GATE + l * (1536 * 576 * sizeof(float)), st->base_ptr + src_off, len, cudaMemcpyHostToDevice, stream);
+        stream_tensor_converted(d_weight_arena, d_staging_buf, VELOX_W_OFFSET_W_GATE + l * (1536 * 576 * sizeof(float)), st->base_ptr + src_off, len, quant_mode, stream);
 
         // Up projection
         snprintf(key, sizeof(key), "model.layers.%zu.mlp.up_proj.weight", l);
         if (!safetensors_find_tensor(st, key, &src_off, &len)) return false;
-        cudaMemcpyAsync(d_weight_arena + VELOX_W_OFFSET_W_UP + l * (1536 * 576 * sizeof(float)), st->base_ptr + src_off, len, cudaMemcpyHostToDevice, stream);
+        stream_tensor_converted(d_weight_arena, d_staging_buf, VELOX_W_OFFSET_W_UP + l * (1536 * 576 * sizeof(float)), st->base_ptr + src_off, len, quant_mode, stream);
 
         // Down projection
         snprintf(key, sizeof(key), "model.layers.%zu.mlp.down_proj.weight", l);
         if (!safetensors_find_tensor(st, key, &src_off, &len)) return false;
-        cudaMemcpyAsync(d_weight_arena + VELOX_W_OFFSET_W_DOWN + l * (576 * 1536 * sizeof(float)), st->base_ptr + src_off, len, cudaMemcpyHostToDevice, stream);
+        stream_tensor_converted(d_weight_arena, d_staging_buf, VELOX_W_OFFSET_W_DOWN + l * (576 * 1536 * sizeof(float)), st->base_ptr + src_off, len, quant_mode, stream);
 
         // Input layernorm
         snprintf(key, sizeof(key), "model.layers.%zu.input_layernorm.weight", l);
         if (!safetensors_find_tensor(st, key, &src_off, &len)) return false;
-        cudaMemcpyAsync(d_weight_arena + VELOX_W_OFFSET_W_ATTN_NORM + l * (576 * sizeof(float)), st->base_ptr + src_off, len, cudaMemcpyHostToDevice, stream);
+        stream_tensor_converted(d_weight_arena, d_staging_buf, VELOX_W_OFFSET_W_ATTN_NORM + l * (576 * sizeof(float)), st->base_ptr + src_off, len, quant_mode, stream);
 
         // Post-attention layernorm
         snprintf(key, sizeof(key), "model.layers.%zu.post_attention_layernorm.weight", l);
         if (!safetensors_find_tensor(st, key, &src_off, &len)) return false;
-        cudaMemcpyAsync(d_weight_arena + VELOX_W_OFFSET_W_MLP_NORM + l * (576 * sizeof(float)), st->base_ptr + src_off, len, cudaMemcpyHostToDevice, stream);
+        stream_tensor_converted(d_weight_arena, d_staging_buf, VELOX_W_OFFSET_W_MLP_NORM + l * (576 * sizeof(float)), st->base_ptr + src_off, len, quant_mode, stream);
     }
 
     // 3. Final layernorm
@@ -221,15 +270,17 @@ static bool stream_weights_to_device(
         fprintf(stderr, "Error: missing model.norm.weight in safetensors\n");
         return false;
     }
-    cudaMemcpyAsync(d_weight_arena + VELOX_W_OFFSET_W_FINAL_NORM, st->base_ptr + src_off, len, cudaMemcpyHostToDevice, stream);
+    stream_tensor_converted(d_weight_arena, d_staging_buf, VELOX_W_OFFSET_W_FINAL_NORM, st->base_ptr + src_off, len, quant_mode, stream);
 
-    // 4. Tied LM Head (same weights as model.embed_tokens.weight)
-    if (!safetensors_find_tensor(st, "lm_head.weight", &src_off, &len)) {
-        fprintf(stderr, "Error: missing lm_head.weight in safetensors\n");
-        return false;
-    }
-    if (VELOX_W_OFFSET_W_HEAD + len <= weight_arena_bytes) {
-        cudaMemcpyAsync(d_weight_arena + VELOX_W_OFFSET_W_HEAD, st->base_ptr + src_off, len, cudaMemcpyHostToDevice, stream);
+    // 4. Tied LM Head (same weights as model.embed_tokens.weight; aliased at offset 0 in quantized modes)
+    if (quant_mode == VELOX_QUANT_FP32) {
+        if (!safetensors_find_tensor(st, "lm_head.weight", &src_off, &len)) {
+            fprintf(stderr, "Error: missing lm_head.weight in safetensors\n");
+            return false;
+        }
+        if (VELOX_W_OFFSET_W_HEAD + len <= weight_arena_bytes) {
+            cudaMemcpyAsync(d_weight_arena + VELOX_W_OFFSET_W_HEAD, st->base_ptr + src_off, len, cudaMemcpyHostToDevice, stream);
+        }
     }
 
     cudaStreamSynchronize(stream);
@@ -280,6 +331,7 @@ int main(int argc, char** argv) {
     size_t steps = 32;
     bool verbose = false;
     bool use_cuda_graph = true;
+    uint32_t quant_mode = VELOX_QUANT_FP32;
 
     // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
@@ -301,6 +353,24 @@ int main(int argc, char** argv) {
             verbose = true;
         } else if (strcmp(argv[i], "--no-cuda-graph") == 0) {
             use_cuda_graph = false;
+        } else if (strcmp(argv[i], "--quantize") == 0 && i + 1 < argc) {
+            const char* q = argv[++i];
+            if (strcmp(q, "f16") == 0 || strcmp(q, "fp16") == 0) {
+                quant_mode = VELOX_QUANT_FP16;
+            } else if (strcmp(q, "q4_0") == 0 || strcmp(q, "int4") == 0 || strcmp(q, "w4a16") == 0) {
+                quant_mode = VELOX_QUANT_Q4_0;
+            } else {
+                quant_mode = VELOX_QUANT_FP32;
+            }
+        } else if (strncmp(argv[i], "--quantize=", 11) == 0) {
+            const char* q = argv[i] + 11;
+            if (strcmp(q, "f16") == 0 || strcmp(q, "fp16") == 0) {
+                quant_mode = VELOX_QUANT_FP16;
+            } else if (strcmp(q, "q4_0") == 0 || strcmp(q, "int4") == 0 || strcmp(q, "w4a16") == 0) {
+                quant_mode = VELOX_QUANT_Q4_0;
+            } else {
+                quant_mode = VELOX_QUANT_FP32;
+            }
         }
     }
 
@@ -326,6 +396,15 @@ int main(int argc, char** argv) {
     size_t weight_bytes = VELOX_WEIGHT_ARENA_BYTES;
     size_t kv_pool_bytes = VELOX_KV_CACHE_POOL_BYTES;
     size_t act_arena_bytes = VELOX_ACTIVATION_ARENA_BYTES;
+    if (quant_mode == VELOX_QUANT_FP16) {
+        // 268,959,744 B FP16 weights + 140,544 B FP32 norms (w_head tied to w_embed at offset 0)
+        weight_bytes = 269100288ULL;
+        act_arena_bytes = 4194304ULL;
+    } else if (quant_mode == VELOX_QUANT_Q4_0) {
+        // 67,239,936 B INT4 packed + 8,404,992 B half2 group-64 scales + 140,544 B FP32 norms
+        weight_bytes = 75785472ULL;
+        act_arena_bytes = 4194304ULL;
+    }
     size_t ring_bytes = 4096;
 
     uint8_t* d_weight_arena = NULL;
@@ -355,16 +434,17 @@ int main(int argc, char** argv) {
     cudaStream_t stream;
     cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
 
-    // Zero-initialize dynamic pools
-    cudaMemsetAsync(d_kv_cache, 0, kv_pool_bytes, stream);
-    cudaMemsetAsync(d_activation, 0, act_arena_bytes, stream);
-    memset(h_ring, 0, ring_bytes);
-
-    // 3. Stream model weights into device weight_arena once at startup
-    if (!stream_weights_to_device(d_weight_arena, weight_bytes, &st_map, stream)) {
+    // 3. Stream model weights into device weight_arena once at startup (using d_kv_cache as temporary staging before zeroing)
+    if (!stream_weights_to_device(d_weight_arena, d_kv_cache, weight_bytes, &st_map, quant_mode, stream)) {
         fprintf(stderr, "Error: failed to stream weights to device\n");
         return 1;
     }
+
+    // Zero-initialize dynamic pools
+    cudaMemsetAsync(d_kv_cache, 0, kv_pool_bytes, stream);
+    cudaMemsetAsync(d_activation, 0, act_arena_bytes, stream);
+    cudaStreamSynchronize(stream);
+    memset(h_ring, 0, ring_bytes);
     double load_ms = timer_ms_since(t_load_start);
 
     // 4. Construct Velox zero-allocation execution arena context
@@ -373,6 +453,20 @@ int main(int argc, char** argv) {
     ctx.kv_cache_pool = d_kv_cache;
     ctx.activation_arena = d_activation;
     ctx.host_pinned_ring = d_ring;
+    ctx.quant_mode = quant_mode;
+    if (quant_mode == VELOX_QUANT_FP16) {
+        ctx.norm_weight_arena = d_weight_arena + (VELOX_W_NORM_START_FP32 >> 1);
+        ctx.weight_scales = NULL;
+        ctx.tied_lm_head = 1u;
+    } else if (quant_mode == VELOX_QUANT_Q4_0) {
+        ctx.norm_weight_arena = d_weight_arena + 75644928ULL;
+        ctx.weight_scales = d_weight_arena + 67239936ULL;
+        ctx.tied_lm_head = 1u;
+    } else {
+        ctx.norm_weight_arena = NULL;
+        ctx.weight_scales = NULL;
+        ctx.tied_lm_head = 0u;
+    }
 
     // 4b. Pre-capture single-step decode CUDA Graph (invariant device-resident VeloxDecodeState)
     cudaGraph_t decode_graph = NULL;

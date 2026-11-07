@@ -866,6 +866,7 @@ impl CodeGenerator {
         let _ = writeln!(out, "// ==========================================================================");
         let _ = writeln!(out);
         let _ = writeln!(out, "#include <cuda_runtime.h>");
+        let _ = writeln!(out, "#include <cuda_fp16.h>");
         let _ = writeln!(out, "#include <stdint.h>");
         let _ = writeln!(out, "#include <stddef.h>");
         let _ = writeln!(out, "#include <math.h>");
@@ -900,6 +901,9 @@ impl CodeGenerator {
         let _ = writeln!(out, "#define VELOX_SCRATCH_DECODE_STATE_OFFSET    2260992ULL");
         let _ = writeln!(out, "#define VELOX_HOST_RING_SLOTS                1024ULL");
         let _ = writeln!(out, "#define VELOX_HOST_RING_EMPTY                0xFFFFFFFFu");
+        let _ = writeln!(out, "#define VELOX_QUANT_FP32                     0u");
+        let _ = writeln!(out, "#define VELOX_QUANT_FP16                     1u");
+        let _ = writeln!(out, "#define VELOX_QUANT_Q4_0                     2u");
         let _ = writeln!(out);
 
         let _ = writeln!(out, "typedef struct VeloxCudaArena {{");
@@ -907,6 +911,10 @@ impl CodeGenerator {
         let _ = writeln!(out, "    uint8_t*       __restrict__ kv_cache_pool;");
         let _ = writeln!(out, "    uint8_t*       __restrict__ activation_arena;");
         let _ = writeln!(out, "    uint32_t*      __restrict__ host_pinned_ring;");
+        let _ = writeln!(out, "    const uint8_t* __restrict__ norm_weight_arena;");
+        let _ = writeln!(out, "    const uint8_t* __restrict__ weight_scales;");
+        let _ = writeln!(out, "    uint32_t                    quant_mode;");
+        let _ = writeln!(out, "    uint32_t                    tied_lm_head;");
         let _ = writeln!(out, "}} VeloxCudaArena;");
         let _ = writeln!(out);
         let _ = writeln!(out, "// Device-resident autoregressive state. Every step-dependent kernel reads `step`/`token` from here");
@@ -918,8 +926,15 @@ impl CodeGenerator {
         let _ = writeln!(out, "    uint32_t reserved;");
         let _ = writeln!(out, "}} VeloxDecodeState;");
         let _ = writeln!(out);
-        let _ = writeln!(out, "#define VELOX_DEV_ACT_PTR(arena_base, offset) ((float*)((uint8_t*)(arena_base) + (offset)))");
+        let _ = writeln!(out, "#define VELOX_W_NORM_START_FP32              537919488ULL");
+        let _ = writeln!(out, "#define VELOX_W_HEAD_START_FP32              538060032ULL");
+        let _ = writeln!(out, "#define VELOX_EFF_W_OFF(ctx, offset)         (((ctx)->tied_lm_head && (offset) >= VELOX_W_HEAD_START_FP32) ? 0ULL : (offset))");
+        let _ = writeln!(out, "#define VELOX_DEV_ACT_PTR(arena_base, offset) ((float*)((uint8_t*)(arena_base) + (((offset) >= 4194304ULL) ? 147456ULL : (offset))))");
         let _ = writeln!(out, "#define VELOX_DEV_W_PTR(weight_base, offset)  ((const float*)((const uint8_t*)(weight_base) + (offset)))");
+        let _ = writeln!(out, "#define VELOX_DEV_W_F16_PTR(ctx, offset)      ((const __half*)((const uint8_t*)(ctx)->weight_arena + (VELOX_EFF_W_OFF(ctx, offset) >> 1)))");
+        let _ = writeln!(out, "#define VELOX_DEV_W_Q4_PTR(ctx, offset)       ((const uint32_t*)((const uint8_t*)(ctx)->weight_arena + (VELOX_EFF_W_OFF(ctx, offset) >> 3)))");
+        let _ = writeln!(out, "#define VELOX_DEV_S_Q4_PTR(ctx, offset)       (((const half2*)(ctx)->weight_scales) + (VELOX_EFF_W_OFF(ctx, offset) >> 8))");
+        let _ = writeln!(out, "#define VELOX_DEV_NORM_PTR(ctx, offset)       ((const float*)(((ctx)->norm_weight_arena != NULL) ? ((ctx)->norm_weight_arena + ((offset) - VELOX_W_NORM_START_FP32)) : ((ctx)->weight_arena + (offset))))");
         let _ = writeln!(out, "#define VELOX_DEV_STATE(ctx) ((VeloxDecodeState*)((uint8_t*)(ctx)->activation_arena + VELOX_SCRATCH_DECODE_STATE_OFFSET))");
         let _ = writeln!(out);
         let _ = writeln!(out, "// Writes the host-provided (token, step) into the device state (used by the eager API entry points).");
@@ -2043,6 +2058,334 @@ impl CodeGenerator {
         let _ = writeln!(out, "}}");
         let _ = writeln!(out);
 
+        // --- 1.11 Step 15: Vectorized FP16 (__half2) & Marlin LOP3 INT4 (w4a16) Kernels ---
+        let _ = writeln!(out, "__device__ __forceinline__ uint32_t velox_ptx_lop3_0xEA(uint32_t a, uint32_t b, uint32_t c) {{");
+        let _ = writeln!(out, "    return (a & b) | c;");
+        let _ = writeln!(out, "}}");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "__device__ __forceinline__ half2 velox_u32_as_half2(uint32_t v) {{");
+        let _ = writeln!(out, "    union {{ uint32_t u; half2 h2; }} conv;");
+        let _ = writeln!(out, "    conv.u = v;");
+        let _ = writeln!(out, "    return conv.h2;");
+        let _ = writeln!(out, "}}");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "__device__ __forceinline__ float velox_marlin_dot8_q4(uint32_t packed, half2 sm_h2, float4 x0, float4 x1) {{");
+        let _ = writeln!(out, "    const uint32_t fp16_bias = 0x64006400u;");
+        let _ = writeln!(out, "    const uint32_t mask_low  = 0x000F000Fu;");
+        let _ = writeln!(out, "    uint32_t h2_0 = velox_ptx_lop3_0xEA(packed,       mask_low, fp16_bias);");
+        let _ = writeln!(out, "    uint32_t h2_1 = velox_ptx_lop3_0xEA(packed >> 4,  mask_low, fp16_bias);");
+        let _ = writeln!(out, "    uint32_t h2_2 = velox_ptx_lop3_0xEA(packed >> 8,  mask_low, fp16_bias);");
+        let _ = writeln!(out, "    uint32_t h2_3 = velox_ptx_lop3_0xEA(packed >> 12, mask_low, fp16_bias);");
+        let _ = writeln!(out, "    const half2 sub_bias = velox_u32_as_half2(fp16_bias);");
+        let _ = writeln!(out, "    const float2 f0 = __half22float2(__hsub2(velox_u32_as_half2(h2_0), sub_bias));");
+        let _ = writeln!(out, "    const float2 f1 = __half22float2(__hsub2(velox_u32_as_half2(h2_1), sub_bias));");
+        let _ = writeln!(out, "    const float2 f2 = __half22float2(__hsub2(velox_u32_as_half2(h2_2), sub_bias));");
+        let _ = writeln!(out, "    const float2 f3 = __half22float2(__hsub2(velox_u32_as_half2(h2_3), sub_bias));");
+        let _ = writeln!(out, "    const float sum_qx = f0.x * x0.x + f0.y * x0.y + f1.x * x0.z + f1.y * x0.w");
+        let _ = writeln!(out, "                       + f2.x * x1.x + f2.y * x1.y + f3.x * x1.z + f3.y * x1.w;");
+        let _ = writeln!(out, "    const float sum_x  = (x0.x + x0.y + x0.z + x0.w) + (x1.x + x1.y + x1.z + x1.w);");
+        let _ = writeln!(out, "    const float2 sm    = __half22float2(sm_h2);");
+        let _ = writeln!(out, "    return sm.x * sum_qx + sm.y * sum_x;");
+        let _ = writeln!(out, "}}");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "__device__ __forceinline__ float velox_warp_dot_f16(const __half* __restrict__ row_w, const float* __restrict__ x, size_t dim, size_t lane_id) {{");
+        let _ = writeln!(out, "    float acc = 0.0f;");
+        let _ = writeln!(out, "    const size_t steps = dim / 128ULL;");
+        let _ = writeln!(out, "    for (size_t s = 0; s < steps; ++s) {{");
+        let _ = writeln!(out, "        const size_t k_offset = s * 128ULL + (lane_id * 4ULL);");
+        let _ = writeln!(out, "        const uint2 w_u2 = __ldg(reinterpret_cast<const uint2*>(&row_w[k_offset]));");
+        let _ = writeln!(out, "        const float4 in_v = *reinterpret_cast<const float4*>(&x[k_offset]);");
+        let _ = writeln!(out, "        const float2 w01 = __half22float2(velox_u32_as_half2(w_u2.x));");
+        let _ = writeln!(out, "        const float2 w23 = __half22float2(velox_u32_as_half2(w_u2.y));");
+        let _ = writeln!(out, "        acc += in_v.x * w01.x + in_v.y * w01.y + in_v.z * w23.x + in_v.w * w23.y;");
+        let _ = writeln!(out, "    }}");
+        let _ = writeln!(out, "    const size_t tail_start = steps * 128ULL;");
+        let _ = writeln!(out, "    const size_t remaining_f4 = (dim - tail_start) / 4ULL;");
+        let _ = writeln!(out, "    if (lane_id < remaining_f4) {{");
+        let _ = writeln!(out, "        const size_t k_offset = tail_start + (lane_id * 4ULL);");
+        let _ = writeln!(out, "        const uint2 w_u2 = __ldg(reinterpret_cast<const uint2*>(&row_w[k_offset]));");
+        let _ = writeln!(out, "        const float4 in_v = *reinterpret_cast<const float4*>(&x[k_offset]);");
+        let _ = writeln!(out, "        const float2 w01 = __half22float2(velox_u32_as_half2(w_u2.x));");
+        let _ = writeln!(out, "        const float2 w23 = __half22float2(velox_u32_as_half2(w_u2.y));");
+        let _ = writeln!(out, "        acc += in_v.x * w01.x + in_v.y * w01.y + in_v.z * w23.x + in_v.w * w23.y;");
+        let _ = writeln!(out, "    }}");
+        let _ = writeln!(out, "    #pragma unroll");
+        let _ = writeln!(out, "    for (int offset = 16; offset > 0; offset >>= 1) {{");
+        let _ = writeln!(out, "        acc += __shfl_down_sync(0xffffffff, acc, offset);");
+        let _ = writeln!(out, "    }}");
+        let _ = writeln!(out, "    return acc;");
+        let _ = writeln!(out, "}}");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "__device__ __forceinline__ float velox_warp_dot_q4(const uint32_t* __restrict__ row_w_q4, const half2* __restrict__ row_s_q4, const float* __restrict__ x, size_t dim, size_t lane_id) {{");
+        let _ = writeln!(out, "    float acc = 0.0f;");
+        let _ = writeln!(out, "    for (size_t k = lane_id * 8ULL; k + 7ULL < dim; k += 256ULL) {{");
+        let _ = writeln!(out, "        const uint32_t packed = __ldg(&row_w_q4[k >> 3]);");
+        let _ = writeln!(out, "        const half2 sm_h2     = __ldg(&row_s_q4[k >> 6]);");
+        let _ = writeln!(out, "        const float4 x0       = *reinterpret_cast<const float4*>(&x[k]);");
+        let _ = writeln!(out, "        const float4 x1       = *reinterpret_cast<const float4*>(&x[k + 4ULL]);");
+        let _ = writeln!(out, "        acc += velox_marlin_dot8_q4(packed, sm_h2, x0, x1);");
+        let _ = writeln!(out, "    }}");
+        let _ = writeln!(out, "    #pragma unroll");
+        let _ = writeln!(out, "    for (int offset = 16; offset > 0; offset >>= 1) {{");
+        let _ = writeln!(out, "        acc += __shfl_down_sync(0xffffffff, acc, offset);");
+        let _ = writeln!(out, "    }}");
+        let _ = writeln!(out, "    return acc;");
+        let _ = writeln!(out, "}}");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "// Startup GPU weight conversion kernels (FP32 -> FP16 and FP32 -> Marlin INT4 group-64)");
+        let _ = writeln!(out, "__global__ void velox_cuda_f32_to_f16_kernel(__half* __restrict__ dst, const float* __restrict__ src, size_t n) {{");
+        let _ = writeln!(out, "    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;");
+        let _ = writeln!(out, "    for (size_t i = idx; i < n; i += (size_t)gridDim.x * blockDim.x) {{");
+        let _ = writeln!(out, "        dst[i] = __float2half(src[i]);");
+        let _ = writeln!(out, "    }}");
+        let _ = writeln!(out, "}}");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "__global__ void velox_cuda_quantize_q4_group64_kernel(uint32_t* __restrict__ dst_packed, half2* __restrict__ dst_scales, const float* __restrict__ src, size_t num_groups) {{");
+        let _ = writeln!(out, "    size_t g = (size_t)blockIdx.x * blockDim.x + threadIdx.x;");
+        let _ = writeln!(out, "    for (; g < num_groups; g += (size_t)gridDim.x * blockDim.x) {{");
+        let _ = writeln!(out, "        const float* grp = src + g * 64ULL;");
+        let _ = writeln!(out, "        float fmin = grp[0];");
+        let _ = writeln!(out, "        float fmax = grp[0];");
+        let _ = writeln!(out, "        for (int i = 1; i < 64; ++i) {{");
+        let _ = writeln!(out, "            float v = grp[i];");
+        let _ = writeln!(out, "            if (v < fmin) fmin = v;");
+        let _ = writeln!(out, "            if (v > fmax) fmax = v;");
+        let _ = writeln!(out, "        }}");
+        let _ = writeln!(out, "        float scale_f = (fmax > fmin) ? ((fmax - fmin) / 15.0f) : 0.0f;");
+        let _ = writeln!(out, "        __half h_scale = __float2half(scale_f);");
+        let _ = writeln!(out, "        __half h_min   = __float2half(fmin);");
+        let _ = writeln!(out, "        dst_scales[g]  = make_half2(h_scale, h_min);");
+        let _ = writeln!(out, "        float s_exact  = __half2float(h_scale);");
+        let _ = writeln!(out, "        float m_exact  = __half2float(h_min);");
+        let _ = writeln!(out, "        float inv_s    = (s_exact > 1.0e-12f) ? (1.0f / s_exact) : 0.0f;");
+        let _ = writeln!(out, "        for (int w = 0; w < 8; ++w) {{");
+        let _ = writeln!(out, "            const float* wp = grp + w * 8;");
+        let _ = writeln!(out, "            uint32_t q[8];");
+        let _ = writeln!(out, "            #pragma unroll");
+        let _ = writeln!(out, "            for (int j = 0; j < 8; ++j) {{");
+        let _ = writeln!(out, "                int qi = __float2int_rn((wp[j] - m_exact) * inv_s);");
+        let _ = writeln!(out, "                if (qi < 0) qi = 0;");
+        let _ = writeln!(out, "                if (qi > 15) qi = 15;");
+        let _ = writeln!(out, "                q[j] = (uint32_t)qi;");
+        let _ = writeln!(out, "            }}");
+        let _ = writeln!(out, "            uint32_t packed = (q[0] <<  0) | (q[2] <<  4) | (q[4] <<  8) | (q[6] << 12)");
+        let _ = writeln!(out, "                            | (q[1] << 16) | (q[3] << 20) | (q[5] << 24) | (q[7] << 28);");
+        let _ = writeln!(out, "            dst_packed[g * 8ULL + (size_t)w] = packed;");
+        let _ = writeln!(out, "        }}");
+        let _ = writeln!(out, "    }}");
+        let _ = writeln!(out, "}}");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "__global__ void __launch_bounds__(256) velox_cuda_embed_kernel_f16(float* __restrict__ dst, const VeloxDecodeState* __restrict__ state, const __half* __restrict__ w_embed, uint64_t active_mask) {{");
+        let _ = writeln!(out, "    if ((active_mask & 1ULL) == 0ULL) return;");
+        let _ = writeln!(out, "    const size_t token_id = (size_t)state->token;");
+        let _ = writeln!(out, "    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;");
+        let _ = writeln!(out, "    if (idx < VELOX_HIDDEN_DIM && token_id < VELOX_VOCAB_SIZE) {{");
+        let _ = writeln!(out, "        dst[idx] = __half2float(__ldg(&w_embed[token_id * VELOX_HIDDEN_DIM + idx]));");
+        let _ = writeln!(out, "    }}");
+        let _ = writeln!(out, "}}");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "__global__ void __launch_bounds__(256) velox_cuda_embed_kernel_q4(float* __restrict__ dst, const VeloxDecodeState* __restrict__ state, const uint32_t* __restrict__ w_embed_q4, const half2* __restrict__ s_embed_q4, uint64_t active_mask) {{");
+        let _ = writeln!(out, "    if ((active_mask & 1ULL) == 0ULL) return;");
+        let _ = writeln!(out, "    const size_t token_id = (size_t)state->token;");
+        let _ = writeln!(out, "    size_t word_idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;");
+        let _ = writeln!(out, "    size_t base_k = word_idx * 8ULL;");
+        let _ = writeln!(out, "    if (base_k + 7ULL < VELOX_HIDDEN_DIM && token_id < VELOX_VOCAB_SIZE) {{");
+        let _ = writeln!(out, "        size_t elem_off = token_id * VELOX_HIDDEN_DIM + base_k;");
+        let _ = writeln!(out, "        uint32_t packed = __ldg(&w_embed_q4[elem_off >> 3]);");
+        let _ = writeln!(out, "        float2 sm = __half22float2(__ldg(&s_embed_q4[elem_off >> 6]));");
+        let _ = writeln!(out, "        const uint32_t fp16_bias = 0x64006400u;");
+        let _ = writeln!(out, "        const uint32_t mask_low  = 0x000F000Fu;");
+        let _ = writeln!(out, "        uint32_t h2_0 = velox_ptx_lop3_0xEA(packed,       mask_low, fp16_bias);");
+        let _ = writeln!(out, "        uint32_t h2_1 = velox_ptx_lop3_0xEA(packed >> 4,  mask_low, fp16_bias);");
+        let _ = writeln!(out, "        uint32_t h2_2 = velox_ptx_lop3_0xEA(packed >> 8,  mask_low, fp16_bias);");
+        let _ = writeln!(out, "        uint32_t h2_3 = velox_ptx_lop3_0xEA(packed >> 12, mask_low, fp16_bias);");
+        let _ = writeln!(out, "        const half2 sub_bias = velox_u32_as_half2(fp16_bias);");
+        let _ = writeln!(out, "        const float2 f0 = __half22float2(__hsub2(velox_u32_as_half2(h2_0), sub_bias));");
+        let _ = writeln!(out, "        const float2 f1 = __half22float2(__hsub2(velox_u32_as_half2(h2_1), sub_bias));");
+        let _ = writeln!(out, "        const float2 f2 = __half22float2(__hsub2(velox_u32_as_half2(h2_2), sub_bias));");
+        let _ = writeln!(out, "        const float2 f3 = __half22float2(__hsub2(velox_u32_as_half2(h2_3), sub_bias));");
+        let _ = writeln!(out, "        dst[base_k + 0ULL] = fmaf(f0.x, sm.x, sm.y);");
+        let _ = writeln!(out, "        dst[base_k + 1ULL] = fmaf(f0.y, sm.x, sm.y);");
+        let _ = writeln!(out, "        dst[base_k + 2ULL] = fmaf(f1.x, sm.x, sm.y);");
+        let _ = writeln!(out, "        dst[base_k + 3ULL] = fmaf(f1.y, sm.x, sm.y);");
+        let _ = writeln!(out, "        dst[base_k + 4ULL] = fmaf(f2.x, sm.x, sm.y);");
+        let _ = writeln!(out, "        dst[base_k + 5ULL] = fmaf(f2.y, sm.x, sm.y);");
+        let _ = writeln!(out, "        dst[base_k + 6ULL] = fmaf(f3.x, sm.x, sm.y);");
+        let _ = writeln!(out, "        dst[base_k + 7ULL] = fmaf(f3.y, sm.x, sm.y);");
+        let _ = writeln!(out, "    }}");
+        let _ = writeln!(out, "}}");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "__global__ void __launch_bounds__(128, 8) velox_cuda_matmul_vec_kernel_f16(float* __restrict__ dst, const float* __restrict__ x, const __half* __restrict__ w, size_t in_dim, size_t out_dim, uint64_t active_mask) {{");
+        let _ = writeln!(out, "    if ((active_mask & 1ULL) == 0ULL) return;");
+        let _ = writeln!(out, "    const size_t warp_id = threadIdx.x / 32;");
+        let _ = writeln!(out, "    const size_t lane_id = threadIdx.x % 32;");
+        let _ = writeln!(out, "    const size_t row = (size_t)blockIdx.x * 4ULL + warp_id;");
+        let _ = writeln!(out, "    if (row >= out_dim) return;");
+        let _ = writeln!(out, "    float acc = velox_warp_dot_f16(w + (row * in_dim), x, in_dim, lane_id);");
+        let _ = writeln!(out, "    if (lane_id == 0) dst[row] = acc;");
+        let _ = writeln!(out, "}}");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "__global__ void __launch_bounds__(128, 8) velox_cuda_matmul_vec_kernel_q4(float* __restrict__ dst, const float* __restrict__ x, const uint32_t* __restrict__ w_q4, const half2* __restrict__ s_q4, size_t in_dim, size_t out_dim, uint64_t active_mask) {{");
+        let _ = writeln!(out, "    if ((active_mask & 1ULL) == 0ULL) return;");
+        let _ = writeln!(out, "    const size_t warp_id = threadIdx.x / 32;");
+        let _ = writeln!(out, "    const size_t lane_id = threadIdx.x % 32;");
+        let _ = writeln!(out, "    const size_t row = (size_t)blockIdx.x * 4ULL + warp_id;");
+        let _ = writeln!(out, "    if (row >= out_dim) return;");
+        let _ = writeln!(out, "    float acc = velox_warp_dot_q4(w_q4 + ((row * in_dim) >> 3), s_q4 + ((row * in_dim) >> 6), x, in_dim, lane_id);");
+        let _ = writeln!(out, "    if (lane_id == 0) dst[row] = acc;");
+        let _ = writeln!(out, "}}");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "__global__ void __launch_bounds__(128, 8) velox_cuda_fused_qkv_warp_kernel_f16(float* __restrict__ dst_q, float* __restrict__ kv_pool, const float* __restrict__ norm_input, const __half* __restrict__ w_q, const __half* __restrict__ w_k, const __half* __restrict__ w_v, size_t layer, const VeloxDecodeState* __restrict__ state, uint64_t active_mask) {{");
+        let _ = writeln!(out, "    if ((active_mask & 1ULL) == 0ULL) return;");
+        let _ = writeln!(out, "    const size_t step = (size_t)state->step;");
+        let _ = writeln!(out, "    const size_t warp_id = threadIdx.x / 32;");
+        let _ = writeln!(out, "    const size_t lane_id = threadIdx.x % 32;");
+        let _ = writeln!(out, "    const size_t global_row = (size_t)blockIdx.x * 4ULL + warp_id;");
+        let _ = writeln!(out, "    const size_t dim = VELOX_HIDDEN_DIM;");
+        let _ = writeln!(out, "    const size_t num_q = VELOX_NUM_HEADS * VELOX_HEAD_DIM;");
+        let _ = writeln!(out, "    const size_t num_kv = VELOX_NUM_KV_HEADS * VELOX_HEAD_DIM;");
+        let _ = writeln!(out, "    if (global_row >= num_q + 2ULL * num_kv) return;");
+        let _ = writeln!(out, "    const size_t max_s = VELOX_MODEL_MAX_SEQ_LEN;");
+        let _ = writeln!(out, "    const size_t safe_step = (step < max_s) ? step : (max_s - 1);");
+        let _ = writeln!(out, "    float* k_layer = kv_pool + (layer * 2ULL * max_s * num_kv);");
+        let _ = writeln!(out, "    float* v_layer = k_layer + (max_s * num_kv);");
+        let _ = writeln!(out, "    const __half* __restrict__ row_w = NULL;");
+        let _ = writeln!(out, "    float* __restrict__ dst_ptr = NULL;");
+        let _ = writeln!(out, "    if (global_row < num_q) {{");
+        let _ = writeln!(out, "        row_w = w_q + (layer * dim * num_q) + (global_row * dim);");
+        let _ = writeln!(out, "        dst_ptr = dst_q + global_row;");
+        let _ = writeln!(out, "    }} else if (global_row < num_q + num_kv) {{");
+        let _ = writeln!(out, "        const size_t k_row = global_row - num_q;");
+        let _ = writeln!(out, "        row_w = w_k + (layer * dim * num_kv) + (k_row * dim);");
+        let _ = writeln!(out, "        dst_ptr = k_layer + (safe_step * num_kv) + k_row;");
+        let _ = writeln!(out, "    }} else {{");
+        let _ = writeln!(out, "        const size_t v_row = global_row - num_q - num_kv;");
+        let _ = writeln!(out, "        row_w = w_v + (layer * dim * num_kv) + (v_row * dim);");
+        let _ = writeln!(out, "        dst_ptr = v_layer + (safe_step * num_kv) + v_row;");
+        let _ = writeln!(out, "    }}");
+        let _ = writeln!(out, "    float acc = velox_warp_dot_f16(row_w, norm_input, dim, lane_id);");
+        let _ = writeln!(out, "    if (lane_id == 0) *dst_ptr = acc;");
+        let _ = writeln!(out, "}}");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "__global__ void __launch_bounds__(128, 8) velox_cuda_fused_qkv_warp_kernel_q4(float* __restrict__ dst_q, float* __restrict__ kv_pool, const float* __restrict__ norm_input, const uint32_t* __restrict__ w_q, const half2* __restrict__ s_q, const uint32_t* __restrict__ w_k, const half2* __restrict__ s_k, const uint32_t* __restrict__ w_v, const half2* __restrict__ s_v, size_t layer, const VeloxDecodeState* __restrict__ state, uint64_t active_mask) {{");
+        let _ = writeln!(out, "    if ((active_mask & 1ULL) == 0ULL) return;");
+        let _ = writeln!(out, "    const size_t step = (size_t)state->step;");
+        let _ = writeln!(out, "    const size_t warp_id = threadIdx.x / 32;");
+        let _ = writeln!(out, "    const size_t lane_id = threadIdx.x % 32;");
+        let _ = writeln!(out, "    const size_t global_row = (size_t)blockIdx.x * 4ULL + warp_id;");
+        let _ = writeln!(out, "    const size_t dim = VELOX_HIDDEN_DIM;");
+        let _ = writeln!(out, "    const size_t num_q = VELOX_NUM_HEADS * VELOX_HEAD_DIM;");
+        let _ = writeln!(out, "    const size_t num_kv = VELOX_NUM_KV_HEADS * VELOX_HEAD_DIM;");
+        let _ = writeln!(out, "    if (global_row >= num_q + 2ULL * num_kv) return;");
+        let _ = writeln!(out, "    const size_t max_s = VELOX_MODEL_MAX_SEQ_LEN;");
+        let _ = writeln!(out, "    const size_t safe_step = (step < max_s) ? step : (max_s - 1);");
+        let _ = writeln!(out, "    float* k_layer = kv_pool + (layer * 2ULL * max_s * num_kv);");
+        let _ = writeln!(out, "    float* v_layer = k_layer + (max_s * num_kv);");
+        let _ = writeln!(out, "    const uint32_t* __restrict__ row_w = NULL;");
+        let _ = writeln!(out, "    const half2* __restrict__ row_s = NULL;");
+        let _ = writeln!(out, "    float* __restrict__ dst_ptr = NULL;");
+        let _ = writeln!(out, "    if (global_row < num_q) {{");
+        let _ = writeln!(out, "        size_t off = (layer * dim * num_q) + (global_row * dim);");
+        let _ = writeln!(out, "        row_w = w_q + (off >> 3); row_s = s_q + (off >> 6);");
+        let _ = writeln!(out, "        dst_ptr = dst_q + global_row;");
+        let _ = writeln!(out, "    }} else if (global_row < num_q + num_kv) {{");
+        let _ = writeln!(out, "        const size_t k_row = global_row - num_q;");
+        let _ = writeln!(out, "        size_t off = (layer * dim * num_kv) + (k_row * dim);");
+        let _ = writeln!(out, "        row_w = w_k + (off >> 3); row_s = s_k + (off >> 6);");
+        let _ = writeln!(out, "        dst_ptr = k_layer + (safe_step * num_kv) + k_row;");
+        let _ = writeln!(out, "    }} else {{");
+        let _ = writeln!(out, "        const size_t v_row = global_row - num_q - num_kv;");
+        let _ = writeln!(out, "        size_t off = (layer * dim * num_kv) + (v_row * dim);");
+        let _ = writeln!(out, "        row_w = w_v + (off >> 3); row_s = s_v + (off >> 6);");
+        let _ = writeln!(out, "        dst_ptr = v_layer + (safe_step * num_kv) + v_row;");
+        let _ = writeln!(out, "    }}");
+        let _ = writeln!(out, "    float acc = velox_warp_dot_q4(row_w, row_s, norm_input, dim, lane_id);");
+        let _ = writeln!(out, "    if (lane_id == 0) *dst_ptr = acc;");
+        let _ = writeln!(out, "}}");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "__global__ void __launch_bounds__(128, 8) velox_cuda_out_proj_residual_kernel_f16(float* __restrict__ dst_hidden, const float* __restrict__ attn_in, const float* __restrict__ residual_in, const __half* __restrict__ w_out, size_t layer, uint64_t active_mask) {{");
+        let _ = writeln!(out, "    if ((active_mask & 1ULL) == 0ULL) return;");
+        let _ = writeln!(out, "    const size_t warp_id = threadIdx.x / 32;");
+        let _ = writeln!(out, "    const size_t lane_id = threadIdx.x % 32;");
+        let _ = writeln!(out, "    const size_t row = (size_t)blockIdx.x * 4ULL + warp_id;");
+        let _ = writeln!(out, "    const size_t dim = VELOX_HIDDEN_DIM;");
+        let _ = writeln!(out, "    if (row >= dim) return;");
+        let _ = writeln!(out, "    float acc = velox_warp_dot_f16(w_out + (layer * dim * dim) + (row * dim), attn_in, dim, lane_id);");
+        let _ = writeln!(out, "    if (lane_id == 0) dst_hidden[row] = acc + residual_in[row];");
+        let _ = writeln!(out, "}}");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "__global__ void __launch_bounds__(128, 8) velox_cuda_out_proj_residual_kernel_q4(float* __restrict__ dst_hidden, const float* __restrict__ attn_in, const float* __restrict__ residual_in, const uint32_t* __restrict__ w_out, const half2* __restrict__ s_out, size_t layer, uint64_t active_mask) {{");
+        let _ = writeln!(out, "    if ((active_mask & 1ULL) == 0ULL) return;");
+        let _ = writeln!(out, "    const size_t warp_id = threadIdx.x / 32;");
+        let _ = writeln!(out, "    const size_t lane_id = threadIdx.x % 32;");
+        let _ = writeln!(out, "    const size_t row = (size_t)blockIdx.x * 4ULL + warp_id;");
+        let _ = writeln!(out, "    const size_t dim = VELOX_HIDDEN_DIM;");
+        let _ = writeln!(out, "    if (row >= dim) return;");
+        let _ = writeln!(out, "    size_t off = (layer * dim * dim) + (row * dim);");
+        let _ = writeln!(out, "    float acc = velox_warp_dot_q4(w_out + (off >> 3), s_out + (off >> 6), attn_in, dim, lane_id);");
+        let _ = writeln!(out, "    if (lane_id == 0) dst_hidden[row] = acc + residual_in[row];");
+        let _ = writeln!(out, "}}");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "__global__ void __launch_bounds__(128, 8) velox_cuda_swiglu_gate_up_kernel_f16(float* __restrict__ dst_act, const float* __restrict__ norm_input, const __half* __restrict__ w_gate, const __half* __restrict__ w_up, size_t layer, uint64_t active_mask) {{");
+        let _ = writeln!(out, "    if ((active_mask & 1ULL) == 0ULL) return;");
+        let _ = writeln!(out, "    const size_t warp_id = threadIdx.x / 32;");
+        let _ = writeln!(out, "    const size_t lane_id = threadIdx.x % 32;");
+        let _ = writeln!(out, "    const size_t j = (size_t)blockIdx.x * 4ULL + warp_id;");
+        let _ = writeln!(out, "    const size_t dim = VELOX_HIDDEN_DIM;");
+        let _ = writeln!(out, "    const size_t inter_dim = VELOX_INTERMEDIATE_DIM;");
+        let _ = writeln!(out, "    if (j >= inter_dim) return;");
+        let _ = writeln!(out, "    size_t off = (layer * inter_dim * dim) + (j * dim);");
+        let _ = writeln!(out, "    float acc_gate = velox_warp_dot_f16(w_gate + off, norm_input, dim, lane_id);");
+        let _ = writeln!(out, "    float acc_up   = velox_warp_dot_f16(w_up + off, norm_input, dim, lane_id);");
+        let _ = writeln!(out, "    if (lane_id == 0) {{");
+        let _ = writeln!(out, "        float silu = acc_gate / (1.0f + expf(-acc_gate));");
+        let _ = writeln!(out, "        dst_act[j] = silu * acc_up;");
+        let _ = writeln!(out, "    }}");
+        let _ = writeln!(out, "}}");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "__global__ void __launch_bounds__(128, 8) velox_cuda_swiglu_gate_up_kernel_q4(float* __restrict__ dst_act, const float* __restrict__ norm_input, const uint32_t* __restrict__ w_gate, const half2* __restrict__ s_gate, const uint32_t* __restrict__ w_up, const half2* __restrict__ s_up, size_t layer, uint64_t active_mask) {{");
+        let _ = writeln!(out, "    if ((active_mask & 1ULL) == 0ULL) return;");
+        let _ = writeln!(out, "    const size_t warp_id = threadIdx.x / 32;");
+        let _ = writeln!(out, "    const size_t lane_id = threadIdx.x % 32;");
+        let _ = writeln!(out, "    const size_t j = (size_t)blockIdx.x * 4ULL + warp_id;");
+        let _ = writeln!(out, "    const size_t dim = VELOX_HIDDEN_DIM;");
+        let _ = writeln!(out, "    const size_t inter_dim = VELOX_INTERMEDIATE_DIM;");
+        let _ = writeln!(out, "    if (j >= inter_dim) return;");
+        let _ = writeln!(out, "    size_t off = (layer * inter_dim * dim) + (j * dim);");
+        let _ = writeln!(out, "    float acc_gate = velox_warp_dot_q4(w_gate + (off >> 3), s_gate + (off >> 6), norm_input, dim, lane_id);");
+        let _ = writeln!(out, "    float acc_up   = velox_warp_dot_q4(w_up + (off >> 3), s_up + (off >> 6), norm_input, dim, lane_id);");
+        let _ = writeln!(out, "    if (lane_id == 0) {{");
+        let _ = writeln!(out, "        float silu = acc_gate / (1.0f + expf(-acc_gate));");
+        let _ = writeln!(out, "        dst_act[j] = silu * acc_up;");
+        let _ = writeln!(out, "    }}");
+        let _ = writeln!(out, "}}");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "__global__ void __launch_bounds__(128, 8) velox_cuda_swiglu_down_residual_kernel_f16(float* __restrict__ dst_hidden, const float* __restrict__ act_in, const __half* __restrict__ w_down, size_t layer, uint64_t active_mask) {{");
+        let _ = writeln!(out, "    if ((active_mask & 1ULL) == 0ULL) return;");
+        let _ = writeln!(out, "    const size_t warp_id = threadIdx.x / 32;");
+        let _ = writeln!(out, "    const size_t lane_id = threadIdx.x % 32;");
+        let _ = writeln!(out, "    const size_t o = (size_t)blockIdx.x * 4ULL + warp_id;");
+        let _ = writeln!(out, "    const size_t dim = VELOX_HIDDEN_DIM;");
+        let _ = writeln!(out, "    const size_t inter_dim = VELOX_INTERMEDIATE_DIM;");
+        let _ = writeln!(out, "    if (o >= dim) return;");
+        let _ = writeln!(out, "    float acc = velox_warp_dot_f16(w_down + (layer * dim * inter_dim) + (o * inter_dim), act_in, inter_dim, lane_id);");
+        let _ = writeln!(out, "    if (lane_id == 0) dst_hidden[o] += acc;");
+        let _ = writeln!(out, "}}");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "__global__ void __launch_bounds__(128, 8) velox_cuda_swiglu_down_residual_kernel_q4(float* __restrict__ dst_hidden, const float* __restrict__ act_in, const uint32_t* __restrict__ w_down, const half2* __restrict__ s_down, size_t layer, uint64_t active_mask) {{");
+        let _ = writeln!(out, "    if ((active_mask & 1ULL) == 0ULL) return;");
+        let _ = writeln!(out, "    const size_t warp_id = threadIdx.x / 32;");
+        let _ = writeln!(out, "    const size_t lane_id = threadIdx.x % 32;");
+        let _ = writeln!(out, "    const size_t o = (size_t)blockIdx.x * 4ULL + warp_id;");
+        let _ = writeln!(out, "    const size_t dim = VELOX_HIDDEN_DIM;");
+        let _ = writeln!(out, "    const size_t inter_dim = VELOX_INTERMEDIATE_DIM;");
+        let _ = writeln!(out, "    if (o >= dim) return;");
+        let _ = writeln!(out, "    size_t off = (layer * dim * inter_dim) + (o * inter_dim);");
+        let _ = writeln!(out, "    float acc = velox_warp_dot_q4(w_down + (off >> 3), s_down + (off >> 6), act_in, inter_dim, lane_id);");
+        let _ = writeln!(out, "    if (lane_id == 0) dst_hidden[o] += acc;");
+        let _ = writeln!(out, "}}");
+        let _ = writeln!(out);
+
         // Emit Host Launch Wrappers
         let w_offset = |name: &str| -> u64 {
             module
@@ -2079,12 +2422,26 @@ impl CodeGenerator {
                         VirInst::Embed {
                             dst, weight_name, ..
                         } => {
+                            let w_off = w_offset(weight_name);
+                            let _ = writeln!(out, "    if (ctx->quant_mode == VELOX_QUANT_FP16) {{");
                             let _ = writeln!(
                                 out,
-                                "    velox_cuda_embed_kernel<<<grid, block, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), d_state, VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), active_mask);",
-                                dst.arena_offset,
-                                w_offset(weight_name)
+                                "        velox_cuda_embed_kernel_f16<<<grid, block, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), d_state, VELOX_DEV_W_F16_PTR(ctx, {}ULL), active_mask);",
+                                dst.arena_offset, w_off
                             );
+                            let _ = writeln!(out, "    }} else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {{");
+                            let _ = writeln!(
+                                out,
+                                "        velox_cuda_embed_kernel_q4<<<grid, block, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), d_state, VELOX_DEV_W_Q4_PTR(ctx, {}ULL), VELOX_DEV_S_Q4_PTR(ctx, {}ULL), active_mask);",
+                                dst.arena_offset, w_off, w_off
+                            );
+                            let _ = writeln!(out, "    }} else {{");
+                            let _ = writeln!(
+                                out,
+                                "        velox_cuda_embed_kernel<<<grid, block, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), d_state, VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), active_mask);",
+                                dst.arena_offset, w_off
+                            );
+                            let _ = writeln!(out, "    }}");
                         }
                         VirInst::FusedNormQkvRopeAttn {
                             dst_attn,
@@ -2100,23 +2457,35 @@ impl CodeGenerator {
                             // 1. Multi-block layer RMSNorm: normalizes input_hidden into scratch_norm
                             let _ = writeln!(
                                 out,
-                                "    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL) + ({}ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, {:.6}f, active_mask);",
+                                "    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_NORM_PTR(ctx, {}ULL) + ({}ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, {:.6}f, active_mask);",
                                 input_hidden.arena_offset,
                                 w_offset(w_norm),
                                 layer,
                                 eps
                             );
                             // 2. Multi-SM coalesced warp QKV projection across all SMs
+                            let wq_off = w_offset(w_q);
+                            let wk_off = w_offset(w_k);
+                            let wv_off = w_offset(w_v);
+                            let _ = writeln!(out, "    if (ctx->quant_mode == VELOX_QUANT_FP16) {{");
                             let _ = writeln!(
                                 out,
-                                "    velox_cuda_fused_qkv_warp_kernel<<<dim3({}), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), {}ULL, d_state, active_mask);",
-                                qkv_blocks,
-                                dst_attn.arena_offset,
-                                w_offset(w_q),
-                                w_offset(w_k),
-                                w_offset(w_v),
-                                layer
+                                "        velox_cuda_fused_qkv_warp_kernel_f16<<<dim3({}), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_F16_PTR(ctx, {}ULL), VELOX_DEV_W_F16_PTR(ctx, {}ULL), VELOX_DEV_W_F16_PTR(ctx, {}ULL), {}ULL, d_state, active_mask);",
+                                qkv_blocks, dst_attn.arena_offset, wq_off, wk_off, wv_off, layer
                             );
+                            let _ = writeln!(out, "    }} else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {{");
+                            let _ = writeln!(
+                                out,
+                                "        velox_cuda_fused_qkv_warp_kernel_q4<<<dim3({}), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_Q4_PTR(ctx, {}ULL), VELOX_DEV_S_Q4_PTR(ctx, {}ULL), VELOX_DEV_W_Q4_PTR(ctx, {}ULL), VELOX_DEV_S_Q4_PTR(ctx, {}ULL), VELOX_DEV_W_Q4_PTR(ctx, {}ULL), VELOX_DEV_S_Q4_PTR(ctx, {}ULL), {}ULL, d_state, active_mask);",
+                                qkv_blocks, dst_attn.arena_offset, wq_off, wq_off, wk_off, wk_off, wv_off, wv_off, layer
+                            );
+                            let _ = writeln!(out, "    }} else {{");
+                            let _ = writeln!(
+                                out,
+                                "        velox_cuda_fused_qkv_warp_kernel<<<dim3({}), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), {}ULL, d_state, active_mask);",
+                                qkv_blocks, dst_attn.arena_offset, wq_off, wk_off, wv_off, layer
+                            );
+                            let _ = writeln!(out, "    }}");
                             // 3. Fused RoPE rotation on Q and K
                             let _ = writeln!(
                                 out,
@@ -2145,44 +2514,74 @@ impl CodeGenerator {
                             layer,
                             eps,
                         } => {
+                            let wout_off = w_offset(w_out);
+                            let wgate_off = w_offset(w_gate);
+                            let wup_off = w_offset(w_up);
+                            let wdown_off = w_down.as_str().find(|_| true).map_or(0, |_| w_offset(w_down));
                             // 1. Multi-SM Out Projection + Residual: dst_hidden = attn_in @ w_out[layer] + residual_in
+                            let _ = writeln!(out, "    if (ctx->quant_mode == VELOX_QUANT_FP16) {{");
                             let _ = writeln!(
                                 out,
-                                "    velox_cuda_out_proj_residual_kernel<<<dim3({}), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), {}ULL, active_mask);",
-                                out_blocks,
-                                dst_hidden.arena_offset,
-                                attn_in.arena_offset,
-                                residual_in.arena_offset,
-                                w_offset(w_out),
-                                layer
+                                "        velox_cuda_out_proj_residual_kernel_f16<<<dim3({}), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_W_F16_PTR(ctx, {}ULL), {}ULL, active_mask);",
+                                out_blocks, dst_hidden.arena_offset, attn_in.arena_offset, residual_in.arena_offset, wout_off, layer
                             );
+                            let _ = writeln!(out, "    }} else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {{");
+                            let _ = writeln!(
+                                out,
+                                "        velox_cuda_out_proj_residual_kernel_q4<<<dim3({}), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_W_Q4_PTR(ctx, {}ULL), VELOX_DEV_S_Q4_PTR(ctx, {}ULL), {}ULL, active_mask);",
+                                out_blocks, dst_hidden.arena_offset, attn_in.arena_offset, residual_in.arena_offset, wout_off, wout_off, layer
+                            );
+                            let _ = writeln!(out, "    }} else {{");
+                            let _ = writeln!(
+                                out,
+                                "        velox_cuda_out_proj_residual_kernel<<<dim3({}), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), {}ULL, active_mask);",
+                                out_blocks, dst_hidden.arena_offset, attn_in.arena_offset, residual_in.arena_offset, wout_off, layer
+                            );
+                            let _ = writeln!(out, "    }}");
                             // 2. Pre-SwiGLU RMSNorm: normalizes dst_hidden into scratch_norm
                             let _ = writeln!(
                                 out,
-                                "    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL) + ({}ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, {:.6}f, active_mask);",
+                                "    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_NORM_PTR(ctx, {}ULL) + ({}ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, {:.6}f, active_mask);",
                                 dst_hidden.arena_offset,
                                 w_offset(w_post_norm),
                                 layer,
                                 eps
                             );
-                            // 3. Multi-SM SwiGLU Gate & Up: scratch_act = silu(norm_mid @ w_gate) * (norm_mid @ w_up)
+                            // 3. Multi-SM SwiGLU Gate & Up + 4. Down Projection + Residual
+                            let _ = writeln!(out, "    if (ctx->quant_mode == VELOX_QUANT_FP16) {{");
                             let _ = writeln!(
                                 out,
-                                "    velox_cuda_swiglu_gate_up_kernel<<<dim3({}), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), {}ULL, active_mask);",
-                                swiglu_blocks,
-                                w_offset(w_gate),
-                                w_offset(w_up),
-                                layer
+                                "        velox_cuda_swiglu_gate_up_kernel_f16<<<dim3({}), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_F16_PTR(ctx, {}ULL), VELOX_DEV_W_F16_PTR(ctx, {}ULL), {}ULL, active_mask);",
+                                swiglu_blocks, wgate_off, wup_off, layer
                             );
-                            // 4. Multi-SM SwiGLU Down Projection + Residual: dst_hidden += scratch_act @ w_down
                             let _ = writeln!(
                                 out,
-                                "    velox_cuda_swiglu_down_residual_kernel<<<dim3({}), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), {}ULL, active_mask);",
-                                out_blocks,
-                                dst_hidden.arena_offset,
-                                w_down.as_str().find(|_| true).map_or(0, |_| w_offset(w_down)),
-                                layer
+                                "        velox_cuda_swiglu_down_residual_kernel_f16<<<dim3({}), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_F16_PTR(ctx, {}ULL), {}ULL, active_mask);",
+                                out_blocks, dst_hidden.arena_offset, wdown_off, layer
                             );
+                            let _ = writeln!(out, "    }} else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {{");
+                            let _ = writeln!(
+                                out,
+                                "        velox_cuda_swiglu_gate_up_kernel_q4<<<dim3({}), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_Q4_PTR(ctx, {}ULL), VELOX_DEV_S_Q4_PTR(ctx, {}ULL), VELOX_DEV_W_Q4_PTR(ctx, {}ULL), VELOX_DEV_S_Q4_PTR(ctx, {}ULL), {}ULL, active_mask);",
+                                swiglu_blocks, wgate_off, wgate_off, wup_off, wup_off, layer
+                            );
+                            let _ = writeln!(
+                                out,
+                                "        velox_cuda_swiglu_down_residual_kernel_q4<<<dim3({}), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_Q4_PTR(ctx, {}ULL), VELOX_DEV_S_Q4_PTR(ctx, {}ULL), {}ULL, active_mask);",
+                                out_blocks, dst_hidden.arena_offset, wdown_off, wdown_off, layer
+                            );
+                            let _ = writeln!(out, "    }} else {{");
+                            let _ = writeln!(
+                                out,
+                                "        velox_cuda_swiglu_gate_up_kernel<<<dim3({}), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), {}ULL, active_mask);",
+                                swiglu_blocks, wgate_off, wup_off, layer
+                            );
+                            let _ = writeln!(
+                                out,
+                                "        velox_cuda_swiglu_down_residual_kernel<<<dim3({}), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), {}ULL, active_mask);",
+                                out_blocks, dst_hidden.arena_offset, wdown_off, layer
+                            );
+                            let _ = writeln!(out, "    }}");
                         }
                         VirInst::FusedMlaAbsorbedAttn {
                             dst_hidden,
@@ -2223,7 +2622,7 @@ impl CodeGenerator {
                             };
                             let _ = writeln!(
                                 out,
-                                "    velox_cuda_rmsnorm_kernel<<<grid, block, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), VELOX_HIDDEN_DIM, {:.6}f, active_mask);",
+                                "    velox_cuda_rmsnorm_kernel<<<grid, block, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_NORM_PTR(ctx, {}ULL), VELOX_HIDDEN_DIM, {:.6}f, active_mask);",
                                 dst_offset,
                                 input.arena_offset,
                                 w_offset(weight_name),
@@ -2245,16 +2644,26 @@ impl CodeGenerator {
                                 lhs.arena_offset
                             };
                             let num_blocks = std::cmp::max(1usize, (out_dim + 3) / 4);
+                            let w_off = w_offset(weight_name);
+                            let _ = writeln!(out, "    if (ctx->quant_mode == VELOX_QUANT_FP16) {{");
                             let _ = writeln!(
                                 out,
-                                "    velox_cuda_matmul_vec_kernel<<<dim3({}ULL), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), {}ULL, {}ULL, active_mask);",
-                                num_blocks,
-                                dst.arena_offset,
-                                lhs_offset,
-                                w_offset(weight_name),
-                                in_dim,
-                                out_dim
+                                "        velox_cuda_matmul_vec_kernel_f16<<<dim3({}ULL), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_W_F16_PTR(ctx, {}ULL), {}ULL, {}ULL, active_mask);",
+                                num_blocks, dst.arena_offset, lhs_offset, w_off, in_dim, out_dim
                             );
+                            let _ = writeln!(out, "    }} else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {{");
+                            let _ = writeln!(
+                                out,
+                                "        velox_cuda_matmul_vec_kernel_q4<<<dim3({}ULL), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_W_Q4_PTR(ctx, {}ULL), VELOX_DEV_S_Q4_PTR(ctx, {}ULL), {}ULL, {}ULL, active_mask);",
+                                num_blocks, dst.arena_offset, lhs_offset, w_off, w_off, in_dim, out_dim
+                            );
+                            let _ = writeln!(out, "    }} else {{");
+                            let _ = writeln!(
+                                out,
+                                "        velox_cuda_matmul_vec_kernel<<<dim3({}ULL), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), {}ULL, {}ULL, active_mask);",
+                                num_blocks, dst.arena_offset, lhs_offset, w_off, in_dim, out_dim
+                            );
+                            let _ = writeln!(out, "    }}");
                         }
                         VirInst::RoPE { dst, input, theta } => {
                             let _ = writeln!(
