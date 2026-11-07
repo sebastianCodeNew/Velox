@@ -279,6 +279,7 @@ int main(int argc, char** argv) {
     size_t prompt_len = 3;
     size_t steps = 32;
     bool verbose = false;
+    bool use_cuda_graph = true;
 
     // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
@@ -298,6 +299,8 @@ int main(int argc, char** argv) {
             steps = (size_t)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--verbose") == 0) {
             verbose = true;
+        } else if (strcmp(argv[i], "--no-cuda-graph") == 0) {
+            use_cuda_graph = false;
         }
     }
 
@@ -371,6 +374,24 @@ int main(int argc, char** argv) {
     ctx.activation_arena = d_activation;
     ctx.host_pinned_ring = d_ring;
 
+    // 4b. Pre-capture single-step decode CUDA Graph (invariant device-resident VeloxDecodeState)
+    cudaGraph_t decode_graph = NULL;
+    cudaGraphExec_t decode_graph_exec = NULL;
+    if (use_cuda_graph) {
+        err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+        if (err == cudaSuccess) {
+            velox_SmolLM_135M_decode_graph_step_cuda(&ctx, 1ULL, stream);
+            err = cudaStreamEndCapture(stream, &decode_graph);
+            if (err == cudaSuccess && decode_graph != NULL) {
+                err = cudaGraphInstantiate(&decode_graph_exec, decode_graph, NULL, NULL, 0);
+            }
+        }
+        if (err != cudaSuccess || decode_graph_exec == NULL) {
+            fprintf(stderr, "Warning: CUDA Graph capture failed (%s), falling back to eager stream\n", cudaGetErrorString(err));
+            use_cuda_graph = false;
+        }
+    }
+
     // Allocate output token buffer on host
     uint32_t* generated_tokens = (uint32_t*)malloc(steps * sizeof(uint32_t));
     if (!generated_tokens) return 1;
@@ -404,22 +425,57 @@ int main(int argc, char** argv) {
     // 6. Autoregressive Decode Phase (strictly 0 dynamic allocations on GPU & CPU)
     float decode_gpu_ms = 0.0f;
     if (steps > 1) {
-        cudaEventRecord(ev_decode_start, stream);
-
-        for (size_t s = 1; s < steps; ++s) {
-            size_t pos = prompt_len - 1 + s;
-            velox_SmolLM_135M_decode_cuda(&ctx, next_tok, pos, 1ULL, stream);
+        if (use_cuda_graph && decode_graph_exec != NULL) {
+            // Ensure device decode state holds (next_tok, prompt_len) before graph replay
+            velox_cuda_set_decode_state<<<1, 1, 0, stream>>>(VELOX_DEV_STATE(&ctx), next_tok, (unsigned long long)prompt_len);
             cudaStreamSynchronize(stream);
-            next_tok = h_ring[pos & 1023ULL];
-            generated_tokens[s] = next_tok;
-            if (verbose) {
-                printf("[Step %zu] Token: %u\n", s, next_tok);
-            }
-        }
 
-        cudaEventRecord(ev_decode_stop, stream);
-        cudaStreamSynchronize(stream);
-        cudaEventElapsedTime(&decode_gpu_ms, ev_decode_start, ev_decode_stop);
+            cudaEventRecord(ev_decode_start, stream);
+
+            if (!verbose && steps <= VELOX_HOST_RING_SLOTS) {
+                for (size_t s = 1; s < steps; ++s) {
+                    cudaGraphLaunch(decode_graph_exec, stream);
+                }
+                cudaEventRecord(ev_decode_stop, stream);
+                cudaStreamSynchronize(stream);
+                for (size_t s = 1; s < steps; ++s) {
+                    size_t pos = prompt_len - 1 + s;
+                    generated_tokens[s] = h_ring[pos & 1023ULL];
+                }
+            } else {
+                for (size_t s = 1; s < steps; ++s) {
+                    size_t pos = prompt_len - 1 + s;
+                    cudaGraphLaunch(decode_graph_exec, stream);
+                    cudaStreamSynchronize(stream);
+                    next_tok = h_ring[pos & 1023ULL];
+                    generated_tokens[s] = next_tok;
+                    if (verbose) {
+                        printf("[Step %zu] Token: %u\n", s, next_tok);
+                    }
+                }
+                cudaEventRecord(ev_decode_stop, stream);
+                cudaStreamSynchronize(stream);
+            }
+
+            cudaEventElapsedTime(&decode_gpu_ms, ev_decode_start, ev_decode_stop);
+        } else {
+            cudaEventRecord(ev_decode_start, stream);
+
+            for (size_t s = 1; s < steps; ++s) {
+                size_t pos = prompt_len - 1 + s;
+                velox_SmolLM_135M_decode_cuda(&ctx, next_tok, pos, 1ULL, stream);
+                cudaStreamSynchronize(stream);
+                next_tok = h_ring[pos & 1023ULL];
+                generated_tokens[s] = next_tok;
+                if (verbose) {
+                    printf("[Step %zu] Token: %u\n", s, next_tok);
+                }
+            }
+
+            cudaEventRecord(ev_decode_stop, stream);
+            cudaStreamSynchronize(stream);
+            cudaEventElapsedTime(&decode_gpu_ms, ev_decode_start, ev_decode_stop);
+        }
     }
 
     double total_gpu_ms = (double)ttft_gpu_ms + (double)decode_gpu_ms;
@@ -504,6 +560,8 @@ int main(int argc, char** argv) {
 
     // Clean up
     free(generated_tokens);
+    if (decode_graph_exec) cudaGraphExecDestroy(decode_graph_exec);
+    if (decode_graph) cudaGraphDestroy(decode_graph);
     cudaEventDestroy(ev_prefill_start);
     cudaEventDestroy(ev_prefill_stop);
     cudaEventDestroy(ev_decode_start);

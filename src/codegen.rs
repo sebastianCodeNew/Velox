@@ -895,6 +895,11 @@ impl CodeGenerator {
         let _ = writeln!(out, "#define VELOX_SCRATCH_ACT_OFFSET             2162688ULL");
         let _ = writeln!(out, "#define VELOX_SCRATCH_STAGE1_VALS_OFFSET     2228224ULL");
         let _ = writeln!(out, "#define VELOX_SCRATCH_STAGE1_IDXS_OFFSET     2244608ULL");
+        // Step 14: 16-byte device-resident decode state (step counter + fed-back token) living in the
+        // static scratch region directly after the 16 KiB Stage-1 index scratch (supports V <= 1,048,576).
+        let _ = writeln!(out, "#define VELOX_SCRATCH_DECODE_STATE_OFFSET    2260992ULL");
+        let _ = writeln!(out, "#define VELOX_HOST_RING_SLOTS                1024ULL");
+        let _ = writeln!(out, "#define VELOX_HOST_RING_EMPTY                0xFFFFFFFFu");
         let _ = writeln!(out);
 
         let _ = writeln!(out, "typedef struct VeloxCudaArena {{");
@@ -904,8 +909,27 @@ impl CodeGenerator {
         let _ = writeln!(out, "    uint32_t*      __restrict__ host_pinned_ring;");
         let _ = writeln!(out, "}} VeloxCudaArena;");
         let _ = writeln!(out);
+        let _ = writeln!(out, "// Device-resident autoregressive state. Every step-dependent kernel reads `step`/`token` from here");
+        let _ = writeln!(out, "// instead of taking them by value, so a single captured CUDA Graph can be replayed for every");
+        let _ = writeln!(out, "// decode position. The final argmax kernel feeds the sampled token back and advances `step`.");
+        let _ = writeln!(out, "typedef struct VeloxDecodeState {{");
+        let _ = writeln!(out, "    unsigned long long step;");
+        let _ = writeln!(out, "    uint32_t token;");
+        let _ = writeln!(out, "    uint32_t reserved;");
+        let _ = writeln!(out, "}} VeloxDecodeState;");
+        let _ = writeln!(out);
         let _ = writeln!(out, "#define VELOX_DEV_ACT_PTR(arena_base, offset) ((float*)((uint8_t*)(arena_base) + (offset)))");
         let _ = writeln!(out, "#define VELOX_DEV_W_PTR(weight_base, offset)  ((const float*)((const uint8_t*)(weight_base) + (offset)))");
+        let _ = writeln!(out, "#define VELOX_DEV_STATE(ctx) ((VeloxDecodeState*)((uint8_t*)(ctx)->activation_arena + VELOX_SCRATCH_DECODE_STATE_OFFSET))");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "// Writes the host-provided (token, step) into the device state (used by the eager API entry points).");
+        let _ = writeln!(out, "__global__ void velox_cuda_set_decode_state(VeloxDecodeState* __restrict__ state, uint32_t token, unsigned long long step) {{");
+        let _ = writeln!(out, "    if (threadIdx.x == 0 && blockIdx.x == 0) {{");
+        let _ = writeln!(out, "        state->step = step;");
+        let _ = writeln!(out, "        state->token = token;");
+        let _ = writeln!(out, "        state->reserved = 0u;");
+        let _ = writeln!(out, "    }}");
+        let _ = writeln!(out, "}}");
         let _ = writeln!(out);
 
         // Emit CUDA device kernels
@@ -913,12 +937,13 @@ impl CodeGenerator {
 
         // 1.1 Embed kernel
         let _ = writeln!(out, "__global__ void __launch_bounds__(256) velox_cuda_embed_kernel(");
-        let _ = writeln!(out, "    float* __restrict__ dst, uint32_t token_id, const float* __restrict__ w_embed, uint64_t active_mask");
+        let _ = writeln!(out, "    float* __restrict__ dst, const VeloxDecodeState* __restrict__ state, const float* __restrict__ w_embed, uint64_t active_mask");
         let _ = writeln!(out, ") {{");
         let _ = writeln!(out, "    if ((active_mask & 1ULL) == 0ULL) return;");
+        let _ = writeln!(out, "    const size_t token_id = (size_t)state->token;");
         let _ = writeln!(out, "    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;");
-        let _ = writeln!(out, "    if (idx < VELOX_HIDDEN_DIM) {{");
-        let _ = writeln!(out, "        dst[idx] = w_embed[(size_t)token_id * VELOX_HIDDEN_DIM + idx];");
+        let _ = writeln!(out, "    if (idx < VELOX_HIDDEN_DIM && token_id < VELOX_VOCAB_SIZE) {{");
+        let _ = writeln!(out, "        dst[idx] = w_embed[token_id * VELOX_HIDDEN_DIM + idx];");
         let _ = writeln!(out, "    }}");
         let _ = writeln!(out, "}}");
         let _ = writeln!(out);
@@ -1025,10 +1050,11 @@ impl CodeGenerator {
         let _ = writeln!(out, "    const float* __restrict__ w_k,");
         let _ = writeln!(out, "    const float* __restrict__ w_v,");
         let _ = writeln!(out, "    size_t layer,");
-        let _ = writeln!(out, "    size_t step,");
+        let _ = writeln!(out, "    const VeloxDecodeState* __restrict__ state,");
         let _ = writeln!(out, "    uint64_t active_mask");
         let _ = writeln!(out, ") {{");
         let _ = writeln!(out, "    if ((active_mask & 1ULL) == 0ULL) return;");
+        let _ = writeln!(out, "    const size_t step = (size_t)state->step;");
         let _ = writeln!(out, "    const size_t warp_id = threadIdx.x / 32;");
         let _ = writeln!(out, "    const size_t lane_id = threadIdx.x % 32;");
         let _ = writeln!(out, "    const size_t global_row = (size_t)blockIdx.x * 4ULL + warp_id;");
@@ -1095,11 +1121,12 @@ impl CodeGenerator {
         let _ = writeln!(out, "    float* __restrict__ q,");
         let _ = writeln!(out, "    float* __restrict__ kv_pool,");
         let _ = writeln!(out, "    size_t layer,");
-        let _ = writeln!(out, "    size_t step,");
+        let _ = writeln!(out, "    const VeloxDecodeState* __restrict__ state,");
         let _ = writeln!(out, "    float theta,");
         let _ = writeln!(out, "    uint64_t active_mask");
         let _ = writeln!(out, ") {{");
         let _ = writeln!(out, "    if ((active_mask & 1ULL) == 0ULL) return;");
+        let _ = writeln!(out, "    const size_t step = (size_t)state->step;");
         let _ = writeln!(out, "    const size_t H = VELOX_NUM_HEADS;");
         let _ = writeln!(out, "    const size_t KV_H = VELOX_NUM_KV_HEADS;");
         let _ = writeln!(out, "    const size_t D = VELOX_HEAD_DIM;");
@@ -1151,10 +1178,11 @@ impl CodeGenerator {
         let _ = writeln!(out, "    float* __restrict__ dst_attn,");
         let _ = writeln!(out, "    const float* __restrict__ kv_pool,");
         let _ = writeln!(out, "    size_t layer,");
-        let _ = writeln!(out, "    size_t step,");
+        let _ = writeln!(out, "    const VeloxDecodeState* __restrict__ state,");
         let _ = writeln!(out, "    uint64_t active_mask");
         let _ = writeln!(out, ") {{");
         let _ = writeln!(out, "    if ((active_mask & 1ULL) == 0ULL) return;");
+        let _ = writeln!(out, "    const size_t step = (size_t)state->step;");
         let _ = writeln!(out, "    const size_t H = VELOX_NUM_HEADS;");
         let _ = writeln!(out, "    const size_t KV_H = VELOX_NUM_KV_HEADS;");
         let _ = writeln!(out, "    const size_t D = VELOX_HEAD_DIM;");
@@ -1195,8 +1223,10 @@ impl CodeGenerator {
         let _ = writeln!(out, "        }}");
         let _ = writeln!(out, "        s_dot[tid] = my_dot;");
         let _ = writeln!(out, "        __syncthreads();");
-        let _ = writeln!(out, "        for (size_t s = 128; s > 0; s >>= 1) {{");
-        let _ = writeln!(out, "            if (tid < s && tid + s < 256) s_dot[tid] += s_dot[tid + s];");
+        let _ = writeln!(out, "        // Tree reduction bounded by the launched block size (power of two, <= 256). Reducing a");
+        let _ = writeln!(out, "        // fixed 256-wide span would read never-written shared memory when blockDim.x < 256.");
+        let _ = writeln!(out, "        for (size_t s = blockDim.x / 2; s > 0; s >>= 1) {{");
+        let _ = writeln!(out, "            if (tid < s) s_dot[tid] += s_dot[tid + s];");
         let _ = writeln!(out, "            __syncthreads();");
         let _ = writeln!(out, "        }}");
         let _ = writeln!(out, "        float dot = s_dot[0] * scale;");
@@ -1415,13 +1445,14 @@ impl CodeGenerator {
         let _ = writeln!(out, "    const float* __restrict__ scratch_vals,");
         let _ = writeln!(out, "    const uint32_t* __restrict__ scratch_idxs,");
         let _ = writeln!(out, "    size_t num_candidates,");
-        let _ = writeln!(out, "    size_t step,");
+        let _ = writeln!(out, "    VeloxDecodeState* __restrict__ state,");
         let _ = writeln!(out, "    uint64_t active_mask");
         let _ = writeln!(out, ") {{");
         let _ = writeln!(out, "    if ((active_mask & 1ULL) == 0ULL) return;");
         let _ = writeln!(out, "    __shared__ float s_val[256];");
         let _ = writeln!(out, "    __shared__ uint32_t s_idx[256];");
         let _ = writeln!(out, "    const size_t tid = threadIdx.x;");
+        let _ = writeln!(out, "    const unsigned long long step = state->step;");
         let _ = writeln!(out);
         let _ = writeln!(out, "    float my_val = -1.0e30f;");
         let _ = writeln!(out, "    uint32_t my_idx = 0U;");
@@ -1448,8 +1479,16 @@ impl CodeGenerator {
         let _ = writeln!(out, "        __syncthreads();");
         let _ = writeln!(out, "    }}");
         let _ = writeln!(out);
-        let _ = writeln!(out, "    if (tid == 0 && host_pinned_ring != NULL) {{");
-        let _ = writeln!(out, "        host_pinned_ring[step & 1023ULL] = s_idx[0];");
+        let _ = writeln!(out, "    if (tid == 0) {{");
+        let _ = writeln!(out, "        const uint32_t winner = s_idx[0];");
+        let _ = writeln!(out, "        if (host_pinned_ring != NULL) {{");
+        let _ = writeln!(out, "            host_pinned_ring[step & (VELOX_HOST_RING_SLOTS - 1ULL)] = winner;");
+        let _ = writeln!(out, "            // Make the zero-copy ring write visible to the polling host thread.");
+        let _ = writeln!(out, "            __threadfence_system();");
+        let _ = writeln!(out, "        }}");
+        let _ = writeln!(out, "        // Device-side autoregressive feedback: next step embeds `winner` at position step + 1.");
+        let _ = writeln!(out, "        state->token = winner;");
+        let _ = writeln!(out, "        state->step = step + 1ULL;");
         let _ = writeln!(out, "    }}");
         let _ = writeln!(out, "}}");
         let _ = writeln!(out);
@@ -1506,9 +1545,10 @@ impl CodeGenerator {
         let _ = writeln!(out, "// RoPE Rotary Position Embedding Kernel");
         let _ = writeln!(out, "__global__ void __launch_bounds__(256) velox_cuda_rope_kernel(");
         let _ = writeln!(out, "    float* __restrict__ dst, const float* __restrict__ src,");
-        let _ = writeln!(out, "    size_t num_heads, size_t head_dim, size_t step, float theta, uint64_t active_mask");
+        let _ = writeln!(out, "    size_t num_heads, size_t head_dim, const VeloxDecodeState* __restrict__ state, float theta, uint64_t active_mask");
         let _ = writeln!(out, ") {{");
         let _ = writeln!(out, "    if ((active_mask & 1ULL) == 0ULL) return;");
+        let _ = writeln!(out, "    const size_t step = (size_t)state->step;");
         let _ = writeln!(out, "    size_t half_d = head_dim / 2;");
         let _ = writeln!(out, "    size_t total_pairs = num_heads * half_d;");
         let _ = writeln!(out, "    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < total_pairs; idx += (size_t)gridDim.x * blockDim.x) {{");
@@ -1777,10 +1817,11 @@ impl CodeGenerator {
         let _ = writeln!(out, "    float* __restrict__ dst_hidden, const float* __restrict__ input_hidden,");
         let _ = writeln!(out, "    const float* __restrict__ w_norm, const float* __restrict__ w_dkv,");
         let _ = writeln!(out, "    const float* __restrict__ w_absorbed_q, const float* __restrict__ w_absorbed_o,");
-        let _ = writeln!(out, "    float* __restrict__ kv_latent, size_t layer, size_t step, float eps, uint64_t active_mask");
+        let _ = writeln!(out, "    float* __restrict__ kv_latent, size_t layer, const VeloxDecodeState* __restrict__ state, float eps, uint64_t active_mask");
         let _ = writeln!(out, ") {{");
         let _ = writeln!(out, "    if ((active_mask & 1ULL) == 0ULL) return;");
         let _ = writeln!(out, "    if (blockIdx.x > 0) return;");
+        let _ = writeln!(out, "    const size_t step = (size_t)state->step;");
         let _ = writeln!(out, "    const size_t dim = VELOX_HIDDEN_DIM;");
         let _ = writeln!(out, "    const size_t max_s = VELOX_MODEL_MAX_SEQ_LEN;");
         let _ = writeln!(out, "    const size_t d_c = 512;");
@@ -2011,14 +2052,26 @@ impl CodeGenerator {
                 .map_or(0, |w| w.offset_bytes)
         };
 
+        let qkv_blocks = std::cmp::max(
+            1usize,
+            (num_heads * head_dim + 2 * num_kv_heads * head_dim + 3) / 4,
+        );
+        let rope_blocks = std::cmp::max(
+            1usize,
+            ((num_heads + num_kv_heads) * (head_dim / 2) + 127) / 128,
+        );
+        let out_blocks = std::cmp::max(1usize, (hidden_dim + 3) / 4);
+        let swiglu_blocks = std::cmp::max(1usize, (inter_dim + 3) / 4);
+
         for func in &module.functions {
             let _ = writeln!(
                 out,
-                "extern \"C\" void {}_cuda(VeloxCudaArena* ctx, uint32_t token_in, size_t step, uint64_t active_mask, cudaStream_t stream) {{",
+                "extern \"C\" void {}_graph_step_cuda(VeloxCudaArena* ctx, uint64_t active_mask, cudaStream_t stream) {{",
                 func.name
             );
             let _ = writeln!(out, "    dim3 grid((VELOX_HIDDEN_DIM + 255) / 256);");
             let _ = writeln!(out, "    dim3 block(256);");
+            let _ = writeln!(out, "    VeloxDecodeState* d_state = VELOX_DEV_STATE(ctx);");
 
             for bb in &func.blocks {
                 for inst in &bb.instructions {
@@ -2028,7 +2081,7 @@ impl CodeGenerator {
                         } => {
                             let _ = writeln!(
                                 out,
-                                "    velox_cuda_embed_kernel<<<grid, block, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), token_in, VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), active_mask);",
+                                "    velox_cuda_embed_kernel<<<grid, block, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), d_state, VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), active_mask);",
                                 dst.arena_offset,
                                 w_offset(weight_name)
                             );
@@ -2053,27 +2106,29 @@ impl CodeGenerator {
                                 layer,
                                 eps
                             );
-                            // 2. Multi-SM coalesced warp QKV projection (240 blocks across all 16 SMs)
+                            // 2. Multi-SM coalesced warp QKV projection across all SMs
                             let _ = writeln!(
                                 out,
-                                "    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), {}ULL, step, active_mask);",
+                                "    velox_cuda_fused_qkv_warp_kernel<<<dim3({}), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), {}ULL, d_state, active_mask);",
+                                qkv_blocks,
                                 dst_attn.arena_offset,
                                 w_offset(w_q),
                                 w_offset(w_k),
                                 w_offset(w_v),
                                 layer
                             );
-                            // 3. Fused RoPE rotation on Q and K (3 blocks)
+                            // 3. Fused RoPE rotation on Q and K
                             let _ = writeln!(
                                 out,
-                                "    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), (float*)ctx->kv_cache_pool, {}ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);",
+                                "    velox_cuda_fused_rope_kernel<<<dim3({}), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), (float*)ctx->kv_cache_pool, {}ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);",
+                                rope_blocks,
                                 dst_attn.arena_offset,
                                 layer
                             );
-                            // 4. Parallel GQA Attention across all 9 query heads (9 blocks)
+                            // 4. Parallel GQA Attention across all query heads
                             let _ = writeln!(
                                 out,
-                                "    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), (float*)ctx->kv_cache_pool, {}ULL, step, active_mask);",
+                                "    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), (float*)ctx->kv_cache_pool, {}ULL, d_state, active_mask);",
                                 dst_attn.arena_offset,
                                 layer
                             );
@@ -2090,10 +2145,11 @@ impl CodeGenerator {
                             layer,
                             eps,
                         } => {
-                            // 1. Multi-SM Out Projection + Residual: dst_hidden = attn_in @ w_out[layer] + residual_in (144 blocks)
+                            // 1. Multi-SM Out Projection + Residual: dst_hidden = attn_in @ w_out[layer] + residual_in
                             let _ = writeln!(
                                 out,
-                                "    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), {}ULL, active_mask);",
+                                "    velox_cuda_out_proj_residual_kernel<<<dim3({}), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), {}ULL, active_mask);",
+                                out_blocks,
                                 dst_hidden.arena_offset,
                                 attn_in.arena_offset,
                                 residual_in.arena_offset,
@@ -2109,18 +2165,20 @@ impl CodeGenerator {
                                 layer,
                                 eps
                             );
-                            // 3. Multi-SM SwiGLU Gate & Up: scratch_act = silu(norm_mid @ w_gate) * (norm_mid @ w_up) (384 blocks)
+                            // 3. Multi-SM SwiGLU Gate & Up: scratch_act = silu(norm_mid @ w_gate) * (norm_mid @ w_up)
                             let _ = writeln!(
                                 out,
-                                "    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), {}ULL, active_mask);",
+                                "    velox_cuda_swiglu_gate_up_kernel<<<dim3({}), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), {}ULL, active_mask);",
+                                swiglu_blocks,
                                 w_offset(w_gate),
                                 w_offset(w_up),
                                 layer
                             );
-                            // 4. Multi-SM SwiGLU Down Projection + Residual: dst_hidden += scratch_act @ w_down (144 blocks)
+                            // 4. Multi-SM SwiGLU Down Projection + Residual: dst_hidden += scratch_act @ w_down
                             let _ = writeln!(
                                 out,
-                                "    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), {}ULL, active_mask);",
+                                "    velox_cuda_swiglu_down_residual_kernel<<<dim3({}), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), {}ULL, active_mask);",
+                                out_blocks,
                                 dst_hidden.arena_offset,
                                 w_down.as_str().find(|_| true).map_or(0, |_| w_offset(w_down)),
                                 layer
@@ -2139,7 +2197,7 @@ impl CodeGenerator {
                         } => {
                             let _ = writeln!(
                                 out,
-                                "    velox_cuda_fused_mla_absorbed_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), (float*)ctx->kv_cache_pool, {}ULL, step, {:.6}f, active_mask);",
+                                "    velox_cuda_fused_mla_absorbed_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), VELOX_DEV_W_PTR(ctx->weight_arena, {}ULL), (float*)ctx->kv_cache_pool, {}ULL, d_state, {:.6}f, active_mask);",
                                 dst_hidden.arena_offset,
                                 input_hidden.arena_offset,
                                 w_offset(w_input_norm),
@@ -2201,7 +2259,7 @@ impl CodeGenerator {
                         VirInst::RoPE { dst, input, theta } => {
                             let _ = writeln!(
                                 out,
-                                "    velox_cuda_rope_kernel<<<grid, block, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_NUM_HEADS, VELOX_HEAD_DIM, step, {:.2}f, active_mask);",
+                                "    velox_cuda_rope_kernel<<<grid, block, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_NUM_HEADS, VELOX_HEAD_DIM, d_state, {:.2}f, active_mask);",
                                 dst.arena_offset,
                                 input.arena_offset,
                                 theta
@@ -2289,7 +2347,7 @@ impl CodeGenerator {
                             );
                             let _ = writeln!(
                                 out,
-                                "    velox_cuda_lm_head_argmax_stage2<<<dim3(1), dim3(256), 0, stream>>>(ctx->host_pinned_ring, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_STAGE1_VALS_OFFSET), (const uint32_t*)VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_STAGE1_IDXS_OFFSET), (VELOX_VOCAB_SIZE + 255ULL) / 256ULL, step, active_mask);",
+                                "    velox_cuda_lm_head_argmax_stage2<<<dim3(1), dim3(256), 0, stream>>>(ctx->host_pinned_ring, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_STAGE1_VALS_OFFSET), (const uint32_t*)VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_STAGE1_IDXS_OFFSET), (VELOX_VOCAB_SIZE + 255ULL) / 256ULL, d_state, active_mask);",
                             );
                         }
                         VirInst::AsyncDma { .. } | VirInst::TmaLoad { .. } | VirInst::TmaStore { .. } => {
@@ -2299,6 +2357,19 @@ impl CodeGenerator {
                     }
                 }
             }
+            let _ = writeln!(out, "}}");
+            let _ = writeln!(out);
+
+            let _ = writeln!(
+                out,
+                "extern \"C\" void {}_cuda(VeloxCudaArena* ctx, uint32_t token_in, size_t step, uint64_t active_mask, cudaStream_t stream) {{",
+                func.name
+            );
+            let _ = writeln!(
+                out,
+                "    velox_cuda_set_decode_state<<<1, 1, 0, stream>>>(VELOX_DEV_STATE(ctx), token_in, (unsigned long long)step);"
+            );
+            let _ = writeln!(out, "    {}_graph_step_cuda(ctx, active_mask, stream);", func.name);
             let _ = writeln!(out, "}}");
             let _ = writeln!(out);
         }
@@ -2475,4 +2546,25 @@ mod tests {
         assert!(cu_code.contains("VELOX_DEV_ACT_PTR(ctx->activation_arena, 786432ULL)"));
         assert!(c_code.contains("VELOX_ACT_PTR(ctx, 786432ULL)"));
     }
+
+    #[test]
+    fn test_codegen_cuda_graph_capture_and_device_decode_state() {
+        let file = "examples/tinystories_smollm.vlx";
+        let src = std::fs::read_to_string(file).unwrap();
+        let mut parser = Parser::from_source(&src, file).unwrap();
+        let prog = parser.parse().unwrap();
+        let typed = SemanticAnalyzer::new().analyze(&prog).unwrap();
+        let plans = StaticMemoryPlanner::new().plan_program(&typed).unwrap();
+        let mut modules = lower_program_to_vir(&typed, &plans);
+        optimize_vir_module(&mut modules[0]);
+
+        let cu_code = CodeGenerator::emit_cuda(&modules[0]);
+        assert!(cu_code.contains("typedef struct VeloxDecodeState {"));
+        assert!(cu_code.contains("} VeloxDecodeState;"));
+        assert!(cu_code.contains("velox_cuda_set_decode_state"));
+        assert!(cu_code.contains("velox_SmolLM_135M_decode_graph_step_cuda"));
+        assert!(cu_code.contains("state->token = winner;"));
+        assert!(cu_code.contains("state->step = step + 1ULL;"));
+    }
 }
+
