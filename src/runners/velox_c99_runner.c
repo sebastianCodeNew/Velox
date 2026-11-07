@@ -12,6 +12,10 @@
 #include <stdbool.h>
 #include <string.h>
 #include <math.h>
+#include <immintrin.h>
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 
 // Include the emitted standalone C99 model implementation
 #include "tinystories_smollm.c"
@@ -366,7 +370,11 @@ int main(int argc, char** argv) {
     printf("VELOX EMITTED C99 STANDALONE RUNTIME EXECUTION REPORT\n");
     printf("================================================================================\n");
     printf("Model                  : SmolLM_135M\n");
-    printf("Runner                 : Native C99 (MSVC /O2) on Host CPU\n");
+#if defined(_OPENMP)
+    printf("Runner                 : Native C99 Multi-Core AVX2+FMA3 (%d threads) on Host CPU\n", omp_get_max_threads());
+#else
+    printf("Runner                 : Native C99 AVX2+FMA3 on Host CPU\n");
+#endif
     printf("Safetensors Weights    : %s (Win32 Zero-Copy Mmap)\n", weights_path);
     printf("Weight Load / Ingest   : %.2f ms\n", load_ms);
     printf("Prompt Tokens (%zu)      : [", prompt_len);

@@ -601,6 +601,102 @@ pub fn rmsnorm_f32(dst: &mut [f32], x: &[f32], weight: &[f32], eps: f32) {
     }
 }
 
+/// Horizontal sum of 256-bit AVX2 float register
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn hsum256_ps(v: core::arch::x86_64::__m256) -> f32 {
+    use core::arch::x86_64::*;
+    let vlow = _mm256_castps256_ps128(v);
+    let vhigh = _mm256_extractf128_ps(v, 1);
+    let vsum = _mm_add_ps(vlow, vhigh);
+    let shuf = _mm_movehdup_ps(vsum);
+    let sums = _mm_add_ps(vsum, shuf);
+    let shuf2 = _mm_movehl_ps(shuf, sums);
+    let sums2 = _mm_add_ss(sums, shuf2);
+    _mm_cvtss_f32(sums2)
+}
+
+/// 4-row register-blocked AVX2+FMA3 transposed matrix-vector multiplication.
+/// Reuses loaded vector x[k..k+8] in YMM register across 4 accumulator registers (acc0..acc3),
+/// cutting L1 cache read traffic by 75% and saturating dual FMA execution ports.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn matmul_transposed_avx2_4row_inner(
+    dst: &mut [f32],
+    x: &[f32],
+    w: &[f32],
+    in_dim: usize,
+    out_dim: usize,
+) {
+    use core::arch::x86_64::*;
+
+    let num_blocks = out_dim / 4;
+    let k_chunks = in_dim / 8;
+    let k_rem = in_dim % 8;
+
+    let x_ptr = x.as_ptr();
+    let w_ptr = w.as_ptr();
+    let dst_ptr = dst.as_mut_ptr();
+
+    for b in 0..num_blocks {
+        let o = b * 4;
+        let w0 = w_ptr.add(o * in_dim);
+        let w1 = w_ptr.add((o + 1) * in_dim);
+        let w2 = w_ptr.add((o + 2) * in_dim);
+        let w3 = w_ptr.add((o + 3) * in_dim);
+
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
+
+        for c in 0..k_chunks {
+            let k = c * 8;
+            let vx = _mm256_loadu_ps(x_ptr.add(k));
+            acc0 = _mm256_fmadd_ps(vx, _mm256_loadu_ps(w0.add(k)), acc0);
+            acc1 = _mm256_fmadd_ps(vx, _mm256_loadu_ps(w1.add(k)), acc1);
+            acc2 = _mm256_fmadd_ps(vx, _mm256_loadu_ps(w2.add(k)), acc2);
+            acc3 = _mm256_fmadd_ps(vx, _mm256_loadu_ps(w3.add(k)), acc3);
+        }
+
+        let mut s0 = hsum256_ps(acc0);
+        let mut s1 = hsum256_ps(acc1);
+        let mut s2 = hsum256_ps(acc2);
+        let mut s3 = hsum256_ps(acc3);
+
+        if k_rem > 0 {
+            let k_base = k_chunks * 8;
+            for k in k_base..in_dim {
+                let xk = *x_ptr.add(k);
+                s0 += xk * *w0.add(k);
+                s1 += xk * *w1.add(k);
+                s2 += xk * *w2.add(k);
+                s3 += xk * *w3.add(k);
+            }
+        }
+
+        *dst_ptr.add(o) = s0;
+        *dst_ptr.add(o + 1) = s1;
+        *dst_ptr.add(o + 2) = s2;
+        *dst_ptr.add(o + 3) = s3;
+    }
+
+    for o in (num_blocks * 4)..out_dim {
+        let w_row = w_ptr.add(o * in_dim);
+        let mut acc = _mm256_setzero_ps();
+        for c in 0..k_chunks {
+            let k = c * 8;
+            let vx = _mm256_loadu_ps(x_ptr.add(k));
+            acc = _mm256_fmadd_ps(vx, _mm256_loadu_ps(w_row.add(k)), acc);
+        }
+        let mut s = hsum256_ps(acc);
+        for k in (k_chunks * 8)..in_dim {
+            s += *x_ptr.add(k) * *w_row.add(k);
+        }
+        *dst_ptr.add(o) = s;
+    }
+}
+
 /// Matrix-vector multiplication $y = x W^T$ where $W \in \mathbb{R}^{\text{out\_dim} \times \text{in\_dim}}$
 /// is stored row-major in Hugging Face `.safetensors` format.
 #[inline]
@@ -614,6 +710,16 @@ pub fn matmul_transposed_f32(
     debug_assert_eq!(x.len(), in_dim);
     debug_assert_eq!(dst.len(), out_dim);
     debug_assert_eq!(w.len(), out_dim * in_dim);
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            unsafe {
+                matmul_transposed_avx2_4row_inner(dst, x, w, in_dim, out_dim);
+                return;
+            }
+        }
+    }
 
     for (o, dst_val) in dst.iter_mut().enumerate() {
         let row = &w[o * in_dim..(o + 1) * in_dim];

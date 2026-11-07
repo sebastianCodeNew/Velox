@@ -10,6 +10,10 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <math.h>
+#include <immintrin.h>
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 
 /* --- 1. Compile-Time Model & Memory Arena Constants ----------------------- */
 #define VELOX_MODEL_HIDDEN_DIM               576ULL
@@ -74,24 +78,129 @@ static inline void velox_c99_rmsnorm_f32(
     for (size_t i = 0; i < dim; ++i) { dst[i] = (x[i] * inv_rms) * weight[i]; }
 }
 
+static inline float velox_c99_hsum256_ps(__m256 v) {
+    __m128 vlow = _mm256_castps256_ps128(v);
+    __m128 vhigh = _mm256_extractf128_ps(v, 1);
+    __m128 vsum = _mm_add_ps(vlow, vhigh);
+    __m128 shuf = _mm_movehdup_ps(vsum);
+    __m128 sums = _mm_add_ps(vsum, shuf);
+    shuf = _mm_movehl_ps(shuf, sums);
+    sums = _mm_add_ss(sums, shuf);
+    return _mm_cvtss_f32(sums);
+}
+
 static inline void velox_c99_matmul_vec_f32(
     float* dst, const float* x, const float* w, size_t in_dim, size_t out_dim
 ) {
-    for (size_t o = 0; o < out_dim; ++o) {
+    size_t num_blocks = out_dim / 4;
+    size_t k_chunks = in_dim / 8;
+    size_t k_rem = in_dim % 8;
+
+    if (num_blocks >= 128) {
+        int b;
+#if defined(_OPENMP)
+        #pragma omp parallel for schedule(static)
+#endif
+        for (b = 0; b < (int)num_blocks; ++b) {
+            size_t o = (size_t)b * 4;
+            const float* w0 = w + ((o + 0) * in_dim);
+            const float* w1 = w + ((o + 1) * in_dim);
+            const float* w2 = w + ((o + 2) * in_dim);
+            const float* w3 = w + ((o + 3) * in_dim);
+
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+            __m256 acc2 = _mm256_setzero_ps();
+            __m256 acc3 = _mm256_setzero_ps();
+
+            for (size_t c = 0; c < k_chunks; ++c) {
+                size_t k = c * 8;
+                __m256 vx = _mm256_loadu_ps(&x[k]);
+                acc0 = _mm256_fmadd_ps(vx, _mm256_loadu_ps(&w0[k]), acc0);
+                acc1 = _mm256_fmadd_ps(vx, _mm256_loadu_ps(&w1[k]), acc1);
+                acc2 = _mm256_fmadd_ps(vx, _mm256_loadu_ps(&w2[k]), acc2);
+                acc3 = _mm256_fmadd_ps(vx, _mm256_loadu_ps(&w3[k]), acc3);
+            }
+
+            float s0 = velox_c99_hsum256_ps(acc0);
+            float s1 = velox_c99_hsum256_ps(acc1);
+            float s2 = velox_c99_hsum256_ps(acc2);
+            float s3 = velox_c99_hsum256_ps(acc3);
+
+            if (k_rem > 0) {
+                size_t k_base = k_chunks * 8;
+                for (size_t k = k_base; k < in_dim; ++k) {
+                    float xk = x[k];
+                    s0 += xk * w0[k];
+                    s1 += xk * w1[k];
+                    s2 += xk * w2[k];
+                    s3 += xk * w3[k];
+                }
+            }
+
+            dst[o + 0] = s0;
+            dst[o + 1] = s1;
+            dst[o + 2] = s2;
+            dst[o + 3] = s3;
+        }
+    } else {
+        for (size_t b = 0; b < num_blocks; ++b) {
+            size_t o = b * 4;
+            const float* w0 = w + ((o + 0) * in_dim);
+            const float* w1 = w + ((o + 1) * in_dim);
+            const float* w2 = w + ((o + 2) * in_dim);
+            const float* w3 = w + ((o + 3) * in_dim);
+
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+            __m256 acc2 = _mm256_setzero_ps();
+            __m256 acc3 = _mm256_setzero_ps();
+
+            for (size_t c = 0; c < k_chunks; ++c) {
+                size_t k = c * 8;
+                __m256 vx = _mm256_loadu_ps(&x[k]);
+                acc0 = _mm256_fmadd_ps(vx, _mm256_loadu_ps(&w0[k]), acc0);
+                acc1 = _mm256_fmadd_ps(vx, _mm256_loadu_ps(&w1[k]), acc1);
+                acc2 = _mm256_fmadd_ps(vx, _mm256_loadu_ps(&w2[k]), acc2);
+                acc3 = _mm256_fmadd_ps(vx, _mm256_loadu_ps(&w3[k]), acc3);
+            }
+
+            float s0 = velox_c99_hsum256_ps(acc0);
+            float s1 = velox_c99_hsum256_ps(acc1);
+            float s2 = velox_c99_hsum256_ps(acc2);
+            float s3 = velox_c99_hsum256_ps(acc3);
+
+            if (k_rem > 0) {
+                size_t k_base = k_chunks * 8;
+                for (size_t k = k_base; k < in_dim; ++k) {
+                    float xk = x[k];
+                    s0 += xk * w0[k];
+                    s1 += xk * w1[k];
+                    s2 += xk * w2[k];
+                    s3 += xk * w3[k];
+                }
+            }
+
+            dst[o + 0] = s0;
+            dst[o + 1] = s1;
+            dst[o + 2] = s2;
+            dst[o + 3] = s3;
+        }
+    }
+
+    for (size_t o = num_blocks * 4; o < out_dim; ++o) {
         const float* w_row = w + (o * in_dim);
-        float acc = 0.0f;
-        size_t chunks = in_dim / 4;
-        for (size_t c = 0; c < chunks; ++c) {
-            size_t base = c * 4;
-            acc += x[base] * w_row[base]
-                + x[base + 1] * w_row[base + 1]
-                + x[base + 2] * w_row[base + 2]
-                + x[base + 3] * w_row[base + 3];
+        __m256 acc = _mm256_setzero_ps();
+        for (size_t c = 0; c < k_chunks; ++c) {
+            size_t k = c * 8;
+            __m256 vx = _mm256_loadu_ps(&x[k]);
+            acc = _mm256_fmadd_ps(vx, _mm256_loadu_ps(&w_row[k]), acc);
         }
-        for (size_t k = chunks * 4; k < in_dim; ++k) {
-            acc += x[k] * w_row[k];
+        float s = velox_c99_hsum256_ps(acc);
+        for (size_t k = k_chunks * 8; k < in_dim; ++k) {
+            s += x[k] * w_row[k];
         }
-        dst[o] = acc;
+        dst[o] = s;
     }
 }
 

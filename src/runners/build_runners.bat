@@ -39,9 +39,9 @@ if exist "%ROOT%target\release\veloxc.exe" (
     "%ROOT%target\release\veloxc.exe" --emit-cuda "%ROOT%examples\tinystories_smollm.vlx" -o "%RUNNERS_DIR%\tinystories_smollm.cu"
 )
 
-echo [3/4] Compiling velox_c99_runner.exe (MSVC cl.exe /O2)...
+echo [3/4] Compiling velox_c99_runner.exe (MSVC cl.exe /O2 /openmp /arch:AVX2)...
 pushd "%RUNNERS_DIR%"
-cl.exe /nologo /O2 /I. /Fe:velox_c99_runner.exe velox_c99_runner.c
+cl.exe /nologo /O2 /openmp /arch:AVX2 /I. /Fe:velox_c99_runner.exe velox_c99_runner.c
 if %ERRORLEVEL% neq 0 (
     echo [ERROR] Failed to compile velox_c99_runner.c
     popd
