@@ -1,0 +1,130 @@
+{
+  "system": {
+    "gpu": {
+      "name": "NVIDIA GeForce RTX 3050 Laptop GPU",
+      "architecture": "Ampere (GA107M, sm_86)",
+      "sms": 16,
+      "cuda_cores": 2048,
+      "peak_fp32_tflops": 6.144,
+      "memory_bus_bits": 128,
+      "memory_clock_gbps": 12.0,
+      "peak_bandwidth_gbps": 192.0,
+      "vram_mib": 4096
+    },
+    "cpu": {
+      "name": "12th Gen Intel(R) Core(TM) i5-12500H",
+      "architecture": "Alder Lake (4 P-cores + 8 E-cores)",
+      "logical_threads": 16,
+      "vector_extensions": ["AVX2", "FMA3"],
+      "l3_cache_mb": 18
+    }
+  },
+  "step11_microbenchmarks": {
+    "bench1_single_vs_multi_sm": {
+      "matrix": {"M": 1536, "K": 576, "size_mb": 3.54},
+      "single_sm_ms": 0.6655,
+      "single_sm_bw_gbps": 5.33,
+      "single_sm_roofline_pct": 2.78,
+      "multi_sm_ms": 0.1070,
+      "multi_sm_bw_gbps": 33.16,
+      "multi_sm_roofline_pct": 17.27,
+      "speedup": 6.22
+    },
+    "bench2_gemv_coalescing": {
+      "matrix": {"M": 49152, "K": 576, "size_mb": 113.25},
+      "strided_uncoalesced_ms": 2.0210,
+      "strided_bw_gbps": 56.13,
+      "strided_roofline_pct": 29.24,
+      "coalesced_scalar_ms": 0.6223,
+      "coalesced_scalar_bw_gbps": 182.30,
+      "coalesced_float4_ms": 0.6223,
+      "coalesced_float4_bw_gbps": 182.29,
+      "coalesced_float4_roofline_pct": 94.94,
+      "speedup": 3.25
+    },
+    "bench3_parallel_lm_head": {
+      "vocab_size": 49152,
+      "single_thread_scan_us": 859.22,
+      "two_stage_parallel_tree_us": 13.25,
+      "speedup": 64.84,
+      "parity_pass": true
+    },
+    "bench4_kernel_launch_overhead": {
+      "sequence_kernels": 64,
+      "host_sync_ms": 0.7689,
+      "host_sync_per_launch_us": 12.01,
+      "async_stream_ms": 0.5382,
+      "async_per_launch_us": 8.41,
+      "cuda_graph_single_shot_ms": 0.0748,
+      "graph_speedup_vs_sync": 10.28,
+      "graph_speedup_vs_async": 7.19,
+      "dispatch_latency_saved_ms": 0.4634,
+      "dispatch_reduction_pct": 86.1
+    },
+    "bench5_cpu_avx2_gemv": {
+      "matrix": {"M": 1536, "K": 576},
+      "scalar_single_thread_ms": 0.4643,
+      "scalar_gflops": 3.81,
+      "avx2_4row_single_thread_ms": 0.0790,
+      "avx2_4row_st_gflops": 22.40,
+      "avx2_4row_16thread_ms": 0.0264,
+      "avx2_4row_16thread_gflops": 67.10,
+      "speedup_vs_scalar": 17.61,
+      "speedup_vs_st": 3.00
+    }
+  },
+  "step11b_challenge_verification": {
+    "test1_warp_gemv_float4_shuffle": {
+      "mlp_intermediate": {
+        "M": 1536, "K": 576,
+        "strided_ms": 0.1177, "warp_ms": 0.0236,
+        "speedup": 4.99,
+        "warp_bandwidth_gbps": 150.49,
+        "roofline_pct": 78.38,
+        "max_err_vs_oracle": 8.45e-8,
+        "parity_pass": true
+      },
+      "vocab_lm_head": {
+        "M": 49152, "K": 576,
+        "strided_ms": 2.0112, "warp_ms": 0.6227,
+        "speedup": 3.23,
+        "warp_bandwidth_gbps": 182.18,
+        "roofline_pct": 94.88,
+        "max_err_vs_oracle": 8.45e-8,
+        "parity_pass": true
+      }
+    },
+    "test2_split_k_flashdecoding_parity": {
+      "S_64": {"single_block_us": 37.54, "splitk_us": 19.01, "speedup": 1.98, "max_err": 7.76e-9, "parity_pass": true},
+      "S_512": {"single_block_us": 279.16, "splitk_us": 48.56, "speedup": 5.75, "max_err": 1.10e-8, "parity_pass": true},
+      "S_1024": {"single_block_us": 590.70, "splitk_us": 93.53, "speedup": 6.32, "max_err": 1.58e-8, "parity_pass": true},
+      "S_2048": {"single_block_us": 1546.38, "splitk_us": 116.63, "speedup": 13.26, "max_err": 1.85e-8, "parity_pass": true}
+    },
+    "test3_marlin_lop3_dequant": {
+      "weights": 1048576,
+      "packed_words": 131072,
+      "naive_ms": 0.0956,
+      "marlin_lop3_ms": 0.0931,
+      "speedup": 1.03,
+      "bandwidth_gbps": 50.71,
+      "max_err_vs_oracle": 0.00e+00,
+      "parity_pass": true
+    },
+    "test4_avx2_fma3_register_blocking": {
+      "tiny_block_256_576": {
+        "scalar_ms": 0.0780, "scalar_gflops": 3.78,
+        "avx2_ms": 0.0074, "avx2_gflops": 39.64,
+        "speedup": 10.48,
+        "max_err_vs_oracle": 4.01e-8,
+        "parity_pass": true
+      },
+      "mlp_projection_1536_576": {
+        "scalar_ms": 0.4793, "scalar_gflops": 3.69,
+        "avx2_ms": 0.0665, "avx2_gflops": 26.61,
+        "speedup": 7.21,
+        "max_err_vs_oracle": 4.01e-8,
+        "parity_pass": true
+      }
+    }
+  }
+}

@@ -31,6 +31,10 @@
 #define VELOX_ACTIVATION_ARENA_BYTES         424676608ULL
 #define VELOX_TOTAL_REQUIRED_VRAM_BYTES      1721909760ULL
 #define VELOX_SAFE_VRAM_BUDGET_BYTES         4080218931ULL
+#define VELOX_SCRATCH_NORM_OFFSET            2097152ULL
+#define VELOX_SCRATCH_ACT_OFFSET             2162688ULL
+#define VELOX_SCRATCH_STAGE1_VALS_OFFSET     2228224ULL
+#define VELOX_SCRATCH_STAGE1_IDXS_OFFSET     2244608ULL
 
 typedef struct VeloxCudaArena {
     const uint8_t* __restrict__ weight_arena;
@@ -77,17 +81,506 @@ __global__ void __launch_bounds__(256) velox_cuda_rmsnorm_kernel(
     }
 }
 
-__global__ void __launch_bounds__(256) velox_cuda_matmul_vec_kernel(
+__global__ void __launch_bounds__(128, 8) velox_cuda_matmul_vec_kernel(
     float* __restrict__ dst, const float* __restrict__ x, const float* __restrict__ w,
     size_t in_dim, size_t out_dim, uint64_t active_mask
 ) {
     if ((active_mask & 1ULL) == 0ULL) return;
-    size_t o = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (o < out_dim) {
-        const float* row = w + (o * in_dim);
-        float acc = 0.0f;
-        for (size_t k = 0; k < in_dim; ++k) { acc += x[k] * row[k]; }
-        dst[o] = acc;
+    const size_t warp_id = threadIdx.x / 32;
+    const size_t lane_id = threadIdx.x % 32;
+    const size_t row = (size_t)blockIdx.x * 4ULL + warp_id;
+    if (row >= out_dim) return;
+
+    const float* __restrict__ row_w = w + (row * in_dim);
+    float acc = 0.0f;
+
+    const size_t steps = in_dim / 128ULL;
+    for (size_t s = 0; s < steps; ++s) {
+        const size_t k_offset = s * 128ULL + (lane_id * 4ULL);
+        const float4 w_v = *reinterpret_cast<const float4*>(&row_w[k_offset]);
+        const float4 x_v = *reinterpret_cast<const float4*>(&x[k_offset]);
+        acc += w_v.x * x_v.x + w_v.y * x_v.y + w_v.z * x_v.z + w_v.w * x_v.w;
+    }
+
+    const size_t tail_start = steps * 128ULL;
+    const size_t remaining_floats = in_dim - tail_start;
+    const size_t remaining_f4 = remaining_floats / 4ULL;
+    if (lane_id < remaining_f4) {
+        const size_t k_offset = tail_start + (lane_id * 4ULL);
+        const float4 w_v = *reinterpret_cast<const float4*>(&row_w[k_offset]);
+        const float4 x_v = *reinterpret_cast<const float4*>(&x[k_offset]);
+        acc += w_v.x * x_v.x + w_v.y * x_v.y + w_v.z * x_v.z + w_v.w * x_v.w;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, offset);
+    }
+
+    if (lane_id == 0) {
+        dst[row] = acc;
+    }
+}
+
+// 1.3b Dedicated Layer RMSNorm Kernel
+__global__ void __launch_bounds__(256) velox_cuda_layer_norm_kernel(
+    float* __restrict__ dst, const float* __restrict__ x, const float* __restrict__ weight,
+    size_t dim, float eps, uint64_t active_mask
+) {
+    if ((active_mask & 1ULL) == 0ULL) return;
+    __shared__ float s_ss[256];
+    size_t tid = threadIdx.x;
+    float local_ss = 0.0f;
+    for (size_t i = tid; i < dim; i += blockDim.x) {
+        float v = x[i];
+        local_ss += v * v;
+    }
+    s_ss[tid] = local_ss;
+    __syncthreads();
+    for (size_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s_ss[tid] += s_ss[tid + stride];
+        __syncthreads();
+    }
+    float inv_rms = rsqrtf((s_ss[0] / (float)dim) + eps);
+    for (size_t i = tid; i < dim; i += blockDim.x) {
+        dst[i] = (x[i] * inv_rms) * weight[i];
+    }
+}
+
+// 1.3c Multi-Block Coalesced Warp QKV Kernel (240 blocks on SmolLM-135M)
+__global__ void __launch_bounds__(128, 8) velox_cuda_fused_qkv_warp_kernel(
+    float* __restrict__ dst_q,
+    float* __restrict__ kv_pool,
+    const float* __restrict__ norm_input,
+    const float* __restrict__ w_q,
+    const float* __restrict__ w_k,
+    const float* __restrict__ w_v,
+    size_t layer,
+    size_t step,
+    uint64_t active_mask
+) {
+    if ((active_mask & 1ULL) == 0ULL) return;
+    const size_t warp_id = threadIdx.x / 32;
+    const size_t lane_id = threadIdx.x % 32;
+    const size_t global_row = (size_t)blockIdx.x * 4ULL + warp_id;
+
+    const size_t dim = VELOX_HIDDEN_DIM;
+    const size_t num_q = VELOX_NUM_HEADS * VELOX_HEAD_DIM;
+    const size_t num_kv = VELOX_NUM_KV_HEADS * VELOX_HEAD_DIM;
+    const size_t total_rows = num_q + 2ULL * num_kv;
+    if (global_row >= total_rows) return;
+
+    const size_t max_s = VELOX_MODEL_MAX_SEQ_LEN;
+    const size_t safe_step = (step < max_s) ? step : (max_s - 1);
+    const size_t layer_kv_stride = 2ULL * max_s * num_kv;
+    float* k_layer = kv_pool + (layer * layer_kv_stride);
+    float* v_layer = k_layer + (max_s * num_kv);
+
+    const float* __restrict__ row_w = NULL;
+    float* __restrict__ dst_ptr = NULL;
+
+    if (global_row < num_q) {
+        row_w = w_q + (layer * dim * num_q) + (global_row * dim);
+        dst_ptr = dst_q + global_row;
+    } else if (global_row < num_q + num_kv) {
+        const size_t k_row = global_row - num_q;
+        row_w = w_k + (layer * dim * num_kv) + (k_row * dim);
+        dst_ptr = k_layer + (safe_step * num_kv) + k_row;
+    } else {
+        const size_t v_row = global_row - num_q - num_kv;
+        row_w = w_v + (layer * dim * num_kv) + (v_row * dim);
+        dst_ptr = v_layer + (safe_step * num_kv) + v_row;
+    }
+
+    float acc = 0.0f;
+    const size_t steps = dim / 128ULL;
+    for (size_t s = 0; s < steps; ++s) {
+        const size_t k_offset = s * 128ULL + (lane_id * 4ULL);
+        const float4 w_v_val = *reinterpret_cast<const float4*>(&row_w[k_offset]);
+        const float4 in_v = *reinterpret_cast<const float4*>(&norm_input[k_offset]);
+        acc += in_v.x * w_v_val.x + in_v.y * w_v_val.y + in_v.z * w_v_val.z + in_v.w * w_v_val.w;
+    }
+
+    const size_t tail_start = steps * 128ULL;
+    const size_t remaining_floats = dim - tail_start;
+    const size_t remaining_f4 = remaining_floats / 4ULL;
+    if (lane_id < remaining_f4) {
+        const size_t k_offset = tail_start + (lane_id * 4ULL);
+        const float4 w_v_val = *reinterpret_cast<const float4*>(&row_w[k_offset]);
+        const float4 in_v = *reinterpret_cast<const float4*>(&norm_input[k_offset]);
+        acc += in_v.x * w_v_val.x + in_v.y * w_v_val.y + in_v.z * w_v_val.z + in_v.w * w_v_val.w;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, offset);
+    }
+
+    if (lane_id == 0) {
+        *dst_ptr = acc;
+    }
+}
+
+// 1.3d Multi-Block Fused RoPE Kernel (Q & K in 3 blocks)
+__global__ void __launch_bounds__(128, 8) velox_cuda_fused_rope_kernel(
+    float* __restrict__ q,
+    float* __restrict__ kv_pool,
+    size_t layer,
+    size_t step,
+    float theta,
+    uint64_t active_mask
+) {
+    if ((active_mask & 1ULL) == 0ULL) return;
+    const size_t H = VELOX_NUM_HEADS;
+    const size_t KV_H = VELOX_NUM_KV_HEADS;
+    const size_t D = VELOX_HEAD_DIM;
+    const size_t half_d = D / 2;
+    const size_t q_pairs = H * half_d;
+    const size_t kv_pairs = KV_H * half_d;
+    const size_t total_pairs = q_pairs + kv_pairs;
+
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_pairs) return;
+
+    const size_t max_s = VELOX_MODEL_MAX_SEQ_LEN;
+    const size_t safe_step = (step < max_s) ? step : (max_s - 1);
+    const size_t kv_dim = KV_H * D;
+    const size_t layer_kv_stride = 2ULL * max_s * kv_dim;
+    float* k_layer = kv_pool + (layer * layer_kv_stride);
+    float* k_slot = k_layer + (safe_step * kv_dim);
+
+    if (idx < q_pairs) {
+        size_t h = idx / half_d;
+        size_t j = idx % half_d;
+        float freq = 1.0f / powf(theta, (2.0f * (float)j) / (float)D);
+        float angle = (float)safe_step * freq;
+        float cos_a = cosf(angle);
+        float sin_a = sinf(angle);
+        float* q_head = q + (h * D);
+        float x1 = q_head[j];
+        float x2 = q_head[j + half_d];
+        q_head[j] = x1 * cos_a - x2 * sin_a;
+        q_head[j + half_d] = x2 * cos_a + x1 * sin_a;
+    } else {
+        size_t kv_idx = idx - q_pairs;
+        size_t h = kv_idx / half_d;
+        size_t j = kv_idx % half_d;
+        float freq = 1.0f / powf(theta, (2.0f * (float)j) / (float)D);
+        float angle = (float)safe_step * freq;
+        float cos_a = cosf(angle);
+        float sin_a = sinf(angle);
+        float* k_head = k_slot + (h * D);
+        float x1 = k_head[j];
+        float x2 = k_head[j + half_d];
+        k_head[j] = x1 * cos_a - x2 * sin_a;
+        k_head[j + half_d] = x2 * cos_a + x1 * sin_a;
+    }
+}
+
+// 1.3e Parallel GQA Attention Kernel (9 blocks across heads)
+__global__ void __launch_bounds__(256, 4) velox_cuda_gqa_attn_kernel(
+    float* __restrict__ dst_attn,
+    const float* __restrict__ kv_pool,
+    size_t layer,
+    size_t step,
+    uint64_t active_mask
+) {
+    if ((active_mask & 1ULL) == 0ULL) return;
+    const size_t H = VELOX_NUM_HEADS;
+    const size_t KV_H = VELOX_NUM_KV_HEADS;
+    const size_t D = VELOX_HEAD_DIM;
+    const size_t max_s = VELOX_MODEL_MAX_SEQ_LEN;
+    const size_t safe_step = (step < max_s) ? step : (max_s - 1);
+    const size_t seq_len = safe_step + 1;
+    const size_t kv_dim = KV_H * D;
+    const size_t layer_kv_stride = 2ULL * max_s * kv_dim;
+
+    const size_t h = blockIdx.x;
+    if (h >= H) return;
+    const size_t tid = threadIdx.x;
+    const size_t kv_group = H / KV_H;
+    const size_t kv_h = h / kv_group;
+
+    const float* k_layer = kv_pool + (layer * layer_kv_stride);
+    const float* v_layer = k_layer + (max_s * kv_dim);
+
+    __shared__ float s_q[128];
+    if (tid < D) {
+        s_q[tid] = dst_attn[h * D + tid];
+    }
+    __syncthreads();
+
+    float scale = 1.0f / sqrtf((float)D);
+    float acc_d = 0.0f;
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    for (size_t t = 0; t < seq_len; ++t) {
+        const float* k_t = k_layer + (t * kv_dim) + (kv_h * D);
+        const float* v_t = v_layer + (t * kv_dim) + (kv_h * D);
+
+        __shared__ float s_dot[256];
+        float my_dot = 0.0f;
+        if (tid < D) {
+            my_dot = s_q[tid] * k_t[tid];
+        }
+        s_dot[tid] = my_dot;
+        __syncthreads();
+        for (size_t s = 128; s > 0; s >>= 1) {
+            if (tid < s && tid + s < 256) s_dot[tid] += s_dot[tid + s];
+            __syncthreads();
+        }
+        float dot = s_dot[0] * scale;
+
+        float new_m = (dot > m) ? dot : m;
+        float alpha = (m == -INFINITY) ? 0.0f : expf(m - new_m);
+        float beta = (new_m == -INFINITY) ? 0.0f : expf(dot - new_m);
+        l = l * alpha + beta;
+        m = new_m;
+
+        if (tid < D) {
+            acc_d = acc_d * alpha + beta * v_t[tid];
+        }
+        __syncthreads();
+    }
+
+    if (tid < D) {
+        dst_attn[h * D + tid] = (l > 0.0f) ? (acc_d / l) : 0.0f;
+    }
+}
+
+// 1.3f Multi-Block Out Projection + Residual Kernel (144 blocks on SmolLM-135M)
+__global__ void __launch_bounds__(128, 8) velox_cuda_out_proj_residual_kernel(
+    float* __restrict__ dst_hidden,
+    const float* __restrict__ attn_in,
+    const float* __restrict__ residual_in,
+    const float* __restrict__ w_out,
+    size_t layer,
+    uint64_t active_mask
+) {
+    if ((active_mask & 1ULL) == 0ULL) return;
+    const size_t warp_id = threadIdx.x / 32;
+    const size_t lane_id = threadIdx.x % 32;
+    const size_t row = (size_t)blockIdx.x * 4ULL + warp_id;
+
+    const size_t dim = VELOX_HIDDEN_DIM;
+    if (row >= dim) return;
+
+    const float* __restrict__ row_w = w_out + (layer * dim * dim) + (row * dim);
+    float acc = 0.0f;
+
+    const size_t steps = dim / 128ULL;
+    for (size_t s = 0; s < steps; ++s) {
+        const size_t k_offset = s * 128ULL + (lane_id * 4ULL);
+        const float4 w_v = *reinterpret_cast<const float4*>(&row_w[k_offset]);
+        const float4 in_v = *reinterpret_cast<const float4*>(&attn_in[k_offset]);
+        acc += in_v.x * w_v.x + in_v.y * w_v.y + in_v.z * w_v.z + in_v.w * w_v.w;
+    }
+
+    const size_t tail_start = steps * 128ULL;
+    const size_t remaining_floats = dim - tail_start;
+    const size_t remaining_f4 = remaining_floats / 4ULL;
+    if (lane_id < remaining_f4) {
+        const size_t k_offset = tail_start + (lane_id * 4ULL);
+        const float4 w_v = *reinterpret_cast<const float4*>(&row_w[k_offset]);
+        const float4 in_v = *reinterpret_cast<const float4*>(&attn_in[k_offset]);
+        acc += in_v.x * w_v.x + in_v.y * w_v.y + in_v.z * w_v.z + in_v.w * w_v.w;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, offset);
+    }
+
+    if (lane_id == 0) {
+        dst_hidden[row] = acc + residual_in[row];
+    }
+}
+
+// 1.3g Multi-Block SwiGLU Gate & Up Kernel (384 blocks on SmolLM-135M)
+__global__ void __launch_bounds__(128, 8) velox_cuda_swiglu_gate_up_kernel(
+    float* __restrict__ dst_act,
+    const float* __restrict__ norm_input,
+    const float* __restrict__ w_gate,
+    const float* __restrict__ w_up,
+    size_t layer,
+    uint64_t active_mask
+) {
+    if ((active_mask & 1ULL) == 0ULL) return;
+    const size_t warp_id = threadIdx.x / 32;
+    const size_t lane_id = threadIdx.x % 32;
+    const size_t j = (size_t)blockIdx.x * 4ULL + warp_id;
+
+    const size_t dim = VELOX_HIDDEN_DIM;
+    const size_t inter_dim = VELOX_INTERMEDIATE_DIM;
+    if (j >= inter_dim) return;
+
+    const float* __restrict__ row_gate = w_gate + (layer * inter_dim * dim) + (j * dim);
+    const float* __restrict__ row_up = w_up + (layer * inter_dim * dim) + (j * dim);
+
+    float acc_gate = 0.0f;
+    float acc_up = 0.0f;
+
+    const size_t steps = dim / 128ULL;
+    for (size_t s = 0; s < steps; ++s) {
+        const size_t k_offset = s * 128ULL + (lane_id * 4ULL);
+        const float4 wg_v = *reinterpret_cast<const float4*>(&row_gate[k_offset]);
+        const float4 wu_v = *reinterpret_cast<const float4*>(&row_up[k_offset]);
+        const float4 in_v = *reinterpret_cast<const float4*>(&norm_input[k_offset]);
+        acc_gate += in_v.x * wg_v.x + in_v.y * wg_v.y + in_v.z * wg_v.z + in_v.w * wg_v.w;
+        acc_up += in_v.x * wu_v.x + in_v.y * wu_v.y + in_v.z * wu_v.z + in_v.w * wu_v.w;
+    }
+
+    const size_t tail_start = steps * 128ULL;
+    const size_t remaining_floats = dim - tail_start;
+    const size_t remaining_f4 = remaining_floats / 4ULL;
+    if (lane_id < remaining_f4) {
+        const size_t k_offset = tail_start + (lane_id * 4ULL);
+        const float4 wg_v = *reinterpret_cast<const float4*>(&row_gate[k_offset]);
+        const float4 wu_v = *reinterpret_cast<const float4*>(&row_up[k_offset]);
+        const float4 in_v = *reinterpret_cast<const float4*>(&norm_input[k_offset]);
+        acc_gate += in_v.x * wg_v.x + in_v.y * wg_v.y + in_v.z * wg_v.z + in_v.w * wg_v.w;
+        acc_up += in_v.x * wu_v.x + in_v.y * wu_v.y + in_v.z * wu_v.z + in_v.w * wu_v.w;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc_gate += __shfl_down_sync(0xffffffff, acc_gate, offset);
+        acc_up += __shfl_down_sync(0xffffffff, acc_up, offset);
+    }
+
+    if (lane_id == 0) {
+        float silu = acc_gate / (1.0f + expf(-acc_gate));
+        dst_act[j] = silu * acc_up;
+    }
+}
+
+// 1.3h Multi-Block SwiGLU Down Projection + Residual Kernel (144 blocks on SmolLM-135M)
+__global__ void __launch_bounds__(128, 8) velox_cuda_swiglu_down_residual_kernel(
+    float* __restrict__ dst_hidden,
+    const float* __restrict__ act_in,
+    const float* __restrict__ w_down,
+    size_t layer,
+    uint64_t active_mask
+) {
+    if ((active_mask & 1ULL) == 0ULL) return;
+    const size_t warp_id = threadIdx.x / 32;
+    const size_t lane_id = threadIdx.x % 32;
+    const size_t o = (size_t)blockIdx.x * 4ULL + warp_id;
+
+    const size_t dim = VELOX_HIDDEN_DIM;
+    const size_t inter_dim = VELOX_INTERMEDIATE_DIM;
+    if (o >= dim) return;
+
+    const float* __restrict__ row_down = w_down + (layer * dim * inter_dim) + (o * inter_dim);
+    float acc = 0.0f;
+
+    const size_t steps = inter_dim / 128ULL;
+    for (size_t s = 0; s < steps; ++s) {
+        const size_t k_offset = s * 128ULL + (lane_id * 4ULL);
+        const float4 wd_v = *reinterpret_cast<const float4*>(&row_down[k_offset]);
+        const float4 in_v = *reinterpret_cast<const float4*>(&act_in[k_offset]);
+        acc += in_v.x * wd_v.x + in_v.y * wd_v.y + in_v.z * wd_v.z + in_v.w * wd_v.w;
+    }
+
+    const size_t tail_start = steps * 128ULL;
+    const size_t remaining_floats = inter_dim - tail_start;
+    const size_t remaining_f4 = remaining_floats / 4ULL;
+    if (lane_id < remaining_f4) {
+        const size_t k_offset = tail_start + (lane_id * 4ULL);
+        const float4 wd_v = *reinterpret_cast<const float4*>(&row_down[k_offset]);
+        const float4 in_v = *reinterpret_cast<const float4*>(&act_in[k_offset]);
+        acc += in_v.x * wd_v.x + in_v.y * wd_v.y + in_v.z * wd_v.z + in_v.w * wd_v.w;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, offset);
+    }
+
+    if (lane_id == 0) {
+        dst_hidden[o] += acc;
+    }
+}
+
+// 1.3i Two-Stage Parallel Vocabulary Argmax (Stage 1: Multi-Block Reduction)
+__global__ void __launch_bounds__(256, 4) velox_cuda_lm_head_argmax_stage1(
+    float* __restrict__ scratch_vals,
+    uint32_t* __restrict__ scratch_idxs,
+    const float* __restrict__ logits,
+    size_t vocab_size,
+    uint64_t active_mask
+) {
+    if ((active_mask & 1ULL) == 0ULL) return;
+    __shared__ float s_val[256];
+    __shared__ uint32_t s_idx[256];
+    const size_t tid = threadIdx.x;
+    const size_t vid = (size_t)blockIdx.x * 256ULL + tid;
+
+    float my_val = (vid < vocab_size) ? logits[vid] : -1.0e30f;
+    uint32_t my_idx = (vid < vocab_size) ? (uint32_t)vid : 0U;
+    s_val[tid] = my_val;
+    s_idx[tid] = my_idx;
+    __syncthreads();
+
+    #pragma unroll
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (s_val[tid + s] > s_val[tid]) {
+                s_val[tid] = s_val[tid + s];
+                s_idx[tid] = s_idx[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        scratch_vals[blockIdx.x] = s_val[0];
+        scratch_idxs[blockIdx.x] = s_idx[0];
+    }
+}
+
+// 1.3j Two-Stage Parallel Vocabulary Argmax (Stage 2: Candidate Stride Reduction)
+__global__ void __launch_bounds__(256, 1) velox_cuda_lm_head_argmax_stage2(
+    uint32_t* __restrict__ host_pinned_ring,
+    const float* __restrict__ scratch_vals,
+    const uint32_t* __restrict__ scratch_idxs,
+    size_t num_candidates,
+    size_t step,
+    uint64_t active_mask
+) {
+    if ((active_mask & 1ULL) == 0ULL) return;
+    __shared__ float s_val[256];
+    __shared__ uint32_t s_idx[256];
+    const size_t tid = threadIdx.x;
+
+    float my_val = -1.0e30f;
+    uint32_t my_idx = 0U;
+    for (size_t c = tid; c < num_candidates; c += blockDim.x) {
+        float c_val = scratch_vals[c];
+        uint32_t c_idx = scratch_idxs[c];
+        if (c_val > my_val) {
+            my_val = c_val;
+            my_idx = c_idx;
+        }
+    }
+    s_val[tid] = my_val;
+    s_idx[tid] = my_idx;
+    __syncthreads();
+
+    #pragma unroll
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (s_val[tid + s] > s_val[tid]) {
+                s_val[tid] = s_val[tid + s];
+                s_idx[tid] = s_idx[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0 && host_pinned_ring != NULL) {
+        host_pinned_ring[step & 1023ULL] = s_idx[0];
     }
 }
 
@@ -624,137 +1117,499 @@ extern "C" void velox_SmolLM_135M_prefill_cuda(VeloxCudaArena* ctx, uint32_t tok
     dim3 grid((VELOX_HIDDEN_DIM + 255) / 256);
     dim3 block(256);
     velox_cuda_embed_kernel<<<grid, block, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), token_in, VELOX_DEV_W_PTR(ctx->weight_arena, 0ULL), active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 0ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 0ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 1ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 1ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 2ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 2ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 3ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 3ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 4ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 4ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 5ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 5ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 6ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 6ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 7ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 7ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 8ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 8ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 9ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 9ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 10ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 10ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 11ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 11ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 12ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 12ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 13ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 13ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 14ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 14ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 15ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 15ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 16ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 16ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 17ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 17ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 18ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 18ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 19ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 19ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 20ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 20ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 21ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 21ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 22ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 22ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 23ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 23ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 24ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 24ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 25ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 25ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 26ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 26ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 27ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 27ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 28ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 28ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 29ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 29ULL, 0.000010f, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (0ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 0ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 0ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 0ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 0ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (0ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 0ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 0ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (1ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 1ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 1ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 1ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 1ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (1ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 1ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 1ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (2ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 2ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 2ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 2ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 2ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (2ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 2ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 2ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (3ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 3ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 3ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 3ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 3ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (3ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 3ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 3ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (4ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 4ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 4ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 4ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 4ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (4ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 4ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 4ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (5ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 5ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 5ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 5ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 5ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (5ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 5ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 5ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (6ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 6ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 6ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 6ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 6ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (6ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 6ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 6ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (7ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 7ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 7ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 7ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 7ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (7ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 7ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 7ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (8ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 8ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 8ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 8ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 8ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (8ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 8ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 8ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (9ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 9ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 9ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 9ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 9ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (9ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 9ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 9ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (10ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 10ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 10ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 10ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 10ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (10ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 10ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 10ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (11ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 11ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 11ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 11ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 11ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (11ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 11ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 11ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (12ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 12ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 12ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 12ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 12ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (12ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 12ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 12ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (13ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 13ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 13ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 13ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 13ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (13ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 13ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 13ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (14ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 14ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 14ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 14ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 14ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (14ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 14ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 14ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (15ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 15ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 15ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 15ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 15ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (15ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 15ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 15ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (16ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 16ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 16ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 16ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 16ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (16ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 16ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 16ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (17ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 17ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 17ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 17ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 17ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (17ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 17ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 17ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (18ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 18ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 18ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 18ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 18ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (18ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 18ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 18ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (19ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 19ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 19ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 19ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 19ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (19ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 19ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 19ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (20ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 20ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 20ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 20ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 20ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (20ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 20ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 20ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (21ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 21ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 21ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 21ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 21ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (21ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 21ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 21ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (22ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 22ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 22ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 22ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 22ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (22ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 22ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 22ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (23ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 23ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 23ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 23ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 23ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (23ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 23ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 23ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (24ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 24ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 24ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 24ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 24ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (24ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 24ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 24ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (25ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 25ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 25ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 25ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 25ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (25ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 25ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 25ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (26ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 26ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 26ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 26ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 26ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (26ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 26ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 26ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (27ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 27ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 27ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 27ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 27ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (27ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 27ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 27ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (28ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 28ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 28ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 28ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 28ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (28ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 28ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 28ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (29ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 29ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 29ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 29ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 29ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (29ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 29ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 29ULL, active_mask);
     velox_cuda_rmsnorm_kernel<<<grid, block, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 786432ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 301989888ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 538057728ULL), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
-    velox_cuda_matmul_vec_kernel<<<dim3((49152ULL + 255) / 256), block, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 786432ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 538060032ULL), 576ULL, 49152ULL, active_mask);
-    velox_cuda_final_norm_argmax<<<1, 32, 0, stream>>>(ctx->host_pinned_ring, VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_VOCAB_SIZE, step, active_mask);
+    velox_cuda_matmul_vec_kernel<<<dim3(12288ULL), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 786432ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 538060032ULL), 576ULL, 49152ULL, active_mask);
+    velox_cuda_lm_head_argmax_stage1<<<dim3((VELOX_VOCAB_SIZE + 255ULL) / 256ULL), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_STAGE1_VALS_OFFSET), (uint32_t*)VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_STAGE1_IDXS_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_VOCAB_SIZE, active_mask);
+    velox_cuda_lm_head_argmax_stage2<<<dim3(1), dim3(256), 0, stream>>>(ctx->host_pinned_ring, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_STAGE1_VALS_OFFSET), (const uint32_t*)VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_STAGE1_IDXS_OFFSET), (VELOX_VOCAB_SIZE + 255ULL) / 256ULL, step, active_mask);
 }
 
 extern "C" void velox_SmolLM_135M_decode_cuda(VeloxCudaArena* ctx, uint32_t token_in, size_t step, uint64_t active_mask, cudaStream_t stream) {
     dim3 grid((VELOX_HIDDEN_DIM + 255) / 256);
     dim3 block(256);
     velox_cuda_embed_kernel<<<grid, block, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), token_in, VELOX_DEV_W_PTR(ctx->weight_arena, 0ULL), active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 0ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 0ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 1ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 1ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 2ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 2ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 3ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 3ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 4ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 4ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 5ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 5ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 6ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 6ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 7ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 7ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 8ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 8ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 9ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 9ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 10ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 10ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 11ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 11ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 12ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 12ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 13ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 13ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 14ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 14ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 15ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 15ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 16ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 16ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 17ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 17ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 18ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 18ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 19ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 19ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 20ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 20ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 21ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 21ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 22ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 22ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 23ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 23ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 24ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 24ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 25ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 25ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 26ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 26ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 27ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 27ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 28ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 28ULL, 0.000010f, active_mask);
-    velox_cuda_fused_norm_qkv_rope_attn<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), (float*)ctx->kv_cache_pool, 29ULL, step, 0.000010f, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_fused_out_res_swiglu_res<<<1, 256, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 29ULL, 0.000010f, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (0ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 0ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 0ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 0ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 0ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (0ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 0ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 0ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (1ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 1ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 1ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 1ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 1ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (1ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 1ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 1ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (2ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 2ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 2ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 2ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 2ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (2ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 2ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 2ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (3ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 3ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 3ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 3ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 3ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (3ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 3ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 3ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (4ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 4ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 4ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 4ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 4ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (4ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 4ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 4ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (5ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 5ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 5ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 5ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 5ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (5ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 5ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 5ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (6ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 6ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 6ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 6ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 6ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (6ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 6ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 6ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (7ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 7ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 7ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 7ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 7ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (7ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 7ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 7ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (8ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 8ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 8ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 8ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 8ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (8ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 8ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 8ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (9ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 9ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 9ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 9ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 9ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (9ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 9ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 9ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (10ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 10ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 10ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 10ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 10ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (10ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 10ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 10ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (11ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 11ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 11ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 11ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 11ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (11ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 11ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 11ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (12ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 12ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 12ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 12ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 12ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (12ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 12ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 12ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (13ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 13ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 13ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 13ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 13ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (13ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 13ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 13ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (14ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 14ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 14ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 14ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 14ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (14ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 14ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 14ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (15ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 15ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 15ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 15ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 15ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (15ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 15ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 15ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (16ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 16ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 16ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 16ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 16ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (16ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 16ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 16ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (17ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 17ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 17ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 17ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 17ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (17ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 17ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 17ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (18ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 18ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 18ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 18ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 18ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (18ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 18ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 18ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (19ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 19ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 19ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 19ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 19ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (19ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 19ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 19ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (20ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 20ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 20ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 20ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 20ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (20ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 20ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 20ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (21ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 21ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 21ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 21ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 21ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (21ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 21ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 21ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (22ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 22ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 22ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 22ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 22ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (22ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 22ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 22ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (23ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 23ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 23ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 23ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 23ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (23ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 23ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 23ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (24ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 24ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 24ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 24ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 24ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (24ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 24ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 24ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (25ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 25ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 25ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 25ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 25ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (25ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 25ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 25ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (26ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 26ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 26ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 26ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 26ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (26ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 26ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 26ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (27ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 27ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 27ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 27ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 27ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (27ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 27ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 27ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (28ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 28ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 28ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 28ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 28ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (28ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 28ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 28ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537919488ULL) + (29ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_fused_qkv_warp_kernel<<<dim3(240), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 113246208ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 153059328ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 166330368ULL), 29ULL, step, active_mask);
+    velox_cuda_fused_rope_kernel<<<dim3(3), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 29ULL, step, VELOX_MODEL_ROPE_THETA, active_mask);
+    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), (float*)ctx->kv_cache_pool, 29ULL, step, active_mask);
+    velox_cuda_out_proj_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 179601408ULL), 29ULL, active_mask);
+    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 537988608ULL) + (29ULL * VELOX_HIDDEN_DIM), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
+    velox_cuda_swiglu_gate_up_kernel<<<dim3(384), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 219414528ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 325582848ULL), 29ULL, active_mask);
+    velox_cuda_swiglu_down_residual_kernel<<<dim3(144), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 431751168ULL), 29ULL, active_mask);
     velox_cuda_rmsnorm_kernel<<<grid, block, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1572864ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 147456ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 538057728ULL), VELOX_HIDDEN_DIM, 0.000010f, active_mask);
-    velox_cuda_matmul_vec_kernel<<<dim3((49152ULL + 255) / 256), block, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1572864ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 538060032ULL), 576ULL, 49152ULL, active_mask);
-    velox_cuda_final_norm_argmax<<<1, 32, 0, stream>>>(ctx->host_pinned_ring, VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_VOCAB_SIZE, step, active_mask);
+    velox_cuda_matmul_vec_kernel<<<dim3(12288ULL), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1572864ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 538060032ULL), 576ULL, 49152ULL, active_mask);
+    velox_cuda_lm_head_argmax_stage1<<<dim3((VELOX_VOCAB_SIZE + 255ULL) / 256ULL), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_STAGE1_VALS_OFFSET), (uint32_t*)VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_STAGE1_IDXS_OFFSET), VELOX_DEV_ACT_PTR(ctx->activation_arena, 0ULL), VELOX_VOCAB_SIZE, active_mask);
+    velox_cuda_lm_head_argmax_stage2<<<dim3(1), dim3(256), 0, stream>>>(ctx->host_pinned_ring, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_STAGE1_VALS_OFFSET), (const uint32_t*)VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_STAGE1_IDXS_OFFSET), (VELOX_VOCAB_SIZE + 255ULL) / 256ULL, step, active_mask);
 }
 
