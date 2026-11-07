@@ -1,6 +1,8 @@
 //! Integration Tests for Steps 8 & 9: Zero-Copy Win32 `.safetensors` Memory Mapping,
 //! Numerical Kernels, and End-to-End Token Generation on Real `SmolLM-135M` Weights.
 
+mod common;
+
 use std::path::Path;
 use veloxc::cli::{run_cli_with_io, EXIT_SUCCESS};
 use veloxc::diagnostics::DiagnosticCode;
@@ -12,10 +14,9 @@ use veloxc::runtime::{
 
 #[test]
 fn test_step8_mmap_safetensors_header_and_e013_missing_key() {
-    let smollm_path = Path::new("smollm-135m.safetensors");
-    if !smollm_path.exists() {
+    let Some(smollm_path) = common::require_smollm_weights() else {
         return;
-    }
+    };
 
     let st = MmapSafetensors::open(smollm_path).expect("Win32 zero-copy mmap must succeed");
     assert!(st.tensors.contains_key("model.embed_tokens.weight"));
@@ -259,10 +260,9 @@ fn test_step9_real_smollm_135m_e2e_generation_and_cli() {
 
 #[test]
 fn test_step9_zero_dynamic_allocation_invariance() {
-    let smollm_path = Path::new("smollm-135m.safetensors");
-    if !smollm_path.exists() {
+    let Some(smollm_path) = common::require_smollm_weights() else {
         return;
-    }
+    };
 
     let config = TransformerConfig::smollm_135m(32);
     let mut engine = VeloxStaticExecutionEngine::load_safetensors(smollm_path, config)

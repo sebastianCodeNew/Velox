@@ -9,9 +9,10 @@
 //! 5. DeepSeek Absorbed MLA: online softmax reduction oracle vs analytical reference, multi-layer isolation.
 //! 6. Transformer Primitives: L2 norm invariance of RoPE, RMSNorm with zero vector, sampling boundaries.
 
+mod common;
+
 use std::fs::File;
 use std::io::Write;
-use std::path::Path;
 use veloxc::cli::{run_cli_with_io, EXIT_IO_ERROR, EXIT_SUCCESS};
 use veloxc::diagnostics::DiagnosticCode;
 use veloxc::runtime::{
@@ -58,11 +59,9 @@ impl TestRng {
 
 #[test]
 fn test_adversarial_buffer_address_stability_across_sequence_lengths() {
-    let smollm_path = Path::new("smollm-135m.safetensors");
-    if !smollm_path.exists() {
-        eprintln!("Skipping smollm-135m test: file not found");
+    let Some(smollm_path) = common::require_smollm_weights() else {
         return;
-    }
+    };
 
     let max_seq = 64;
     let config = TransformerConfig::smollm_135m(max_seq);
@@ -402,9 +401,7 @@ fn test_adversarial_corrupt_safetensors_fuzzing() {
 
 #[test]
 fn test_adversarial_cli_deterministic_execution_and_reports() {
-    let smollm_path = Path::new("smollm-135m.safetensors");
-    if !smollm_path.exists() {
-        eprintln!("Skipping SmolLM CLI test: smollm-135m.safetensors not found");
+    if common::require_smollm_weights().is_none() {
         return;
     }
 
