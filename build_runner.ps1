@@ -9,3 +9,12 @@ $env:INCLUDE = "$incPath;$winSdkInc\$sdkVer\ucrt;$winSdkInc\$sdkVer\um;$winSdkIn
 $env:LIB = "$libPath;$winSdkLib\$sdkVer\ucrt\x64;$winSdkLib\$sdkVer\um\x64"
 Set-Location "C:\Sebastian\Project\Velox"
 nvcc -o velox_cuda_runner_k2.exe src/runners/velox_cuda_runner_k2.cu -arch=sm_86 -O3 --use_fast_math -Xcompiler "/EHsc /O2" -Xptxas -v
+
+# Sync the freshly built runner into src\runners\ — the canonical location
+# resolved by veloxc's CLI backend dispatcher (prevents stale-binary drift:
+# the CLI would otherwise execute an outdated, pre-fix runner copy).
+if (Test-Path "velox_cuda_runner_k2.exe") {
+    Copy-Item "velox_cuda_runner_k2.exe" "src\runners\velox_cuda_runner_k2.exe" -Force
+    Write-Host "[OK] Synced velox_cuda_runner_k2.exe -> src\runners\"
+}
+

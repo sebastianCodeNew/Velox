@@ -448,6 +448,34 @@ static void load_gguf_tensor_to_arena(
 // act_buf: 1024 * 10240 * 4 = 41,943,040 bytes (40 MiB)
 // Total: 8 + 10 + 10 + 16 + 40 = 84 MiB (within 125 MiB arena)
 
+// =============================================================================
+// Speculative Verify Region (Batched LM-Head Evaluation)
+//
+// Layout (all static offsets inside the 125 MiB activation arena):
+//   [spec token slots]  1024 * 12 B  (4 B token ids + 8 B device positions)
+//   [verify norm rows]  SPEC_MAX_ROWS * 2560 * 4   (82 KB for 8 rows)
+//   [verify logits]     SPEC_MAX_ROWS * 250624 * 4 (7.65 MiB for 8 rows)
+//   [stage1 scratch]    SPEC_MAX_ROWS * 979 blocks * 8 B (63 KB)
+//
+// The device token slots are written AFTER the batched-prefill activation
+// region (offset ACT_BASE + act_bytes); all three verify buffers trail them,
+// so total arena usage peaks at ~91.8 MiB and never collides with the low
+// 0..8 MiB block (scratch/decode-state) or the prefill region itself.
+// =============================================================================
+#define VELOX_SPEC_MAX_ROWS               8ULL
+#define VELOX_VERIFY_TOKEN_SLOT_BYTES     12ULL  /* 4 B id + 8 B position */
+#define VELOX_VERIFY_TOKEN_REGION_END     (VELOX_BATCHED_PREFILL_ACT_BASE + VELOX_BATCHED_PREFILL_MAX_TOKENS * (VELOX_INTERMEDIATE_DIM * 4ULL + VELOX_VERIFY_TOKEN_SLOT_BYTES))
+#define VELOX_VERIFY_NORM_BASE            VELOX_VERIFY_TOKEN_REGION_END
+#define VELOX_VERIFY_LOGITS_BASE          (VELOX_VERIFY_NORM_BASE + VELOX_SPEC_MAX_ROWS * VELOX_HIDDEN_DIM * 4ULL)
+#define VELOX_VERIFY_STAGE1_BASE          (VELOX_VERIFY_LOGITS_BASE + VELOX_SPEC_MAX_ROWS * VELOX_VOCAB_SIZE * 4ULL)
+// Stage1 scratch: split into separate float vals and uint32_t idxs buffers
+#define VELOX_VERIFY_STAGE1_NUM_BLOCKS    ((VELOX_VOCAB_SIZE + 255ULL) / 256ULL)  // 979
+#define VELOX_VERIFY_STAGE1_VALS_SIZE     (VELOX_SPEC_MAX_ROWS * VELOX_VERIFY_STAGE1_NUM_BLOCKS * 4ULL)  // float
+#define VELOX_VERIFY_STAGE1_IDXS_BASE     (VELOX_VERIFY_STAGE1_BASE + VELOX_VERIFY_STAGE1_VALS_SIZE)
+#define VELOX_VERIFY_STAGE1_IDXS_SIZE     (VELOX_SPEC_MAX_ROWS * VELOX_VERIFY_STAGE1_NUM_BLOCKS * 4ULL)  // uint32_t
+#define VELOX_VERIFY_REGION_END           (VELOX_VERIFY_STAGE1_IDXS_BASE + VELOX_VERIFY_STAGE1_IDXS_SIZE)
+
+
 // Batched Embed Q4: blockIdx.y = token index
 __global__ void __launch_bounds__(256) velox_cuda_embed_batched_q4(
     float* __restrict__ dst_base, const uint32_t* __restrict__ tokens,
@@ -1105,6 +1133,217 @@ static uint32_t velox_evaluate_lm_head(
     return ctx->host_pinned_ring[eval_pos & (VELOX_HOST_RING_SLOTS - 1ULL)];
 }
 
+// ===========================================================================
+// BATCHED Speculative Verify: RMSNorm + Q4 LM-Head + Argmax for K+1 candidate
+// rows in ONE streamed pass.
+//
+// Why this exists (bandwidth proof, RTX 3050 sm_86):
+//   The output head is Q6_K: 2560 x 250624 = 641,598,720 params -> after
+//   Marlin-int4 repacking 320,799,360 B of weight traffic per pass. The
+//   single-row path ran this B times sequentially with a full stream sync
+//   after each row, so speculative verify cost grew linearly with the draft
+//   width. This version reads the weight tables ONCE for all rows (L2 covers
+//   the per-block 4-row working set across candidate rows) and synchronizes
+//   exactly once, making verify ~O(1) per candidate instead of O(B) passes:
+//   break-even draft acceptance drops from a=1.0 (impossible in practice)
+//   to a > (m_B - 1) / K with m_B ~= 1.1-1.3, i.e. a ~= 0.1 for K = 3.
+// ===========================================================================
+
+// Row-batched Marlin-int4 output projection: one output row per warp,
+// one candidate index per blockIdx.y. dst rows stride = out_dim floats.
+__global__ void __launch_bounds__(128, 8) velox_cuda_matmul_vec_batched_q4(
+    float* __restrict__ dst,
+    const float* __restrict__ x_base,
+    const uint32_t* __restrict__ w_q4,
+    const half2* __restrict__ s_q4,
+    size_t in_dim,
+    size_t out_dim,
+    size_t n_rows
+) {
+    const size_t row = (size_t)blockIdx.x * 4ULL + threadIdx.x / 32;
+    if (row >= out_dim) return;
+    const size_t b = blockIdx.y;
+    if (b >= n_rows) return;
+    const float* x = x_base + (b * in_dim);
+    const float acc = velox_warp_dot_q4(
+        w_q4 + ((row * in_dim) >> 3),
+        s_q4 + ((row * in_dim) >> 6),
+        x, in_dim, threadIdx.x % 32);
+    if (threadIdx.x % 32 == 0) {
+        dst[(b * out_dim) + row] = acc;
+    }
+}
+
+// Stage 1 batched: per (row, vocab-slice) partial argmax into the verify
+// scratch region. One block per (row, 256-wide vocab slice).
+__global__ void velox_cuda_lm_head_argmax_stage1_batched(
+    float* __restrict__ scratch_vals,
+    uint32_t* __restrict__ scratch_idxs,
+    const float* __restrict__ logits,
+    size_t vocab_size,
+    size_t n_rows
+) {
+    const size_t row = blockIdx.y;
+    if (row >= n_rows) return;
+    const size_t num_blocks = gridDim.x;
+    __shared__ float s_val[256];
+    __shared__ uint32_t s_idx[256];
+    const size_t tid = threadIdx.x;
+    const size_t vid = (size_t)blockIdx.x * 256ULL + tid;
+    const float* row_logits = logits + (row * vocab_size);
+
+    float my_val = (vid < vocab_size) ? row_logits[vid] : -1.0e30f;
+    uint32_t my_idx = (vid < vocab_size) ? (uint32_t)vid : 0U;
+    s_val[tid] = my_val;
+    s_idx[tid] = my_idx;
+    __syncthreads();
+
+    #pragma unroll
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s && s_val[tid + s] > s_val[tid]) {
+            s_val[tid] = s_val[tid + s];
+            s_idx[tid] = s_idx[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        const size_t slot = (row * num_blocks) + blockIdx.x;
+        scratch_vals[slot] = s_val[0];
+        scratch_idxs[slot] = s_idx[0];
+    }
+}
+
+// Stage 2 batched: one block per candidate row reduces its partial argmax
+// list and zero-copy writes the winner into the host-pinned ring at the
+// candidate's absolute decode position (same slot contract as single-row
+// evaluation), followed by a system-level fence so a polling host sees it.
+__global__ void velox_cuda_lm_head_argmax_stage2_batched(
+    uint32_t* __restrict__ host_pinned_ring,
+    const float* __restrict__ scratch_vals,
+    const uint32_t* __restrict__ scratch_idxs,
+    size_t num_candidates,
+    const size_t* __restrict__ d_positions,
+    size_t n_rows
+) {
+    const size_t row = blockIdx.x;
+    if (row >= n_rows) return;
+    __shared__ float s_val[256];
+    __shared__ uint32_t s_idx[256];
+    const size_t tid = threadIdx.x;
+
+    float my_val = -1.0e30f;
+    uint32_t my_idx = 0U;
+    const float* r_vals = scratch_vals + (row * num_candidates);
+    const uint32_t* r_idxs = scratch_idxs + (row * num_candidates);
+    for (size_t c = tid; c < num_candidates; c += blockDim.x) {
+        const float c_val = r_vals[c];
+        const uint32_t c_idx = r_idxs[c];
+        if (c_val > my_val) {
+            my_val = c_val;
+            my_idx = c_idx;
+        }
+    }
+    s_val[tid] = my_val;
+    s_idx[tid] = my_idx;
+    __syncthreads();
+
+    #pragma unroll
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s && s_val[tid + s] > s_val[tid]) {
+            s_val[tid] = s_val[tid + s];
+            s_idx[tid] = s_idx[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        const size_t pos = d_positions[row];
+        host_pinned_ring[pos & (VELOX_HOST_RING_SLOTS - 1ULL)] = s_idx[0];
+        // Make the zero-copy ring write visible to the polling host thread.
+        __threadfence_system();
+    }
+}
+
+// Host-side batched evaluator: final RMSNorm -> batched Q4 LM head ->
+// two-stage batched argmax. Zero host synchronization inside (the caller
+// is responsible for one cudaStreamSynchronize after this returns, which
+// also makes it safe to embed inside CUDA graph capture).
+static void velox_evaluate_lm_head_batched(
+    VeloxCudaArena* ctx,
+    const float* hidden_base,
+    size_t n_rows,
+    const size_t* d_positions,
+    cudaStream_t stream
+) {
+    if (n_rows == 0ULL || n_rows > VELOX_SPEC_MAX_ROWS) return;
+
+    const float* final_norm_w = VELOX_DEV_NORM_PTR(ctx, 2208972800ULL);
+    float* verify_norm = VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_VERIFY_NORM_BASE);
+    float* verify_logits = VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_VERIFY_LOGITS_BASE);
+    float* scratch_vals = VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_VERIFY_STAGE1_BASE);
+    uint32_t* scratch_idxs = (uint32_t*)VELOX_DEV_ACT_PTR(
+        ctx->activation_arena, VELOX_VERIFY_STAGE1_IDXS_BASE);
+
+    velox_cuda_rmsnorm_batched<<<dim3(1, (unsigned int)n_rows), dim3(256), 0, stream>>>(
+        verify_norm, hidden_base, final_norm_w,
+        VELOX_HIDDEN_DIM, 1e-6f,
+        n_rows, VELOX_HIDDEN_DIM, VELOX_HIDDEN_DIM
+    );
+
+    velox_cuda_matmul_vec_batched_q4<<<dim3(62656ULL, (unsigned int)n_rows), dim3(128), 0, stream>>>(
+        verify_logits, verify_norm,
+        VELOX_DEV_W_Q4_PTR(ctx, 2208983040ULL),
+        VELOX_DEV_S_Q4_PTR(ctx, 2208983040ULL),
+        2560ULL, VELOX_VOCAB_SIZE, n_rows
+    );
+
+    velox_cuda_lm_head_argmax_stage1_batched<<<dim3((VELOX_VOCAB_SIZE + 255ULL) / 256ULL, (unsigned int)n_rows), dim3(256), 0, stream>>>(
+        scratch_vals, scratch_idxs, verify_logits, VELOX_VOCAB_SIZE, n_rows
+    );
+
+    velox_cuda_lm_head_argmax_stage2_batched<<<dim3((unsigned int)n_rows), dim3(256), 0, stream>>>(
+        ctx->host_pinned_ring, scratch_vals, scratch_idxs,
+        (VELOX_VOCAB_SIZE + 255ULL) / 256ULL, d_positions, n_rows
+    );
+}
+
+// Full spec-verify forward pass for a compile-time batch width: embed the
+// B candidate rows, run all 36 fused layers in one weights-stream pass,
+// and batch-evaluate the LM head. Shared by the CUDA-graph capture prologue
+// and the legacy fallback so both paths dispatch through the same code.
+#define RUN_VERIFY_BATCH(N) case N: velox_run_batched_layers_q4<N>(ctx, hidden, norm, q, act, d_positions, stream); break;
+static void velox_verify_forward_full(
+    VeloxCudaArena* ctx,
+    int batch,
+    float* hidden,
+    float* norm,
+    float* q,
+    float* act,
+    const size_t* d_positions,
+    cudaStream_t stream
+) {
+    velox_cuda_embed_batched_q4<<<dim3((VELOX_HIDDEN_DIM / 8ULL + 255) / 256, (unsigned int)batch), dim3(256), 0, stream>>>(
+        hidden, (uint32_t*)((uint8_t*)ctx->activation_arena + (VELOX_BATCHED_PREFILL_ACT_BASE + VELOX_BATCHED_PREFILL_MAX_TOKENS * (VELOX_INTERMEDIATE_DIM * 4ULL + 0ULL))),
+        VELOX_DEV_W_Q4_PTR(ctx, 0ULL), VELOX_DEV_S_Q4_PTR(ctx, 0ULL),
+        (size_t)batch, VELOX_HIDDEN_DIM
+    );
+
+    switch (batch) {
+        RUN_VERIFY_BATCH(2)
+        RUN_VERIFY_BATCH(3)
+        RUN_VERIFY_BATCH(4)
+        RUN_VERIFY_BATCH(5)
+        RUN_VERIFY_BATCH(6)
+        RUN_VERIFY_BATCH(7)
+        RUN_VERIFY_BATCH(8)
+        default: break;
+    }
+
+    velox_evaluate_lm_head_batched(ctx, hidden, (size_t)batch, d_positions, stream);
+}
+#undef RUN_VERIFY_BATCH
+
 // Prompt-Lookup Drafting (PLD): Match last n-gram in prompt/generation history
 // Searches backward from current position for the most recent match.
 static int velox_prompt_lookup_draft(
@@ -1291,6 +1530,7 @@ int main(int argc, char** argv) {
     bool use_cuda_graph = true;
     bool use_speculative = false;
     int max_draft_len = 3;
+    float spec_off_ema = 0.20f;
     size_t max_context_tokens = 16384;
 
     for (int i = 1; i < argc; ++i) {
@@ -1317,6 +1557,10 @@ int main(int argc, char** argv) {
             max_draft_len = atoi(argv[++i]);
             if (max_draft_len <= 0) max_draft_len = 3;
             if (max_draft_len > 7) max_draft_len = 7;
+        } else if (strcmp(argv[i], "--spec-ema") == 0 && i + 1 < argc) {
+            spec_off_ema = (float)atof(argv[++i]);
+            if (spec_off_ema < 0.0f) spec_off_ema = 0.0f;
+            if (spec_off_ema > 0.95f) spec_off_ema = 0.95f;
         } else if (strcmp(argv[i], "--steps") == 0 && i + 1 < argc) {
             steps = (size_t)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--context-len") == 0 && i + 1 < argc) {
@@ -1333,6 +1577,7 @@ int main(int argc, char** argv) {
             printf("  --tokens <t1,t2,...>   Comma-separated prompt token IDs (or --prompt)\n");
             printf("  --speculative [K]      Enable Prompt-Lookup Speculative Decoding (default draft K=3)\n");
             printf("  --draft-len <K>        Set max draft candidate length (default: 3, max: 7)\n");
+            printf("  --spec-ema <x>         Adaptive drafting: EMA acceptance floor (default 0.20)\n");
             printf("  --steps <N>            Autoregressive decode steps (default: 16)\n");
             printf("  --context-len <N>      Max context tokens in host-pinned KV cache (default: 16384)\n");
             printf("  --verbose              Print token at each step\n");
@@ -1545,6 +1790,69 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Shared scratch pointers for the speculative verify path. Embed, fused
+    // layers, and the batched LM head all read/write these fixed arena
+    // offsets, so a captured graph replays against fresh inputs by simply
+    // updating d_tokens / d_positions on the same stream before launch.
+    float* hidden_base = (float*)((uint8_t*)ctx.activation_arena + VELOX_BATCHED_PREFILL_BASE);
+    float* norm_base   = (float*)((uint8_t*)ctx.activation_arena + VELOX_BATCHED_PREFILL_NORM_BASE);
+    float* q_base      = (float*)((uint8_t*)ctx.activation_arena + VELOX_BATCHED_PREFILL_Q_BASE);
+    float* act_base    = (float*)((uint8_t*)ctx.activation_arena + VELOX_BATCHED_PREFILL_ACT_BASE);
+
+    size_t token_dev_offset = VELOX_BATCHED_PREFILL_ACT_BASE + VELOX_BATCHED_PREFILL_MAX_TOKENS * VELOX_INTERMEDIATE_DIM * 4ULL;
+    uint32_t* d_tokens = (uint32_t*)((uint8_t*)ctx.activation_arena + token_dev_offset);
+    size_t* d_positions = (size_t*)((uint8_t*)ctx.activation_arena + token_dev_offset + VELOX_BATCHED_PREFILL_MAX_TOKENS * sizeof(uint32_t));
+
+    // 6b. Pre-capture batched speculative-verify CUDA Graphs, one per batch
+    // width B = 2..8. Each graph bakes in: batched embed -> 36 fused layers
+    // in a single weights-stream pass -> batched LM head + two-stage argmax.
+    // Per speculative step the host only issues the candidate H2D copy, a
+    // 1-block position-init kernel, and one cudaGraphLaunch, collapsing
+    // ~170 kernel launches (7 per layer x 36 layers + head) into 1.
+    cudaGraph_t verify_graph[9];
+    cudaGraphExec_t verify_graph_exec[9];
+    int verify_graphs_ready = 0;
+    for (int b = 0; b < 9; ++b) {
+        verify_graph[b] = NULL;
+        verify_graph_exec[b] = NULL;
+    }
+    if (use_cuda_graph && use_speculative) {
+        for (int B = 2; B <= 8; ++B) {
+            bool capture_ok = true;
+            err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+            if (err == cudaSuccess) {
+                velox_verify_forward_full(&ctx, B, hidden_base, norm_base, q_base, act_base, d_positions, stream);
+                err = cudaStreamEndCapture(stream, &verify_graph[B]);
+                capture_ok = (err == cudaSuccess && verify_graph[B] != NULL);
+            }
+            if (capture_ok) {
+                err = cudaGraphInstantiate(&verify_graph_exec[B], verify_graph[B], NULL, NULL, 0);
+                capture_ok = (err == cudaSuccess && verify_graph_exec[B] != NULL);
+            }
+            if (capture_ok) {
+                // Keep only the instantiated executable; release the graph
+                // template so no graph handles linger past startup.
+                cudaGraphDestroy(verify_graph[B]);
+                verify_graph[B] = NULL;
+                ++verify_graphs_ready;
+            } else {
+                // Per-width fallback: a failed width simply flies legacy
+                // launches while narrower/wider widths still replay graphs.
+                if (verify_graph[B] != NULL) {
+                    cudaGraphDestroy(verify_graph[B]);
+                    verify_graph[B] = NULL;
+                }
+                if (verbose) {
+                    printf("[CUDA Graph] Verify batch B=%d capture failed: %s\n",
+                           B, (err == cudaSuccess) ? "instantiate failed" : cudaGetErrorString(err));
+                }
+            }
+        }
+        if (verbose) {
+            printf("[CUDA Graph] Speculative verify graphs captured: %d/7 (B=2..8)\n", verify_graphs_ready);
+        }
+    }
+
     uint32_t* generated_tokens = (uint32_t*)malloc(steps * sizeof(uint32_t));
     if (!generated_tokens) return 1;
 
@@ -1588,19 +1896,39 @@ int main(int argc, char** argv) {
     size_t total_drafted = 0;
     size_t total_accepted = 0;
     size_t spec_steps = 0;
+    size_t plain_by_policy = 0;
+    float  spec_ema_final = 0.0f;
+    int    spec_ladder_final = 0;
 
     if (steps > 1) {
         if (use_speculative) {
             cudaEventRecord(ev_decode_start, stream);
 
-            float* hidden_base = (float*)((uint8_t*)ctx.activation_arena + VELOX_BATCHED_PREFILL_BASE);
-            float* norm_base   = (float*)((uint8_t*)ctx.activation_arena + VELOX_BATCHED_PREFILL_NORM_BASE);
-            float* q_base      = (float*)((uint8_t*)ctx.activation_arena + VELOX_BATCHED_PREFILL_Q_BASE);
-            float* act_base    = (float*)((uint8_t*)ctx.activation_arena + VELOX_BATCHED_PREFILL_ACT_BASE);
+            // Shared scratch pointers (hidden/norm/q/act arenas, candidate token
+            // and position staging) were hoisted before graph capture above.
 
-            size_t token_dev_offset = VELOX_BATCHED_PREFILL_ACT_BASE + VELOX_BATCHED_PREFILL_MAX_TOKENS * VELOX_INTERMEDIATE_DIM * 4ULL;
-            uint32_t* d_tokens = (uint32_t*)((uint8_t*)ctx.activation_arena + token_dev_offset);
-            size_t* d_positions = (size_t*)((uint8_t*)ctx.activation_arena + token_dev_offset + VELOX_BATCHED_PREFILL_MAX_TOKENS * sizeof(uint32_t));
+            // -------------------------------------------------------------
+            // Adaptive acceptance policy (EMA over per-step draft acceptance):
+            //
+            //   r_t   = accepted drafts in this step / drafts attempted
+            //   ema   = (1 - tau) * ema + tau * r_t          (tau = 0.35)
+            //
+            // Speculation stays enabled while ema >= spec_off_ema (default
+            // 0.20). Below the floor, drafting pauses for a ladder that
+            // doubles in plain-decode steps (1, 2, 4, ... 64) and probes a
+            // single speculative step again -- text regimes change mid-run
+            // (comment blocks, repetitive prints), so one bad stretch must
+            // not disable the engine permanently. K is additionally scaled
+            // by the current EMA: high confidence -> full K, marginal
+            // confidence -> narrow drafts, keeping wasted verify work at a
+            // premium.
+            // -------------------------------------------------------------
+            const float spec_ema_tau     = 0.35f;
+            float       ema_accept       = 0.70f;
+            const float spec_ladder_cap  = 64.0f;
+            int         plain_stride     = 1;
+            int         plain_since_spec = 0;
+            spec_ema_final = 0.70f;
 
             size_t curr_pos = prompt_len;
             size_t gen_count = 1;
@@ -1610,15 +1938,39 @@ int main(int argc, char** argv) {
             history[prompt_len] = next_tok;
             size_t history_len = prompt_len + 1;
 
-            while (gen_count < steps) {
+            while (gen_count < steps && curr_pos + 2ULL < VELOX_MODEL_MAX_SEQ_LEN && history_len + 2ULL < VELOX_MODEL_MAX_SEQ_LEN) {
                 spec_steps++;
                 uint32_t draft_tokens[8];
                 int K = velox_prompt_lookup_draft(history, history_len, draft_tokens, max_draft_len);
                 if ((size_t)K > steps - gen_count) {
                     K = (int)(steps - gen_count);
                 }
+                // Dynamic draft width from current acceptance confidence.
+                if (K > 0) {
+                    int k_cap = (int)(max_draft_len * (0.4f + 0.6f * (ema_accept > 1.0f ? 1.0f : ema_accept)));
+                    if (k_cap < 1) k_cap = 1;
+                    if (K > k_cap) K = k_cap;
+                    if ((size_t)K > steps - gen_count) {
+                        K = (int)(steps - gen_count);
+                    }
+                }
 
-                if (K <= 0) {
+                // Probe-ladder policy gate.
+                bool use_spec_now;
+                if ((ema_accept >= spec_off_ema) || K <= 0) {
+                    use_spec_now = (K > 0);
+                    plain_since_spec = 0;
+                } else if (plain_since_spec >= plain_stride) {
+                    use_spec_now = true;
+                    plain_since_spec = 0;
+                    plain_stride = (plain_stride < (int)spec_ladder_cap) ? plain_stride * 2 : (int)spec_ladder_cap;
+                } else {
+                    use_spec_now = false;
+                    plain_since_spec++;
+                }
+
+                if (!use_spec_now) {
+                    plain_by_policy++;
                     velox_K2_Horizon_3_7B_decode_cuda(&ctx, next_tok, curr_pos, 1ULL, stream);
                     cudaStreamSynchronize(stream);
                     next_tok = h_ring[curr_pos & (VELOX_HOST_RING_SLOTS - 1ULL)];
@@ -1632,6 +1984,7 @@ int main(int argc, char** argv) {
                 } else {
                     total_drafted += K;
                     int B = K + 1;
+                    int accepted_in_step = 0;
                     uint32_t candidates[9];
                     candidates[0] = next_tok;
                     for (int i = 0; i < K; ++i) {
@@ -1641,32 +1994,27 @@ int main(int argc, char** argv) {
                     cudaMemcpyAsync(d_tokens, candidates, B * sizeof(uint32_t), cudaMemcpyHostToDevice, stream);
                     velox_cuda_init_positions<<<1, 32, 0, stream>>>(d_positions, curr_pos, B);
 
-                    velox_cuda_embed_batched_q4<<<dim3((VELOX_HIDDEN_DIM / 8ULL + 255) / 256, (unsigned int)B), dim3(256), 0, stream>>>(
-                        hidden_base, d_tokens,
-                        VELOX_DEV_W_Q4_PTR(&ctx, 0ULL), VELOX_DEV_S_Q4_PTR(&ctx, 0ULL),
-                        B, VELOX_HIDDEN_DIM
-                    );
-
-                    #define RUN_VERIFY_BATCH(N) case N: velox_run_batched_layers_q4<N>(&ctx, hidden_base, norm_base, q_base, act_base, d_positions, stream); break;
-                    switch (B) {
-                        RUN_VERIFY_BATCH(2)
-                        RUN_VERIFY_BATCH(3)
-                        RUN_VERIFY_BATCH(4)
-                        RUN_VERIFY_BATCH(5)
-                        RUN_VERIFY_BATCH(6)
-                        RUN_VERIFY_BATCH(7)
-                        RUN_VERIFY_BATCH(8)
-                        default: break;
+                    if (verify_graph_exec[B] != NULL) {
+                        // Graph replay: the captured batch reads the d_tokens and
+                        // d_positions scratch slots, which the two operations
+                        // above just refreshed on this same stream -- stream
+                        // ordering guarantees replay observes the fresh inputs.
+                        cudaGraphLaunch(verify_graph_exec[B], stream);
+                    } else {
+                        // Legacy fallback (capture disabled or unavailable for
+                        // this batch width): identical dispatch, explicated
+                        // launches. Bit-identical kernel sequence to the graph.
+                        velox_verify_forward_full(&ctx, B, hidden_base, norm_base, q_base, act_base, d_positions, stream);
                     }
-                    #undef RUN_VERIFY_BATCH
+                    cudaStreamSynchronize(stream);
 
                     for (int t = 0; t < B && gen_count < steps; ++t) {
-                        const float* h_tok = hidden_base + t * VELOX_HIDDEN_DIM;
-                        uint32_t winner = velox_evaluate_lm_head(&ctx, h_tok, curr_pos + t, stream);
+                        const uint32_t winner = h_ring[(curr_pos + (size_t)t) & (VELOX_HOST_RING_SLOTS - 1ULL)];
 
                         if (t < B - 1) {
                             if (winner == candidates[t + 1]) {
                                 total_accepted++;
+                                accepted_in_step++;
                                 generated_tokens[gen_count++] = candidates[t + 1];
                                 history[history_len++] = candidates[t + 1];
                                 if (verbose) {
@@ -1695,12 +2043,21 @@ int main(int argc, char** argv) {
                             }
                         }
                     }
+
+                    // Exponentially smooth per-step draft acceptance into the
+                    // policy state (r always in [0,1]).
+                    {
+                        const float r = (float)accepted_in_step / (float)K;
+                        ema_accept = (1.0f - spec_ema_tau) * ema_accept + spec_ema_tau * r;
+                    }
                 }
             }
 
             cudaEventRecord(ev_decode_stop, stream);
             cudaStreamSynchronize(stream);
             cudaEventElapsedTime(&decode_gpu_ms, ev_decode_start, ev_decode_stop);
+            spec_ladder_final = plain_stride;
+            spec_ema_final = ema_accept;
         } else if (use_cuda_graph && decode_graph_exec != NULL) {
             velox_cuda_set_decode_state<<<1, 1, 0, stream>>>(VELOX_DEV_STATE(&ctx), next_tok, (unsigned long long)prompt_len);
             cudaStreamSynchronize(stream);
@@ -1763,7 +2120,8 @@ int main(int argc, char** argv) {
     printf("================================================================================\n");
     printf("VELOX EMITTED CUDA STANDALONE RUNTIME EXECUTION REPORT\n");
     printf("================================================================================\n");
-    printf("Model                  : K2-Horizon-3.7B (36 Layers, 512K Context)\n");
+    printf("Model                  : K2-Horizon-3.7B (36 Layers)\n");
+    printf("Context                : 524288 tokens (arch limit; planner grants 2048 active KV slots)\n");
     printf("Target Device          : %s (Compute %d.%d, %zu MiB VRAM)\n",
            prop.name, prop.major, prop.minor, prop.totalGlobalMem / (1024 * 1024));
     printf("Weights Source         : %s\n", has_weights_file ? weights_path : "Dry-Run Feasibility Arena (0 Allocation)");
@@ -1806,7 +2164,11 @@ int main(int argc, char** argv) {
                steps - 1, decode_gpu_ms, decode_tok_per_sec, (double)decode_gpu_ms / (double)(steps - 1));
     }
     if (use_speculative) {
-        printf("Decoding Mode          : Speculative Decoding (Prompt-Lookup Engine, Draft K=%d)\n", max_draft_len);
+        printf("Decoding Mode          : Speculative Decoding (Prompt-Lookup, max draft K=%d)\n", max_draft_len);
+        printf("Verify Batch Replay    : %d/7 CUDA graphs captured (B=2..8); fallback: explicit launches\n",
+               verify_graphs_ready);
+        printf("Adaptive Policy        : EMA floor %.2f, final EMA %.2f, ladder x%d; policy-plain steps: %zu\n",
+               spec_off_ema, spec_ema_final, spec_ladder_final, plain_by_policy);
         printf("Draft Acceptance Rate  : %.1f%% (%zu / %zu draft tokens accepted)\n",
                total_drafted > 0 ? ((double)total_accepted / (double)total_drafted) * 100.0 : 0.0,
                total_accepted, total_drafted);
@@ -1824,6 +2186,9 @@ int main(int argc, char** argv) {
     free(generated_tokens);
     if (decode_graph_exec) cudaGraphExecDestroy(decode_graph_exec);
     if (decode_graph) cudaGraphDestroy(decode_graph);
+    for (int b = 2; b <= 8; ++b) {
+        if (verify_graph_exec[b]) cudaGraphExecDestroy(verify_graph_exec[b]);
+    }
     cudaEventDestroy(ev_prefill_start);
     cudaEventDestroy(ev_prefill_stop);
     cudaEventDestroy(ev_decode_start);
