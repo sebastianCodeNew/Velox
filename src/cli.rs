@@ -106,6 +106,7 @@ pub struct CliArgs {
     pub emit_cuda: bool,
     pub emit_ir: bool,
     pub run_model: bool,
+    pub chat: bool,
     pub backend: ExecutionBackend,
     pub weights_path: Option<String>,
     pub tokenizer_path: Option<String>,
@@ -133,6 +134,7 @@ impl Default for CliArgs {
             emit_cuda: false,
             emit_ir: false,
             run_model: false,
+            chat: false,
             backend: ExecutionBackend::Rust,
             weights_path: None,
             tokenizer_path: None,
@@ -218,6 +220,10 @@ pub fn parse_cli_args(raw_args: &[String]) -> Result<CliAction, String> {
             cli_args.emit_ir = true;
             idx += 1;
         } else if arg == "--run" {
+            cli_args.run_model = true;
+            idx += 1;
+        } else if arg == "--chat" {
+            cli_args.chat = true;
             cli_args.run_model = true;
             idx += 1;
         } else if arg == "--no-color" {
@@ -435,6 +441,7 @@ options:
   --emit-c               Emit standalone zero-allocation ANSI C99 source (.c).
   --emit-cuda            Emit standalone zero-allocation NVIDIA CUDA source (.cu).
   --run                  Execute model natively using zero-copy safetensors mmap.
+  --chat                 Launch interactive native coding REPL (100% zero-Python).
   --backend <backend>    Execution backend: cuda, c99, rust, auto (default: auto).
   --prompt \"<text>\"      Input text prompt (encoded via native BPE tokenizer).
   --tokens <ids>         Comma-separated input prompt token IDs for --run.
@@ -1298,9 +1305,11 @@ fn execute_compilation(
         };
 
         // Resolve execution backend
+        let is_k2 = first_model.name.contains("K2") || first_model.name.contains("Horizon");
         let effective_backend = match cli_args.backend {
             ExecutionBackend::Auto => {
-                if find_runner_binary("velox_cuda_runner.exe").is_some() {
+                let cuda_target = if is_k2 { "velox_cuda_runner_k2.exe" } else { "velox_cuda_runner.exe" };
+                if find_runner_binary(cuda_target).is_some() {
                     ExecutionBackend::Cuda
                 } else if find_runner_binary("velox_c99_runner.exe").is_some() {
                     ExecutionBackend::C99
@@ -1311,14 +1320,122 @@ fn execute_compilation(
             other => other,
         };
 
-        // Multi-backend dispatch: External Standalone Runner (CUDA / C99)
-        if effective_backend == ExecutionBackend::Cuda || effective_backend == ExecutionBackend::C99 {
-            let runner_name = if effective_backend == ExecutionBackend::Cuda {
-                "velox_cuda_runner.exe"
+        let runner_name = if effective_backend == ExecutionBackend::Cuda {
+            if is_k2 {
+                "velox_cuda_runner_k2.exe"
             } else {
-                "velox_c99_runner.exe"
+                "velox_cuda_runner.exe"
+            }
+        } else {
+            "velox_c99_runner.exe"
+        };
+
+        // Native Zero-Python Interactive Coding REPL (--chat)
+        if cli_args.chat {
+            let Some(ref tok) = tokenizer_opt else {
+                let _ = writeln!(stderr, "veloxc: chat error: tokenizer file required. Specify --tokenizer <path>.");
+                return EXIT_IO_ERROR;
             };
 
+            let _ = writeln!(stdout, "\x1b[1;36m================================================================================\x1b[0m");
+            let _ = writeln!(stdout, "\x1b[1;36m       VELOX NATIVE BARE-METAL CODING REPL (ZERO-PYTHON PURE SILICON)           \x1b[0m");
+            let _ = writeln!(stdout, "\x1b[1;36m================================================================================\x1b[0m");
+            let _ = writeln!(stdout, "  Target Model   : {} (100% Zero-Dynamic-Allocation DAG)", first_model.name);
+            let _ = writeln!(stdout, "  Active Backend : {:?}", effective_backend);
+            let _ = writeln!(stdout, "  Runtime Engine : 100% Pure Native Velox (0 Python, 0 Ollama, 0 PyTorch)");
+            let _ = writeln!(stdout, "\x1b[36m--------------------------------------------------------------------------------\x1b[0m");
+            let _ = writeln!(stdout, "  Commands: /save <file>, /clear, /exit");
+            let _ = writeln!(stdout, "\x1b[1;36m================================================================================\x1b[0m\n");
+
+            let runner_path = if effective_backend == ExecutionBackend::Cuda || effective_backend == ExecutionBackend::C99 {
+                match find_runner_binary(runner_name) {
+                    Some(p) => Some(p),
+                    None => {
+                        let _ = writeln!(stderr, "veloxc: runner executable '{}' not found", runner_name);
+                        return EXIT_IO_ERROR;
+                    }
+                }
+            } else {
+                None
+            };
+
+            let mut latest_response = String::new();
+
+            loop {
+                let _ = write!(stdout, "\x1b[1;36mvelox[{}]> \x1b[0m", first_model.name);
+                let _ = stdout.flush();
+
+                let mut input = String::new();
+                if std::io::stdin().read_line(&mut input).is_err() || input.is_empty() {
+                    let _ = writeln!(stdout, "\n\x1b[33m[*] Exiting Velox REPL. Goodbye!\x1b[0m");
+                    break;
+                }
+
+                let trimmed = input.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                if trimmed == "/exit" || trimmed == "/quit" {
+                    let _ = writeln!(stdout, "\x1b[33m[*] Exiting Velox REPL. Goodbye!\x1b[0m");
+                    break;
+                } else if trimmed == "/clear" {
+                    latest_response.clear();
+                    let _ = writeln!(stdout, "\x1b[32m[+] Context cleared.\x1b[0m");
+                    continue;
+                } else if trimmed.starts_with("/save ") {
+                    let path = trimmed[6..].trim();
+                    if latest_response.is_empty() {
+                        let _ = writeln!(stderr, "\x1b[31m[-] No response generated yet to save.\x1b[0m");
+                    } else {
+                        match fs::write(path, &latest_response) {
+                            Ok(_) => {
+                                let _ = writeln!(stdout, "\x1b[32m[+] Response saved to '{}' ({} bytes)\x1b[0m", path, latest_response.len());
+                            }
+                            Err(e) => {
+                                let _ = writeln!(stderr, "\x1b[31m[-] Failed to write file: {}\x1b[0m", e);
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                let prompt_str = if trimmed.starts_with("def ") || trimmed.starts_with("fn ") || trimmed.starts_with("class ") || trimmed.starts_with("struct ") {
+                    trimmed.to_string()
+                } else {
+                    format!("USER: {}\nASSISTANT: ", trimmed)
+                };
+
+                let mut turn_tokens = tok.encode(&prompt_str);
+                if !turn_tokens.starts_with(&[1]) && !prompt_str.starts_with("<|") {
+                    turn_tokens.insert(0, 1);
+                }
+
+                let _ = write!(stdout, "\n\x1b[1;32mvelox-assistant> \x1b[0m");
+                let _ = stdout.flush();
+
+                if let Some(ref r_path) = runner_path {
+                    let streaming_decoder = tok.streaming_decoder();
+                    let _ = run_external_runner(
+                        r_path,
+                        &weights_file,
+                        &turn_tokens,
+                        cli_args.steps,
+                        cli_args.threads,
+                        Some(streaming_decoder),
+                        false,
+                        false,
+                        stdout,
+                        stderr,
+                    );
+                }
+                let _ = writeln!(stdout);
+            }
+            return EXIT_SUCCESS;
+        }
+
+        // Multi-backend dispatch: External Standalone Runner (CUDA / C99)
+        if effective_backend == ExecutionBackend::Cuda || effective_backend == ExecutionBackend::C99 {
             let runner_path = match find_runner_binary(runner_name) {
                 Some(p) => p,
                 None => {

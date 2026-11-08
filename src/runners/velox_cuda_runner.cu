@@ -640,17 +640,18 @@ int main(int argc, char** argv) {
         288, 9517, 253, 12301, 198, 19161, 354, 12301, 198, 19161, 354, 12301, 198, 2683, 416, 722
     };
 
-    bool match_4 = (steps >= 4);
-    for (size_t i = 0; i < 4 && i < steps; ++i) {
+    bool is_ref_prompt = (prompt_len == 3 && prompt_tokens[0] == 1 && prompt_tokens[1] == 504 && prompt_tokens[2] == 346);
+    bool match_4 = (steps >= 4 && is_ref_prompt);
+    for (size_t i = 0; i < 4 && i < steps && is_ref_prompt; ++i) {
         if (generated_tokens[i] != EXPECTED_32[i]) match_4 = false;
     }
-    bool match_32 = (steps >= 32);
-    for (size_t i = 0; i < 32 && i < steps; ++i) {
+    bool match_32 = (steps >= 32 && is_ref_prompt);
+    for (size_t i = 0; i < 32 && i < steps && is_ref_prompt; ++i) {
         if (generated_tokens[i] != EXPECTED_32[i]) match_32 = false;
     }
 
     if (quant_mode == VELOX_QUANT_Q4_0) {
-        if (steps >= 4) {
+        if (steps >= 4 && is_ref_prompt) {
             if (match_4) {
                 printf("Parity 4-token check   : PASSED [359, 253, 4028, 282]\n");
             } else {
@@ -658,33 +659,35 @@ int main(int argc, char** argv) {
                        generated_tokens[0], generated_tokens[1], generated_tokens[2], generated_tokens[3]);
             }
         } else {
-            printf("Parity 4-token check   : SKIPPED (fewer than 4 steps requested: %zu)\n", steps);
+            printf("Parity 4-token check   : SKIPPED (Custom prompt or steps < 4)\n");
         }
 
-        if (steps >= 32) {
+        if (steps >= 32 && is_ref_prompt) {
             if (match_32) {
                 printf("Parity 32-token check  : PASSED (Exact match with Velox Rust CPU reference)\n");
             } else {
                 printf("Parity 32-token check  : DIVERGED (INT4 quantization noise vs FP32)\n");
             }
         } else {
-            printf("Parity 32-token check  : SKIPPED (fewer than 32 steps requested: %zu)\n", steps);
+            printf("Parity 32-token check  : SKIPPED (Custom prompt or steps < 32)\n");
         }
 
         float delta = fabsf(step0_token_359_logit - 18.586565f);
-        printf("Accuracy Metric Check  : %s (Step 0 target logit error = %.6f relative to FP32 reference)\n",
-               delta <= 0.03f ? "PASSED" : "FAILED", delta);
+        if (is_ref_prompt) {
+            printf("Accuracy Metric Check  : %s (Step 0 target logit error = %.6f relative to FP32 reference)\n",
+                   delta <= 0.03f ? "PASSED" : "FAILED", delta);
+        }
     } else {
-        if (steps >= 4) {
+        if (steps >= 4 && is_ref_prompt) {
             printf("Parity 4-token check   : %s\n", match_4 ? "PASSED [359, 253, 4028, 282]" : "FAILED");
         } else {
-            printf("Parity 4-token check   : SKIPPED (fewer than 4 steps requested: %zu)\n", steps);
+            printf("Parity 4-token check   : SKIPPED (Custom prompt or steps < 4)\n");
         }
 
-        if (steps >= 32) {
+        if (steps >= 32 && is_ref_prompt) {
             printf("Parity 32-token check  : %s\n", match_32 ? "PASSED (Exact match with Velox Rust CPU reference)" : "FAILED");
         } else {
-            printf("Parity 32-token check  : SKIPPED (fewer than 32 steps requested: %zu)\n", steps);
+            printf("Parity 32-token check  : SKIPPED (Custom prompt or steps < 32)\n");
         }
     }
     printf("================================================================================\n");
@@ -709,15 +712,15 @@ int main(int argc, char** argv) {
     if (last_err != cudaSuccess) {
         fprintf(stderr, "CUDA error detected: %s\n", cudaGetErrorString(last_err));
         exit_code = 1;
-    } else if (quant_mode == VELOX_QUANT_Q4_0) {
+    } else if (is_ref_prompt && quant_mode == VELOX_QUANT_Q4_0) {
         float delta = fabsf(step0_token_359_logit - 18.586565f);
         exit_code = (delta <= 0.03f) ? 0 : 2;
-    } else if (steps >= 32) {
+    } else if (is_ref_prompt && steps >= 32) {
         exit_code = (match_4 && match_32) ? 0 : 2;
-    } else if (steps >= 4) {
+    } else if (is_ref_prompt && steps >= 4) {
         exit_code = match_4 ? 0 : 2;
     } else {
-        exit_code = 0; // generation succeeded for steps < 4
+        exit_code = 0; // generation succeeded for custom prompts
     }
     return exit_code;
 }
