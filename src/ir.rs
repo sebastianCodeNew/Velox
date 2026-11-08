@@ -458,8 +458,16 @@ fn lower_model_to_vir(
         let mut alloc_reg = |name: &str, shape: Vec<usize>, dtype: ScalarType, tier: MemoryTier| -> VirReg {
             let id = reg_counter;
             reg_counter += 1;
+            // CUDA and C99 kernels always compute activations in float32 (4 bytes/elem).
+            // Force BumpSram register sizing to use at least 4 bytes/elem to match
+            // the actual kernel write footprint and prevent activation buffer aliasing.
+            let effective_byte_size = if tier == MemoryTier::BumpSram && dtype.byte_size() < 4.0 {
+                4.0
+            } else {
+                dtype.byte_size()
+            };
             let raw_bytes =
-                (shape.iter().product::<usize>() as f64 * dtype.byte_size()).ceil() as u64;
+                (shape.iter().product::<usize>() as f64 * effective_byte_size).ceil() as u64;
             let aligned_bytes = align_up_256(raw_bytes.max(256));
             let arena_offset = if let Some(&off) = offset_map.get(name) {
                 off
@@ -499,7 +507,7 @@ fn lower_model_to_vir(
             weight_name: w_embed.clone(),
         });
 
-        let eps = if model.name.contains("Qwen") {
+        let eps = if model.name.contains("Qwen") || model.name.contains("K2") || model.name.contains("Horizon") {
             1e-6
         } else {
             1e-5

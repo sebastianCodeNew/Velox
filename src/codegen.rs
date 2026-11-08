@@ -169,14 +169,20 @@ impl CodeGenerator {
         let _ = writeln!(out, "}}");
         let _ = writeln!(out);
 
-        // 3.2 RMSNorm
+        // 3.2 RMSNorm (Grouped RMSNorm support: 2 groups for dim=2560 K2-Horizon, 1 group otherwise)
         let _ = writeln!(out, "static inline void velox_c99_rmsnorm_f32(");
         let _ = writeln!(out, "    float* dst, const float* x, const float* weight, size_t dim, float eps");
         let _ = writeln!(out, ") {{");
-        let _ = writeln!(out, "    float ss = 0.0f;");
-        let _ = writeln!(out, "    for (size_t i = 0; i < dim; ++i) {{ ss += x[i] * x[i]; }}");
-        let _ = writeln!(out, "    float inv_rms = 1.0f / sqrtf((ss / (float)dim) + eps);");
-        let _ = writeln!(out, "    for (size_t i = 0; i < dim; ++i) {{ dst[i] = (x[i] * inv_rms) * weight[i]; }}");
+        let _ = writeln!(out, "    const size_t n_groups = (dim == 2560) ? 2 : 1;");
+        let _ = writeln!(out, "    const size_t grp_dim = dim / n_groups;");
+        let _ = writeln!(out, "    const float eff_eps = (dim == 2560 && eps > 1e-6f) ? 1e-6f : eps;");
+        let _ = writeln!(out, "    for (size_t g = 0; g < n_groups; ++g) {{");
+        let _ = writeln!(out, "        const size_t base = g * grp_dim;");
+        let _ = writeln!(out, "        float ss = 0.0f;");
+        let _ = writeln!(out, "        for (size_t i = 0; i < grp_dim; ++i) {{ float v = x[base + i]; ss += v * v; }}");
+        let _ = writeln!(out, "        float inv_rms = 1.0f / sqrtf((ss / (float)grp_dim) + eff_eps);");
+        let _ = writeln!(out, "        for (size_t i = 0; i < grp_dim; ++i) {{ dst[base + i] = (x[base + i] * inv_rms) * weight[base + i]; }}");
+        let _ = writeln!(out, "    }}");
         let _ = writeln!(out, "}}");
         let _ = writeln!(out);
 
@@ -429,9 +435,10 @@ impl CodeGenerator {
         let _ = writeln!(out, "    size_t layer, float eps");
         let _ = writeln!(out, ") {{");
         let _ = writeln!(out, "    const size_t dim = VELOX_MODEL_HIDDEN_DIM;");
+        let _ = writeln!(out, "    const size_t attn_dim = VELOX_MODEL_NUM_HEADS * VELOX_MODEL_HEAD_DIM;");
         let _ = writeln!(out, "    const size_t inter_dim = VELOX_MODEL_INTERMEDIATE_DIM;");
         let _ = writeln!(out, "    float mid[VELOX_MODEL_HIDDEN_DIM];");
-        let _ = writeln!(out, "    velox_c99_matmul_vec_f32(mid, attn_in, w_out + (layer * dim * dim), dim, dim);");
+        let _ = writeln!(out, "    velox_c99_matmul_vec_f32(mid, attn_in, w_out + (layer * dim * attn_dim), attn_dim, dim);");
         let _ = writeln!(out, "    for (size_t i = 0; i < dim; ++i) {{ mid[i] += residual_in[i]; }}");
         let _ = writeln!(out);
         let _ = writeln!(out, "    float norm_mid[VELOX_MODEL_HIDDEN_DIM];");
@@ -1107,28 +1114,35 @@ impl CodeGenerator {
         let _ = writeln!(out, "}}");
         let _ = writeln!(out);
 
-        // 1.2 RMSNorm kernel
+        // 1.2 RMSNorm kernel (Grouped RMSNorm support: 2 groups for dim=2560 K2-Horizon, 1 group otherwise)
         let _ = writeln!(out, "__global__ void __launch_bounds__(256) velox_cuda_rmsnorm_kernel(");
         let _ = writeln!(out, "    float* __restrict__ dst, const float* __restrict__ x, const float* __restrict__ weight,");
         let _ = writeln!(out, "    size_t dim, float eps, uint64_t active_mask");
         let _ = writeln!(out, ") {{");
-        let _ = writeln!(out, "    if ((active_mask & 1ULL) == 0ULL) return;");
+        let _ = writeln!(out, "    if ((active_mask & 1ULL) == 0ULL || blockIdx.x != 0) return;");
+        let _ = writeln!(out, "    const size_t n_groups = (dim == 2560ULL) ? 2ULL : 1ULL;");
+        let _ = writeln!(out, "    const size_t grp_dim = dim / n_groups;");
+        let _ = writeln!(out, "    const float eff_eps = (dim == 2560ULL && eps > 1e-6f) ? 1e-6f : eps;");
         let _ = writeln!(out, "    __shared__ float s_ss[256];");
         let _ = writeln!(out, "    size_t tid = threadIdx.x;");
-        let _ = writeln!(out, "    float local_ss = 0.0f;");
-        let _ = writeln!(out, "    for (size_t i = tid; i < dim; i += blockDim.x) {{");
-        let _ = writeln!(out, "        float v = x[i];");
-        let _ = writeln!(out, "        local_ss += v * v;");
-        let _ = writeln!(out, "    }}");
-        let _ = writeln!(out, "    s_ss[tid] = local_ss;");
-        let _ = writeln!(out, "    __syncthreads();");
-        let _ = writeln!(out, "    for (size_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {{");
-        let _ = writeln!(out, "        if (tid < stride) s_ss[tid] += s_ss[tid + stride];");
+        let _ = writeln!(out, "    for (size_t g = 0ULL; g < n_groups; ++g) {{");
+        let _ = writeln!(out, "        const size_t base = g * grp_dim;");
+        let _ = writeln!(out, "        float local_ss = 0.0f;");
+        let _ = writeln!(out, "        for (size_t i = tid; i < grp_dim; i += blockDim.x) {{");
+        let _ = writeln!(out, "            float v = x[base + i];");
+        let _ = writeln!(out, "            local_ss += v * v;");
+        let _ = writeln!(out, "        }}");
+        let _ = writeln!(out, "        s_ss[tid] = local_ss;");
         let _ = writeln!(out, "        __syncthreads();");
-        let _ = writeln!(out, "    }}");
-        let _ = writeln!(out, "    float inv_rms = rsqrtf((s_ss[0] / (float)dim) + eps);");
-        let _ = writeln!(out, "    for (size_t i = (size_t)blockIdx.x * blockDim.x + tid; i < dim; i += (size_t)gridDim.x * blockDim.x) {{");
-        let _ = writeln!(out, "        dst[i] = (x[i] * inv_rms) * weight[i];");
+        let _ = writeln!(out, "        for (size_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {{");
+        let _ = writeln!(out, "            if (tid < stride) s_ss[tid] += s_ss[tid + stride];");
+        let _ = writeln!(out, "            __syncthreads();");
+        let _ = writeln!(out, "        }}");
+        let _ = writeln!(out, "        float inv_rms = rsqrtf((s_ss[0] / (float)grp_dim) + eff_eps);");
+        let _ = writeln!(out, "        for (size_t i = tid; i < grp_dim; i += blockDim.x) {{");
+        let _ = writeln!(out, "            dst[base + i] = (x[base + i] * inv_rms) * weight[base + i];");
+        let _ = writeln!(out, "        }}");
+        let _ = writeln!(out, "        __syncthreads();");
         let _ = writeln!(out, "    }}");
         let _ = writeln!(out, "}}");
         let _ = writeln!(out);
@@ -1175,28 +1189,35 @@ impl CodeGenerator {
         let _ = writeln!(out, "    }}");
         let _ = writeln!(out, "}}");
         let _ = writeln!(out);
-        let _ = writeln!(out, "// 1.3b Dedicated Layer RMSNorm Kernel");
+        let _ = writeln!(out, "// 1.3b Dedicated Layer RMSNorm Kernel (Grouped RMSNorm support: 2 groups for dim=2560 K2-Horizon, 1 group otherwise)");
         let _ = writeln!(out, "__global__ void __launch_bounds__(256) velox_cuda_layer_norm_kernel(");
         let _ = writeln!(out, "    float* __restrict__ dst, const float* __restrict__ x, const float* __restrict__ weight,");
         let _ = writeln!(out, "    size_t dim, float eps, uint64_t active_mask");
         let _ = writeln!(out, ") {{");
         let _ = writeln!(out, "    if ((active_mask & 1ULL) == 0ULL) return;");
+        let _ = writeln!(out, "    const size_t n_groups = (dim == 2560ULL) ? 2ULL : 1ULL;");
+        let _ = writeln!(out, "    const size_t grp_dim = dim / n_groups;");
+        let _ = writeln!(out, "    const float eff_eps = (dim == 2560ULL && eps > 1e-6f) ? 1e-6f : eps;");
         let _ = writeln!(out, "    __shared__ float s_ss[256];");
         let _ = writeln!(out, "    size_t tid = threadIdx.x;");
-        let _ = writeln!(out, "    float local_ss = 0.0f;");
-        let _ = writeln!(out, "    for (size_t i = tid; i < dim; i += blockDim.x) {{");
-        let _ = writeln!(out, "        float v = x[i];");
-        let _ = writeln!(out, "        local_ss += v * v;");
-        let _ = writeln!(out, "    }}");
-        let _ = writeln!(out, "    s_ss[tid] = local_ss;");
-        let _ = writeln!(out, "    __syncthreads();");
-        let _ = writeln!(out, "    for (size_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {{");
-        let _ = writeln!(out, "        if (tid < stride) s_ss[tid] += s_ss[tid + stride];");
+        let _ = writeln!(out, "    for (size_t g = 0ULL; g < n_groups; ++g) {{");
+        let _ = writeln!(out, "        const size_t base = g * grp_dim;");
+        let _ = writeln!(out, "        float local_ss = 0.0f;");
+        let _ = writeln!(out, "        for (size_t i = tid; i < grp_dim; i += blockDim.x) {{");
+        let _ = writeln!(out, "            float v = x[base + i];");
+        let _ = writeln!(out, "            local_ss += v * v;");
+        let _ = writeln!(out, "        }}");
+        let _ = writeln!(out, "        s_ss[tid] = local_ss;");
         let _ = writeln!(out, "        __syncthreads();");
-        let _ = writeln!(out, "    }}");
-        let _ = writeln!(out, "    float inv_rms = rsqrtf((s_ss[0] / (float)dim) + eps);");
-        let _ = writeln!(out, "    for (size_t i = tid; i < dim; i += blockDim.x) {{");
-        let _ = writeln!(out, "        dst[i] = (x[i] * inv_rms) * weight[i];");
+        let _ = writeln!(out, "        for (size_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {{");
+        let _ = writeln!(out, "            if (tid < stride) s_ss[tid] += s_ss[tid + stride];");
+        let _ = writeln!(out, "            __syncthreads();");
+        let _ = writeln!(out, "        }}");
+        let _ = writeln!(out, "        float inv_rms = rsqrtf((s_ss[0] / (float)grp_dim) + eff_eps);");
+        let _ = writeln!(out, "        for (size_t i = tid; i < grp_dim; i += blockDim.x) {{");
+        let _ = writeln!(out, "            dst[base + i] = (x[base + i] * inv_rms) * weight[base + i];");
+        let _ = writeln!(out, "        }}");
+        let _ = writeln!(out, "        __syncthreads();");
         let _ = writeln!(out, "    }}");
         let _ = writeln!(out, "}}");
         let _ = writeln!(out);
@@ -1422,12 +1443,13 @@ impl CodeGenerator {
         let _ = writeln!(out, "    const size_t row = (size_t)blockIdx.x * 4ULL + warp_id;");
         let _ = writeln!(out);
         let _ = writeln!(out, "    const size_t dim = VELOX_HIDDEN_DIM;");
+        let _ = writeln!(out, "    const size_t attn_dim = VELOX_NUM_HEADS * VELOX_HEAD_DIM;");
         let _ = writeln!(out, "    if (row >= dim) return;");
         let _ = writeln!(out);
-        let _ = writeln!(out, "    const float* __restrict__ row_w = w_out + (layer * dim * dim) + (row * dim);");
+        let _ = writeln!(out, "    const float* __restrict__ row_w = w_out + (layer * dim * attn_dim) + (row * attn_dim);");
         let _ = writeln!(out, "    float acc = 0.0f;");
         let _ = writeln!(out);
-        let _ = writeln!(out, "    const size_t steps = dim / 128ULL;");
+        let _ = writeln!(out, "    const size_t steps = attn_dim / 128ULL;");
         let _ = writeln!(out, "    for (size_t s = 0; s < steps; ++s) {{");
         let _ = writeln!(out, "        const size_t k_offset = s * 128ULL + (lane_id * 4ULL);");
         let _ = writeln!(out, "        const float4 w_v = *reinterpret_cast<const float4*>(&row_w[k_offset]);");
@@ -1436,7 +1458,7 @@ impl CodeGenerator {
         let _ = writeln!(out, "    }}");
         let _ = writeln!(out);
         let _ = writeln!(out, "    const size_t tail_start = steps * 128ULL;");
-        let _ = writeln!(out, "    const size_t remaining_floats = dim - tail_start;");
+        let _ = writeln!(out, "    const size_t remaining_floats = attn_dim - tail_start;");
         let _ = writeln!(out, "    const size_t remaining_f4 = remaining_floats / 4ULL;");
         let _ = writeln!(out, "    if (lane_id < remaining_f4) {{");
         let _ = writeln!(out, "        const size_t k_offset = tail_start + (lane_id * 4ULL);");
@@ -1893,9 +1915,10 @@ impl CodeGenerator {
         let _ = writeln!(out, "    if ((active_mask & 1ULL) == 0ULL) return;");
         let _ = writeln!(out, "    if (blockIdx.x > 0) return;");
         let _ = writeln!(out, "    const size_t dim = VELOX_HIDDEN_DIM;");
+        let _ = writeln!(out, "    const size_t attn_dim = VELOX_NUM_HEADS * VELOX_HEAD_DIM;");
         let _ = writeln!(out, "    const size_t inter_dim = VELOX_INTERMEDIATE_DIM;");
         let _ = writeln!(out, "    size_t tid = threadIdx.x;");
-        let _ = writeln!(out, "    const float* l_wout = w_out + (layer * dim * dim);");
+        let _ = writeln!(out, "    const float* l_wout = w_out + (layer * dim * attn_dim);");
         let _ = writeln!(out, "    const float* l_wpost = w_post_norm + (layer * dim);");
         let _ = writeln!(out, "    const float* l_wgate = w_gate + (layer * inter_dim * dim);");
         let _ = writeln!(out, "    const float* l_wup = w_up + (layer * inter_dim * dim);");
@@ -1903,9 +1926,9 @@ impl CodeGenerator {
         let _ = writeln!(out);
         let _ = writeln!(out, "    // 1. Compute mid[o] = attn_in @ w_out[o] + residual_in[o] into dst_hidden[o]");
         let _ = writeln!(out, "    for (size_t o = tid; o < dim; o += blockDim.x) {{");
-        let _ = writeln!(out, "        const float* row = l_wout + (o * dim);");
+        let _ = writeln!(out, "        const float* row = l_wout + (o * attn_dim);");
         let _ = writeln!(out, "        float acc = 0.0f;");
-        let _ = writeln!(out, "        for (size_t k = 0; k < dim; ++k) {{");
+        let _ = writeln!(out, "        for (size_t k = 0; k < attn_dim; ++k) {{");
         let _ = writeln!(out, "            acc += attn_in[k] * row[k];");
         let _ = writeln!(out, "        }}");
         let _ = writeln!(out, "        dst_hidden[o] = acc + residual_in[o];");
@@ -2477,8 +2500,9 @@ impl CodeGenerator {
         let _ = writeln!(out, "    const size_t lane_id = threadIdx.x % 32;");
         let _ = writeln!(out, "    const size_t row = (size_t)blockIdx.x * 4ULL + warp_id;");
         let _ = writeln!(out, "    const size_t dim = VELOX_HIDDEN_DIM;");
+        let _ = writeln!(out, "    const size_t attn_dim = VELOX_NUM_HEADS * VELOX_HEAD_DIM;");
         let _ = writeln!(out, "    if (row >= dim) return;");
-        let _ = writeln!(out, "    float acc = velox_warp_dot_f16(w_out + (layer * dim * dim) + (row * dim), attn_in, dim, lane_id);");
+        let _ = writeln!(out, "    float acc = velox_warp_dot_f16(w_out + (layer * dim * attn_dim) + (row * attn_dim), attn_in, attn_dim, lane_id);");
         let _ = writeln!(out, "    if (lane_id == 0) dst_hidden[row] = acc + residual_in[row];");
         let _ = writeln!(out, "}}");
         let _ = writeln!(out);
@@ -2488,9 +2512,10 @@ impl CodeGenerator {
         let _ = writeln!(out, "    const size_t lane_id = threadIdx.x % 32;");
         let _ = writeln!(out, "    const size_t row = (size_t)blockIdx.x * 4ULL + warp_id;");
         let _ = writeln!(out, "    const size_t dim = VELOX_HIDDEN_DIM;");
+        let _ = writeln!(out, "    const size_t attn_dim = VELOX_NUM_HEADS * VELOX_HEAD_DIM;");
         let _ = writeln!(out, "    if (row >= dim) return;");
-        let _ = writeln!(out, "    size_t off = (layer * dim * dim) + (row * dim);");
-        let _ = writeln!(out, "    float acc = velox_warp_dot_q4(w_out + (off >> 3), s_out + (off >> 6), attn_in, dim, lane_id);");
+        let _ = writeln!(out, "    size_t off = (layer * dim * attn_dim) + (row * attn_dim);");
+        let _ = writeln!(out, "    float acc = velox_warp_dot_q4(w_out + (off >> 3), s_out + (off >> 6), attn_in, attn_dim, lane_id);");
         let _ = writeln!(out, "    if (lane_id == 0) dst_hidden[row] = acc + residual_in[row];");
         let _ = writeln!(out, "}}");
         let _ = writeln!(out);
@@ -2790,7 +2815,7 @@ impl CodeGenerator {
                             };
                             let _ = writeln!(
                                 out,
-                                "    velox_cuda_rmsnorm_kernel<<<grid, block, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_NORM_PTR(ctx, {}ULL), VELOX_HIDDEN_DIM, {:.6}f, active_mask);",
+                                "    velox_cuda_rmsnorm_kernel<<<dim3(1), dim3(256), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, {}ULL), VELOX_DEV_NORM_PTR(ctx, {}ULL), VELOX_HIDDEN_DIM, {:.6}f, active_mask);",
                                 dst_offset,
                                 input.arena_offset,
                                 w_offset(weight_name),

@@ -1611,7 +1611,15 @@ impl SemanticAnalyzer {
             let elems: u64 = concrete_shape
                 .iter()
                 .fold(1u64, |acc, &d| acc.saturating_mul(d.max(1) as u64));
-            let size_bytes = (elems as f64 * dtype.byte_size()).ceil() as u64;
+            // CUDA and C99 kernels always compute activations in float32 (4 bytes/elem).
+            // Force BumpSram activation sizing to use at least 4 bytes/elem to prevent
+            // buffer aliasing in the Static Memory Planner's interval graph coloring.
+            let effective_byte_size = if *tier == MemoryTier::BumpSram && dtype.byte_size() < 4.0 {
+                4.0
+            } else {
+                dtype.byte_size()
+            };
+            let size_bytes = (elems as f64 * effective_byte_size).ceil() as u64;
             let id = activations.len();
             activations.push(TypedActivation {
                 id,

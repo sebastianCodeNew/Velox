@@ -32,6 +32,9 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 
+# External baseline toolchains (llama.cpp reference binaries, 1.9 GB)
+/tools/
+
 # Benchmark & GPU harness outputs
 /bench/results/raw/
 /gpu/build/

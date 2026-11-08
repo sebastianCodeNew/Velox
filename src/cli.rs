@@ -1297,12 +1297,16 @@ fn execute_compilation(
         };
 
         // Resolve prompt token sequence
+        // Resolve execution backend and model family
+        let is_k2 = first_model.name.contains("K2") || first_model.name.contains("Horizon");
+
         let prompt_tokens = if let Some(ref prompt_text) = cli_args.prompt_text {
             if let Some(ref tok) = tokenizer_opt {
                 let mut enc = tok.encode(prompt_text);
-                // Prepend chat start token 1 if not present and prompt doesn't start with special tag
-                if !enc.starts_with(&[1]) && !prompt_text.starts_with("<|") {
-                    enc.insert(0, 1);
+                let bos_tok = if is_k2 { 0u32 } else { 1u32 };
+                // Prepend model-appropriate BOS token (0 for K2, 1 for LLaMA/SmolLM) if not present
+                if !enc.starts_with(&[bos_tok]) && (!prompt_text.starts_with("<|") || is_k2) {
+                    enc.insert(0, bos_tok);
                 }
                 enc
             } else {
@@ -1316,8 +1320,6 @@ fn execute_compilation(
             cli_args.prompt_tokens.clone()
         };
 
-        // Resolve execution backend
-        let is_k2 = first_model.name.contains("K2") || first_model.name.contains("Horizon");
         let effective_backend = match cli_args.backend {
             ExecutionBackend::Auto => {
                 let cuda_target = if is_k2 { "velox_cuda_runner_k2.exe" } else { "velox_cuda_runner.exe" };
@@ -1415,14 +1417,15 @@ fn execute_compilation(
                 let prompt_str = if trimmed.starts_with("def ") || trimmed.starts_with("fn ") || trimmed.starts_with("class ") || trimmed.starts_with("struct ") {
                     trimmed.to_string()
                 } else if is_k2 {
-                    format!("<|ifm|im_start|>user\n{}<|ifm|im_end|>\n<|ifm|im_start|>assistant\n", trimmed)
+                    format!("<|ifm|im_start|>user\n{}<|ifm|im_end|>\n<|ifm|im_start|>assistant\n<ifm|think>\n", trimmed)
                 } else {
                     format!("USER: {}\nASSISTANT: ", trimmed)
                 };
 
                 let mut turn_tokens = tok.encode(&prompt_str);
-                if !turn_tokens.starts_with(&[1]) && !prompt_str.starts_with("<|") {
-                    turn_tokens.insert(0, 1);
+                let bos_tok = if is_k2 { 0u32 } else { 1u32 };
+                if !turn_tokens.starts_with(&[bos_tok]) && (!prompt_str.starts_with("<|") || is_k2) {
+                    turn_tokens.insert(0, bos_tok);
                 }
 
                 let _ = write!(stdout, "\n\x1b[1;32mvelox-assistant> \x1b[0m");

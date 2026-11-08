@@ -62,7 +62,7 @@ model K2_Horizon_3_7B<
         let mut h = embed(tokens, w_embed);
 
         for l in 0..NUM_LAYERS {
-            let norm_x = rmsnorm(h, w_input_norm[l], eps = 1e-5);
+            let norm_x = rmsnorm(h, w_input_norm[l], eps = 1e-6);
             let (q, k, v) = qkv_proj(norm_x, w_q[l], w_k[l], w_v[l]);
             let q_rot = rope(q, 0);
             let k_rot = rope(k, 0);
@@ -70,11 +70,11 @@ model K2_Horizon_3_7B<
             let attn_context = gqa_attention(q_rot, k_rot, v, &mut kv_cache, l);
             h += attn_context @ w_o[l];
 
-            let mlp_norm = rmsnorm(h, w_post_norm[l], eps = 1e-5);
+            let mlp_norm = rmsnorm(h, w_post_norm[l], eps = 1e-6);
             h += swiglu(mlp_norm, w_gate[l], w_up[l], w_down[l]);
         }
 
-        let out_norm = rmsnorm(h, w_norm, eps = 1e-5);
+        let out_norm = rmsnorm(h, w_norm, eps = 1e-6);
         let final_logits = lm_head(out_norm[:, S - 1, :], w_lm_head);
         return sample_argmax(final_logits);
     }
@@ -87,7 +87,7 @@ model K2_Horizon_3_7B<
         let mut h = embed(next_token, w_embed);
 
         for l in 0..NUM_LAYERS {
-            let norm_x = rmsnorm(h, w_input_norm[l], eps = 1e-5);
+            let norm_x = rmsnorm(h, w_input_norm[l], eps = 1e-6);
             let (q, k, v) = qkv_proj(norm_x, w_q[l], w_k[l], w_v[l]);
             let q_rot = rope(q, step);
             let k_rot = rope(k, step);
@@ -98,11 +98,11 @@ model K2_Horizon_3_7B<
             let attn_context = gqa_attention(q_rot, &kv_cache, l);
             h += attn_context @ w_o[l];
 
-            let mlp_norm = rmsnorm(h, w_post_norm[l], eps = 1e-5);
+            let mlp_norm = rmsnorm(h, w_post_norm[l], eps = 1e-6);
             h += swiglu(mlp_norm, w_gate[l], w_up[l], w_down[l]);
         }
 
-        let out_norm = rmsnorm(h, w_norm, eps = 1e-5);
+        let out_norm = rmsnorm(h, w_norm, eps = 1e-6);
         let final_logits = lm_head(out_norm, w_lm_head);
         return sample_argmax(final_logits);
     }
