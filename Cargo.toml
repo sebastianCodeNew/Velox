@@ -22,3 +22,4 @@ strip = false
 
 [dependencies]
 # Zero external dependencies (std only)
+half = "2"

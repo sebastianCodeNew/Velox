@@ -193,6 +193,31 @@ fn extract_all_registers(module: &VirModule) -> Vec<VirReg> {
                         regs.push(attn_in.clone());
                         regs.push(residual_in.clone());
                     }
+                    VirInst::FlashAttn3Fp8 { dst_attn, q, k, v, q_scale, k_scale, v_scale, .. } => {
+                        regs.push(dst_attn.clone());
+                        regs.push(q.clone());
+                        regs.push(k.clone());
+                        regs.push(v.clone());
+                        regs.push(q_scale.clone());
+                        regs.push(k_scale.clone());
+                        regs.push(v_scale.clone());
+                    }
+                    VirInst::PersistentGemm { dst, a, b, .. } => {
+                        regs.push(dst.clone());
+                        regs.push(a.clone());
+                        regs.push(b.clone());
+                    }
+                    VirInst::StrataFluxFetch { dst_high_precision, src_low_precision, scale, token_ids, .. } => {
+                        regs.push(dst_high_precision.clone());
+                        regs.push(src_low_precision.clone());
+                        regs.push(scale.clone());
+                        regs.push(token_ids.clone());
+                    }
+                    VirInst::StrataFluxRefine { dst_refined, base_low_precision, refinement } => {
+                        regs.push(dst_refined.clone());
+                        regs.push(base_low_precision.clone());
+                        regs.push(refinement.clone());
+                    }
                 }
             }
             if let VirTerminator::Return(Some(reg)) = &bb.terminator {

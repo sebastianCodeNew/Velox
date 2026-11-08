@@ -1613,3 +1613,17 @@ mod tests {
     }
 }
 
+
+// SOTA 2026 runtime components (in separate module)
+pub use crate::runtime_sota::{
+    StrataFluxConfig, StrataFluxStreamer,
+    PersistentKernelScheduler, PersistentWorkItem,
+    FlashCommConfig, ReadinessEncoding, FlashCommProtocol, FlashComm, ReduceOp,
+    VExpertConfig, VExpert,
+    FastAFDConfig, FastAFD,
+    FlashAttn3FP8Config, FlashAttn3FP8Launch,
+    LoopDuetConfig, LoopDuetScheduler,
+    CharmConfig, CharmMerger,
+    TieredInferenceConfig, TieredInferenceRouter, InferenceTier,
+};
+

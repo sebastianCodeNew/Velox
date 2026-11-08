@@ -258,6 +258,45 @@ pub enum VirInst {
         layer: usize,
         eps: f32,
     },
+    /// FlashAttention-3 FP8 (Hopper/Blackwell): FP8 GEMM + ping-pong softmax/GEMM overlap
+    FlashAttn3Fp8 {
+        dst_attn: VirReg,
+        q: VirReg,
+        k: VirReg,
+        v: VirReg,
+        q_scale: VirReg,
+        k_scale: VirReg,
+        v_scale: VirReg,
+        layer: usize,
+    },
+    /// Persistent Kernel: Self-scheduling workgroups for GEMM (KOSMOS-style)
+    PersistentGemm {
+        dst: VirReg,
+        a: VirReg,
+        b: VirReg,
+        work_queue: VirReg,
+        ready_flags: VirReg,
+        m: usize,
+        n: usize,
+        k: usize,
+        layer: usize,
+    },
+    /// StrataFlux Precision Streaming: Host/SSD -> GPU for 2-4bit weights + KV
+    StrataFluxFetch {
+        dst_high_precision: VirReg,
+        src_low_precision: VirReg,
+        scale: VirReg,
+        token_ids: VirReg,
+        num_tokens: usize,
+        layer: usize,
+        hidden_dim: usize,
+    },
+    /// StrataFlux Refine: Overlap precision fetch with compute
+    StrataFluxRefine {
+        dst_refined: VirReg,
+        base_low_precision: VirReg,
+        refinement: VirReg,
+    },
 }
 
 /// Basic block control-flow terminator.

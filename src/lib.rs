@@ -17,6 +17,7 @@ pub mod memory_planner;
 pub mod optimizer;
 pub mod parser;
 pub mod runtime;
+pub mod runtime_sota;
 pub mod sema;
 pub mod tokenizer;
 pub mod tokens;
@@ -60,6 +61,15 @@ pub use runtime::{
     gqa_attention_step_f32, matmul_transposed_f32, rmsnorm_f32, rope_rotate_half_in_place_f32,
     sample_argmax_f32, sample_top_p_f32, swiglu_mlp_residual_f32, MmapSafetensors, SafetensorEntry,
     TransformerConfig, VeloxStaticExecutionEngine,
+    StrataFluxConfig, StrataFluxStreamer,
+    PersistentKernelScheduler, PersistentWorkItem,
+    FlashCommConfig, ReadinessEncoding, FlashCommProtocol, FlashComm, ReduceOp,
+    VExpertConfig, VExpert,
+    FastAFDConfig, FastAFD,
+    FlashAttn3FP8Config, FlashAttn3FP8Launch,
+    LoopDuetConfig, LoopDuetScheduler,
+    CharmConfig, CharmMerger,
+    TieredInferenceConfig, TieredInferenceRouter, InferenceTier,
 };
 pub use sema::{
     EvaluatedType, FourierMotzkinSolver, SemanticAnalyzer, SymbolicDim, TypedActivation,
