@@ -94,6 +94,30 @@ impl ExecutionBackend {
     }
 }
 
+/// Speculative decoding options forwarded to the standalone CUDA runner.
+/// Semantics mirror the runner's own argv exactly (pure passthrough):
+/// `--speculative` enables prompt-lookup drafting; `--draft-len` sizes it and
+/// does NOT enable it on its own; `--spec-ema` sets the adaptive EMA floor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpecOptions {
+    /// Enable prompt-lookup speculative decoding in the external runner.
+    pub speculative: bool,
+    /// Maximum draft length K in 1..=7 (K+1 tokens verified per step).
+    pub draft_len: Option<u32>,
+    /// Adaptive acceptance EMA floor in 0.0..=1.0 below which drafting pauses.
+    pub spec_ema: Option<f32>,
+}
+
+impl Default for SpecOptions {
+    fn default() -> Self {
+        Self {
+            speculative: false,
+            draft_len: None,
+            spec_ema: None,
+        }
+    }
+}
+
 /// Parsed command-line flags and positional options.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CliArgs {
@@ -113,6 +137,7 @@ pub struct CliArgs {
     pub prompt_text: Option<String>,
     pub prompt_tokens: Vec<u32>,
     pub steps: usize,
+    pub spec: SpecOptions,
     pub benchmark: bool,
     pub warmup: usize,
     pub threads: Option<usize>,
@@ -141,6 +166,7 @@ impl Default for CliArgs {
             prompt_text: None,
             prompt_tokens: vec![1, 504, 346],
             steps: 32,
+            spec: SpecOptions::default(),
             benchmark: false,
             warmup: 0,
             threads: None,
@@ -339,6 +365,103 @@ pub fn parse_cli_args(raw_args: &[String]) -> Result<CliAction, String> {
                 .parse::<usize>()
                 .map_err(|_| format!("error: invalid integer for --steps: '{steps_str}'"))?;
             idx += 1;
+        } else if arg == "--speculative" {
+            cli_args.spec.speculative = true;
+            // Optional numeric draft width, mirroring the runner's argv:
+            // "--speculative K". Consume the next token only when it parses
+            // as an integer so "veloxc --speculative model.vlx" still treats
+            // model.vlx as the required positional input file.
+            if idx + 1 < args.len() && !args[idx + 1].starts_with('-') {
+                if let Ok(k) = args[idx + 1].parse::<u32>() {
+                    if (1u32..=7u32).contains(&k) {
+                        cli_args.spec.draft_len = Some(k);
+                        idx += 1;
+                    } else {
+                        return Err(format!(
+                            "error: draft length for --speculative must be in the range 1-7: {k}"
+                        ));
+                    }
+                }
+            }
+            idx += 1;
+        } else if let Some(k_str) = arg.strip_prefix("--speculative=") {
+            match k_str.parse::<u32>() {
+                Ok(k) if (1u32..=7u32).contains(&k) => {
+                    cli_args.spec.speculative = true;
+                    cli_args.spec.draft_len = Some(k);
+                }
+                Ok(k) => {
+                    return Err(format!(
+                        "error: draft length for --speculative must be in the range 1-7: {k}"
+                    ));
+                }
+                Err(_) => {
+                    return Err(format!("error: invalid draft length for --speculative: '{k_str}'"));
+                }
+            }
+            idx += 1;
+        } else if arg == "--draft-len" {
+            if idx + 1 >= args.len() {
+                return Err("error: flag '--draft-len' requires an integer argument (1-7)".to_string());
+            }
+            match args[idx + 1].parse::<u32>() {
+                Ok(k) if (1u32..=7u32).contains(&k) => {
+                    cli_args.spec.draft_len = Some(k);
+                }
+                Ok(k) => {
+                    return Err(format!("error: draft length must be in the range 1-7: {k}"));
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "error: invalid integer for --draft-len: '{}'",
+                        args[idx + 1]
+                    ));
+                }
+            }
+            idx += 2;
+        } else if let Some(k_str) = arg.strip_prefix("--draft-len=") {
+            match k_str.parse::<u32>() {
+                Ok(k) if (1u32..=7u32).contains(&k) => {
+                    cli_args.spec.draft_len = Some(k);
+                }
+                Ok(k) => {
+                    return Err(format!("error: draft length must be in the range 1-7: {k}"));
+                }
+                Err(_) => {
+                    return Err(format!("error: invalid integer for --draft-len: '{k_str}'"));
+                }
+            }
+            idx += 1;
+        } else if arg == "--spec-ema" {
+            if idx + 1 >= args.len() {
+                return Err("error: flag '--spec-ema' requires a numeric argument (0.0-1.0)".to_string());
+            }
+            let e_str = &args[idx + 1];
+            match e_str.parse::<f32>() {
+                Ok(e) if e.is_finite() && (0.0f32..=1.0f32).contains(&e) => {
+                    cli_args.spec.spec_ema = Some(e);
+                }
+                Ok(e) => {
+                    return Err(format!("error: EMA floor for --spec-ema must be in 0.0-1.0: {e}"));
+                }
+                Err(_) => {
+                    return Err(format!("error: invalid float for --spec-ema: '{e_str}'"));
+                }
+            }
+            idx += 2;
+        } else if let Some(e_str) = arg.strip_prefix("--spec-ema=") {
+            match e_str.parse::<f32>() {
+                Ok(e) if e.is_finite() && (0.0f32..=1.0f32).contains(&e) => {
+                    cli_args.spec.spec_ema = Some(e);
+                }
+                Ok(e) => {
+                    return Err(format!("error: EMA floor for --spec-ema must be in 0.0-1.0: {e}"));
+                }
+                Err(_) => {
+                    return Err(format!("error: invalid float for --spec-ema: '{e_str}'"));
+                }
+            }
+            idx += 1;
         } else if arg == "--format" {
             if idx + 1 >= args.len() {
                 return Err("error: flag '--format' requires an argument (choose from 'text', 'json')".to_string());
@@ -447,6 +570,9 @@ options:
   --tokens <ids>         Comma-separated input prompt token IDs for --run.
   --prompt-tokens <ids>  Alias for --tokens.
   --steps <N>            Number of tokens to generate during --run (default: 32).
+  --speculative [K]      Enable prompt-lookup speculative decoding (CUDA runner; optional draft width, default K=3).
+  --draft-len <K>        Set the max speculative draft length 1-7 (used with --speculative).
+  --spec-ema <x>         Adaptive drafting: EMA acceptance floor 0.0-1.0 below which drafting pauses (default: 0.20).
   --weights <path>       Override path to .safetensors weights file for --run.
   --tokenizer <path>     Path to tokenizer.json (default: tokenizer.json).
   --benchmark            Print detailed inference latency, throughput, and allocations.
@@ -516,6 +642,7 @@ pub fn run_external_runner(
     weights_path: &str,
     prompt_tokens: &[u32],
     steps: usize,
+    spec: SpecOptions,
     threads_opt: Option<usize>,
     mut streaming_decoder_opt: Option<StreamingDecoder>,
     verbose: bool,
@@ -534,6 +661,18 @@ pub fn run_external_runner(
     cmd.arg("--tokens").arg(&tokens_str);
     cmd.arg("--steps").arg(steps.to_string());
     cmd.arg("--verbose");
+
+    // Speculative-decoding passthrough (mirrors the runner's raw argv
+    // semantics: --speculative enables, --draft-len sizes, --spec-ema floors).
+    if spec.speculative {
+        cmd.arg("--speculative");
+    }
+    if let Some(draft_len) = spec.draft_len {
+        cmd.arg("--draft-len").arg(draft_len.to_string());
+    }
+    if let Some(spec_ema) = spec.spec_ema {
+        cmd.arg("--spec-ema").arg(spec_ema.to_string());
+    }
 
     if runner_path.to_string_lossy().contains("k2") {
         cmd.arg("--context-len").arg("16384");
@@ -1438,6 +1577,7 @@ fn execute_compilation(
                         &weights_file,
                         &turn_tokens,
                         cli_args.steps,
+                        cli_args.spec,
                         cli_args.threads,
                         Some(streaming_decoder),
                         false,
@@ -1453,6 +1593,15 @@ fn execute_compilation(
 
         // Multi-backend dispatch: External Standalone Runner (CUDA / C99)
         if effective_backend == ExecutionBackend::Cuda || effective_backend == ExecutionBackend::C99 {
+            // Speculative drafting is only implemented in the K2 CUDA runner's
+            // verify path; warn instead of silently swallowing the flags.
+            if cli_args.spec.speculative && is_k2 && effective_backend != ExecutionBackend::Cuda {
+                let _ = writeln!(
+                    stderr,
+                    "veloxc: warning: --speculative requires the CUDA backend; the {:?} backend ignores it.",
+                    effective_backend
+                );
+            }
             let runner_path = match find_runner_binary(runner_name) {
                 Some(p) => p,
                 None => {
@@ -1472,6 +1621,7 @@ fn execute_compilation(
                 &weights_file,
                 &prompt_tokens,
                 cli_args.steps,
+                cli_args.spec,
                 cli_args.threads,
                 streaming_decoder_opt,
                 cli_args.verbose,
@@ -1845,6 +1995,134 @@ mod tests {
                 assert_eq!(cli.warmup, 1);
                 assert_eq!(cli.threads, Some(8));
                 assert_eq!(cli.input_file, "examples/tinystories_smollm.vlx");
+            }
+            other => panic!("Unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_speculative_options() {
+        let args = vec![
+            "--run".to_string(),
+            "--backend".to_string(),
+            "cuda".to_string(),
+            "--speculative".to_string(),
+            "--spec-ema".to_string(),
+            "0.35".to_string(),
+            "model.vlx".to_string(),
+        ];
+        match parse_cli_args(&args) {
+            Ok(CliAction::Run(cli)) => {
+                assert!(cli.spec.speculative);
+                assert_eq!(cli.spec.draft_len, None);
+                assert_eq!(cli.spec.spec_ema, Some(0.35));
+            }
+            other => panic!("Unexpected action: {other:?}"),
+        }
+
+        let args_k = vec![
+            "--run".to_string(),
+            "--backend=cuda".to_string(),
+            "--speculative=5".to_string(),
+            "model.vlx".to_string(),
+        ];
+        match parse_cli_args(&args_k) {
+            Ok(CliAction::Run(cli)) => {
+                assert!(cli.spec.speculative);
+                assert_eq!(cli.spec.draft_len, Some(5));
+                assert_eq!(cli.spec.spec_ema, None);
+            }
+            other => panic!("Unexpected action: {other:?}"),
+        }
+
+        // --draft-len is a pure width selector and does not enable drafting.
+        let args_len = vec![
+            "--run".to_string(),
+            "--backend=cuda".to_string(),
+            "--draft-len".to_string(),
+            "7".to_string(),
+            "model.vlx".to_string(),
+        ];
+        match parse_cli_args(&args_len) {
+            Ok(CliAction::Run(cli)) => {
+                assert!(!cli.spec.speculative);
+                assert_eq!(cli.spec.draft_len, Some(7));
+            }
+            other => panic!("Unexpected action: {other:?}"),
+        }
+
+        // Validation boundaries: draft width, EMA floor, and error paths.
+        assert!(parse_cli_args(&["--run".to_string(), "--speculative".to_string(), "0".to_string(), "model.vlx".to_string()]).is_err());
+        assert!(parse_cli_args(&["--run".to_string(), "--speculative".to_string(), "8".to_string(), "model.vlx".to_string()]).is_err());
+        assert!(parse_cli_args(&["--run".to_string(), "--draft-len".to_string(), "9".to_string(), "model.vlx".to_string()]).is_err());
+        assert!(parse_cli_args(&["--run".to_string(), "--draft-len".to_string(), "model.vlx".to_string()]).is_err());
+        assert!(parse_cli_args(&["--run".to_string(), "--spec-ema".to_string(), "1.5".to_string(), "model.vlx".to_string()]).is_err());
+        assert!(parse_cli_args(&["--run".to_string(), "--spec-ema".to_string(), "-0.1".to_string(), "model.vlx".to_string()]).is_err());
+        assert!(parse_cli_args(&["--run".to_string(), "--spec-ema".to_string(), "abc".to_string(), "model.vlx".to_string()]).is_err());
+        assert!(parse_cli_args(&["--run".to_string(), "--spec-ema".to_string(), "model.vlx".to_string()]).is_err());
+
+        // Boundary successes: K=1, K=7, EMA floors 0.0 and 1.0.
+        let args_bounds = vec![
+            "--run".to_string(),
+            "--backend=cuda".to_string(),
+            "--speculative".to_string(),
+            "1".to_string(),
+            "--draft-len=7".to_string(),
+            "--spec-ema=1.0".to_string(),
+            "model.vlx".to_string(),
+        ];
+        match parse_cli_args(&args_bounds) {
+            Ok(CliAction::Run(cli)) => {
+                assert!(cli.spec.speculative);
+                assert_eq!(cli.spec.draft_len, Some(7));
+                assert_eq!(cli.spec.spec_ema, Some(1.0));
+            }
+            other => panic!("Unexpected action: {other:?}"),
+        }
+
+        let args_zero = vec![
+            "--run".to_string(),
+            "--backend=cuda".to_string(),
+            "--spec-ema=0.0".to_string(),
+            "model.vlx".to_string(),
+        ];
+        match parse_cli_args(&args_zero) {
+            Ok(CliAction::Run(cli)) => {
+                assert_eq!(cli.spec.spec_ema, Some(0.0));
+            }
+            other => panic!("Unexpected action: {other:?}"),
+        }
+
+        // Optional numeric is not consumed when the next token is the
+        // positional input file or another flag.
+        let args_fallthrough = vec![
+            "--run".to_string(),
+            "--backend=cuda".to_string(),
+            "--speculative".to_string(),
+            "model.vlx".to_string(),
+        ];
+        match parse_cli_args(&args_fallthrough) {
+            Ok(CliAction::Run(cli)) => {
+                assert!(cli.spec.speculative);
+                assert_eq!(cli.spec.draft_len, None);
+                assert_eq!(cli.input_file, "model.vlx");
+            }
+            other => panic!("Unexpected action: {other:?}"),
+        }
+
+        let args_flag_next = vec![
+            "--run".to_string(),
+            "--backend=cuda".to_string(),
+            "--speculative".to_string(),
+            "--spec-ema".to_string(),
+            "0.2".to_string(),
+            "model.vlx".to_string(),
+        ];
+        match parse_cli_args(&args_flag_next) {
+            Ok(CliAction::Run(cli)) => {
+                assert!(cli.spec.speculative);
+                assert_eq!(cli.spec.draft_len, None);
+                assert_eq!(cli.spec.spec_ema, Some(0.2));
             }
             other => panic!("Unexpected action: {other:?}"),
         }
