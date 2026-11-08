@@ -2507,7 +2507,19 @@ impl SemanticAnalyzer {
                     }
                 }
                 "lm_head" => {
-                    let vocab = consts.get("VOCAB").copied().unwrap_or(250624);
+                    let vocab = consts
+                        .get("VOCAB")
+                        .copied()
+                        .or_else(|| {
+                            arg_types.get(1).and_then(|t| match t {
+                                EvaluatedType::Tensor { shape, .. } => shape.last().and_then(|d| match d {
+                                    SymbolicDim::Concrete(v) => Some(*v),
+                                    _ => None,
+                                }),
+                                _ => None,
+                            })
+                        })
+                        .unwrap_or(250624);
                     if let Some(EvaluatedType::Tensor { shape, .. }) = arg_types.first() {
                         let b_dim = shape.first().cloned().unwrap_or(SymbolicDim::Concrete(1));
                         EvaluatedType::Tensor {

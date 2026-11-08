@@ -395,6 +395,12 @@ fn lower_model_to_vir(
         .copied()
         .unwrap_or(hidden_dim * 4);
     let vocab = model.constants.get("VOCAB").copied().unwrap_or(49152);
+    let rope_theta = model
+        .constants
+        .get("ROPE_THETA")
+        .copied()
+        .map(|v| v as f32)
+        .unwrap_or(10000.0);
 
     // Identify canonical weight names from model declarations
     let find_weight = |candidates: &[&str], fallback: &str| -> String {
@@ -682,12 +688,12 @@ fn lower_model_to_vir(
                 insts.push(VirInst::RoPE {
                     dst: q_reg.clone(),
                     input: q_reg.clone(),
-                    theta: 10000.0,
+                    theta: rope_theta,
                 });
                 insts.push(VirInst::RoPE {
                     dst: k_reg.clone(),
                     input: k_reg.clone(),
-                    theta: 10000.0,
+                    theta: rope_theta,
                 });
 
                 let attn_out = alloc_reg(

@@ -1035,10 +1035,29 @@ impl CodeGenerator {
         let _ = writeln!(out, "    uint32_t reserved;");
         let _ = writeln!(out, "}} VeloxDecodeState;");
         let _ = writeln!(out);
-        let _ = writeln!(out, "#define VELOX_W_NORM_START_FP32              537919488ULL");
-        let _ = writeln!(out, "#define VELOX_W_HEAD_START_FP32              538060032ULL");
+        let w_norm_start = module
+            .memory_plan
+            .weight_offsets
+            .iter()
+            .find(|w| matches!(w.name.as_str(), "w_attn_norm" | "w_input_norm" | "w_norm"))
+            .map(|w| w.offset_bytes)
+            .unwrap_or(537919488);
+        let w_head_start = module
+            .memory_plan
+            .weight_offsets
+            .iter()
+            .find(|w| matches!(w.name.as_str(), "w_head" | "w_lm_head"))
+            .map(|w| w.offset_bytes)
+            .unwrap_or(538060032);
+
+        let _ = writeln!(out, "#define VELOX_W_NORM_START_FP32              {}ULL", w_norm_start);
+        let _ = writeln!(out, "#define VELOX_W_HEAD_START_FP32              {}ULL", w_head_start);
         let _ = writeln!(out, "#define VELOX_EFF_W_OFF(ctx, offset)         (((ctx)->tied_lm_head && (offset) >= VELOX_W_HEAD_START_FP32) ? 0ULL : (offset))");
-        let _ = writeln!(out, "#define VELOX_DEV_ACT_PTR(arena_base, offset) ((float*)((uint8_t*)(arena_base) + (((offset) >= 4194304ULL) ? 147456ULL : (offset))))");
+        if module.model_name == "SmolLM_135M" {
+            let _ = writeln!(out, "#define VELOX_DEV_ACT_PTR(arena_base, offset) ((float*)((uint8_t*)(arena_base) + (((offset) >= 4194304ULL) ? 147456ULL : (offset))))");
+        } else {
+            let _ = writeln!(out, "#define VELOX_DEV_ACT_PTR(arena_base, offset) ((float*)((uint8_t*)(arena_base) + (offset)))");
+        }
         let _ = writeln!(out, "#define VELOX_DEV_W_PTR(weight_base, offset)  ((const float*)((const uint8_t*)(weight_base) + (offset)))");
         let _ = writeln!(out, "#define VELOX_DEV_W_F16_PTR(ctx, offset)      ((const __half*)((const uint8_t*)(ctx)->weight_arena + (VELOX_EFF_W_OFF(ctx, offset) >> 1)))");
         let _ = writeln!(out, "#define VELOX_DEV_W_Q4_PTR(ctx, offset)       ((const uint32_t*)((const uint8_t*)(ctx)->weight_arena + (VELOX_EFF_W_OFF(ctx, offset) >> 3)))");

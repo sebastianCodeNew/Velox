@@ -329,6 +329,21 @@ fn test_k2_horizon_3_7b_vir_lowering_and_optimization() {
     assert_eq!(vir.device_name, "nvidia_rtx_3050_laptop");
     assert_eq!(vir.functions.len(), 2);
 
+    // Verify that lowered RoPE instructions picked up ROPE_THETA = 500000
+    let rope_insts: Vec<&VirInst> = vir
+        .functions
+        .iter()
+        .flat_map(|f| f.blocks.iter())
+        .flat_map(|b| b.instructions.iter())
+        .filter(|i| matches!(i, VirInst::RoPE { .. }))
+        .collect();
+    assert!(!rope_insts.is_empty(), "Lowered VIR must contain RoPE instructions before fusion");
+    for r in rope_insts {
+        if let VirInst::RoPE { theta, .. } = r {
+            assert_eq!(*theta, 500000.0, "RoPE theta must match model ROPE_THETA constant (500000)");
+        }
+    }
+
     let report = optimize_vir_module(vir);
     assert!(vir.kernel_fusion_applied);
     assert!(vir.dag_monomorphized);
@@ -391,6 +406,12 @@ fn test_k2_horizon_3_7b_codegen_c99_and_cuda_zero_heap_alloc() {
     assert!(cuda.contains("#define VELOX_VOCAB_SIZE                     250624ULL"));
     assert!(cuda.contains("#define VELOX_MODEL_ROPE_THETA               500000.0f"));
 
+    // Verify dynamic model-specific norm and lm_head weight offsets in CUDA
+    assert!(cuda.contains("#define VELOX_W_NORM_START_FP32              2031288320ULL"));
+    assert!(cuda.contains("#define VELOX_W_HEAD_START_FP32              2031662080ULL"));
+    // Verify un-clamped device activation pointer macro
+    assert!(cuda.contains("#define VELOX_DEV_ACT_PTR(arena_base, offset) ((float*)((uint8_t*)(arena_base) + (offset)))"));
+
     // Verify Candidate-Stride Two-Stage Tree Argmax Kernel for V = 250,624
     assert!(cuda.contains("velox_cuda_lm_head_argmax_stage1"));
     assert!(cuda.contains("velox_cuda_lm_head_argmax_stage2"));
@@ -415,4 +436,96 @@ fn test_k2_horizon_3_7b_codegen_c99_and_cuda_zero_heap_alloc() {
             "Forbidden dynamic memory allocation '{forbidden}' found in generated CUDA code"
         );
     }
+}
+
+#[test]
+fn test_k2_horizon_3_7b_cli_driver_check_prove_emit() {
+    use veloxc::cli::{run_cli_with_io, EXIT_SUCCESS};
+
+    // 1. --check
+    let mut check_out = Vec::new();
+    let mut check_err = Vec::new();
+    let check_code = run_cli_with_io(
+        &["--check".to_string(), K2_PATH.to_string()],
+        &mut check_out,
+        &mut check_err,
+    );
+    assert_eq!(
+        check_code,
+        EXIT_SUCCESS,
+        "CLI --check failed: {}",
+        String::from_utf8_lossy(&check_err)
+    );
+
+    // 2. --prove-vram
+    let mut prove_out = Vec::new();
+    let mut prove_err = Vec::new();
+    let prove_code = run_cli_with_io(
+        &["--prove-vram".to_string(), K2_PATH.to_string()],
+        &mut prove_out,
+        &mut prove_err,
+    );
+    assert_eq!(
+        prove_code,
+        EXIT_SUCCESS,
+        "CLI --prove-vram failed: {}",
+        String::from_utf8_lossy(&prove_err)
+    );
+    let prove_str = String::from_utf8(prove_out).expect("UTF-8 proof output");
+    assert!(prove_str.contains("VELOX COMPILE-TIME VRAM FEASIBILITY PROOF CERTIFICATE"));
+    assert!(prove_str.contains("VERIFIED FEASIBLE (Q.E.D.)"));
+    assert!(prove_str.contains("#define VELOX_HOST_RAM_REQUIRED_BYTES        48318513152ULL"));
+
+    // 3. --emit-cuda
+    let tmp_cu = std::env::temp_dir().join(format!("velox_cli_k2_{}.cu", std::process::id()));
+    let mut cuda_out = Vec::new();
+    let mut cuda_err = Vec::new();
+    let cuda_code = run_cli_with_io(
+        &[
+            "--emit-cuda".to_string(),
+            K2_PATH.to_string(),
+            "-o".to_string(),
+            tmp_cu.to_string_lossy().to_string(),
+        ],
+        &mut cuda_out,
+        &mut cuda_err,
+    );
+    assert_eq!(
+        cuda_code,
+        EXIT_SUCCESS,
+        "CLI --emit-cuda failed: {}",
+        String::from_utf8_lossy(&cuda_err)
+    );
+    let cu_str = fs::read_to_string(&tmp_cu).expect("read cu");
+    assert!(cu_str.contains("#define VELOX_VOCAB_SIZE                     250624ULL"));
+    assert!(cu_str.contains("#define VELOX_W_NORM_START_FP32              2031288320ULL"));
+    assert!(cu_str.contains("#define VELOX_W_HEAD_START_FP32              2031662080ULL"));
+    assert!(cu_str.contains("#define VELOX_DEV_ACT_PTR(arena_base, offset) ((float*)((uint8_t*)(arena_base) + (offset)))"));
+    let _ = fs::remove_file(&tmp_cu);
+
+    // 4. --emit-c
+    let tmp_c = std::env::temp_dir().join(format!("velox_cli_k2_{}.c", std::process::id()));
+    let mut c_out = Vec::new();
+    let mut c_err = Vec::new();
+    let c_code = run_cli_with_io(
+        &[
+            "--emit-c".to_string(),
+            K2_PATH.to_string(),
+            "-o".to_string(),
+            tmp_c.to_string_lossy().to_string(),
+        ],
+        &mut c_out,
+        &mut c_err,
+    );
+    assert_eq!(
+        c_code,
+        EXIT_SUCCESS,
+        "CLI --emit-c failed: {}",
+        String::from_utf8_lossy(&c_err)
+    );
+    let c_str = fs::read_to_string(&tmp_c).expect("read c");
+    assert!(c_str.contains("#define VELOX_MODEL_VOCAB_SIZE               250624ULL"));
+    assert!(c_str.contains("velox_K2_Horizon_3_7B_prefill"));
+    assert!(c_str.contains("velox_K2_Horizon_3_7B_decode"));
+    let _ = fs::remove_file(&tmp_c);
 }
