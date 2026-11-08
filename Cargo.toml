@@ -10,11 +10,12 @@ name = "veloxc"
 path = "src/lib.rs"
 
 [[bin]]
-name = "veloxc"
+name = "velox-cli"
 path = "src/main.rs"
 
 [profile.release]
-opt-level = 3
+opt-level = 2
+debug = true
 lto = false
 codegen-units = 16
 strip = false

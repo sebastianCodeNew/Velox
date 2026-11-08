@@ -3,7 +3,7 @@
 // Target: NVIDIA GeForce RTX 3050 Laptop GPU (4 GB VRAM, sm_86)
 // Model:  K2-Horizon-3.7B (examples/k2_horizon_3_7b.vlx)
 //         36 Layers, Hidden=2560, Intermediate=10240, Heads=32, KV_Heads=8,
-//         Head_Dim=80, Vocab=250624, RoPE_Theta=500000.0, Native 512K Context
+//         Head_Dim=128, Vocab=250624, RoPE_Theta=10000000.0, Native 512K Context
 // Strict Invariant: Strictly zero dynamic allocations during inference
 //                   (0 cudaMalloc/cudaFree/malloc/free during autoregressive loop)
 // ============================================================================
@@ -26,10 +26,10 @@
 #include "k2_horizon_3_7b.cu"
 
 // Static Memory Tier Offsets & Sizes from Velox Static Memory Planner
-#define K2_TIER1_WEIGHT_ARENA_BYTES       2352460800ULL /* 2243.48 MiB */
-#define K2_TIER3_ACTIVATION_ARENA_BYTES   45878016ULL   /* 43.75 MiB */
+#define K2_TIER1_WEIGHT_ARENA_BYTES       2529781760ULL /* 2412.59 MiB */
+#define K2_TIER3_ACTIVATION_ARENA_BYTES   65538816ULL   /* 62.50 MiB */
 #define K2_TIER4_SYSTEM_RESERVE_BYTES     268435456ULL  /* 256.00 MiB */
-#define K2_WEIGHT_SCALES_BYTES            308281344ULL  /* ~294.00 MiB for group-64 scales */
+#define K2_WEIGHT_SCALES_BYTES            340000000ULL  /* ~324.25 MiB for group-64 scales */
 #define K2_HOST_RING_BYTES                4096ULL
 
 // --- High-Resolution Performance Timer --------------------------------------
@@ -45,105 +45,375 @@ static double timer_ms_since(LARGE_INTEGER start) {
     return ((double)(now.QuadPart - start.QuadPart) * 1000.0) / (double)g_timer_freq.QuadPart;
 }
 
-// --- Win32 Zero-Copy Memory-Mapped Safetensors Loader -----------------------
+// --- Win32 Zero-Copy Memory-Mapped GGUF Loader ------------------------------
+typedef struct {
+    char name[128];
+    uint32_t n_dims;
+    uint64_t dims[4];
+    uint32_t type;
+    uint64_t offset;
+    size_t byte_len;
+} GgufTensorEntry;
+
 typedef struct {
     HANDLE hFile;
     HANDLE hMapping;
     const uint8_t* base_ptr;
     size_t file_size;
-    const char* header_json;
-    size_t header_len;
-    size_t data_start_offset;
-} Win32SafetensorsMap;
+    uint32_t version;
+    uint64_t tensor_count;
+    uint64_t kv_count;
+    size_t tensor_data_start;
+    GgufTensorEntry* tensors;
+} Win32GgufMap;
 
-static bool win32_safetensors_open(const char* filepath, Win32SafetensorsMap* map) {
+static bool skip_gguf_val(const uint8_t* base, size_t* pos, size_t file_sz, uint32_t vtype) {
+    switch (vtype) {
+        case 0: case 1: case 7:
+            *pos += 1; return (*pos <= file_sz);
+        case 2: case 3:
+            *pos += 2; return (*pos <= file_sz);
+        case 4: case 5: case 6:
+            *pos += 4; return (*pos <= file_sz);
+        case 8: {
+            if (*pos + 8 > file_sz) return false;
+            uint64_t slen = *(const uint64_t*)(base + *pos);
+            *pos += 8 + (size_t)slen;
+            return (*pos <= file_sz);
+        }
+        case 10: case 11: case 12:
+            *pos += 8; return (*pos <= file_sz);
+        case 9: {
+            if (*pos + 12 > file_sz) return false;
+            uint32_t elem_type = *(const uint32_t*)(base + *pos);
+            uint64_t arr_len = *(const uint64_t*)(base + *pos + 4);
+            *pos += 12;
+            for (uint64_t a = 0; a < arr_len; ++a) {
+                if (!skip_gguf_val(base, pos, file_sz, elem_type)) return false;
+            }
+            return (*pos <= file_sz);
+        }
+        default:
+            return false;
+    }
+}
+
+static bool win32_gguf_open(const char* filepath, Win32GgufMap* map) {
     memset(map, 0, sizeof(*map));
-
     int wlen = MultiByteToWideChar(CP_UTF8, 0, filepath, -1, NULL, 0);
     if (wlen <= 0) return false;
     wchar_t* wpath = (wchar_t*)malloc(wlen * sizeof(wchar_t));
     if (!wpath) return false;
     MultiByteToWideChar(CP_UTF8, 0, filepath, -1, wpath, wlen);
 
-    map->hFile = CreateFileW(
-        wpath, GENERIC_READ, FILE_SHARE_READ, NULL,
-        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL
-    );
+    map->hFile = CreateFileW(wpath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     free(wpath);
-
-    if (map->hFile == INVALID_HANDLE_VALUE) {
-        return false;
-    }
+    if (map->hFile == INVALID_HANDLE_VALUE) return false;
 
     LARGE_INTEGER sz;
-    if (!GetFileSizeEx(map->hFile, &sz) || sz.QuadPart < 8) {
+    if (!GetFileSizeEx(map->hFile, &sz) || sz.QuadPart < 24) {
         CloseHandle(map->hFile);
         return false;
     }
     map->file_size = (size_t)sz.QuadPart;
 
     map->hMapping = CreateFileMappingW(map->hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-    if (!map->hMapping) {
-        CloseHandle(map->hFile);
-        return false;
-    }
+    if (!map->hMapping) { CloseHandle(map->hFile); return false; }
 
     map->base_ptr = (const uint8_t*)MapViewOfFile(map->hMapping, FILE_MAP_READ, 0, 0, 0);
-    if (!map->base_ptr) {
-        CloseHandle(map->hMapping);
-        CloseHandle(map->hFile);
-        return false;
-    }
+    if (!map->base_ptr) { CloseHandle(map->hMapping); CloseHandle(map->hFile); return false; }
 
-    uint64_t hlen = *(const uint64_t*)map->base_ptr;
-    if (map->file_size < 8 + hlen) {
+    if (*(const uint32_t*)map->base_ptr != 0x46554747u) {
         UnmapViewOfFile(map->base_ptr);
         CloseHandle(map->hMapping);
         CloseHandle(map->hFile);
         return false;
     }
 
-    map->header_len = (size_t)hlen;
-    map->header_json = (const char*)(map->base_ptr + 8);
-    map->data_start_offset = 8 + (size_t)hlen;
+    size_t pos = 4;
+    map->version = *(const uint32_t*)(map->base_ptr + pos); pos += 4;
+    map->tensor_count = *(const uint64_t*)(map->base_ptr + pos); pos += 8;
+    map->kv_count = *(const uint64_t*)(map->base_ptr + pos); pos += 8;
+
+    for (uint64_t k = 0; k < map->kv_count; ++k) {
+        if (pos + 8 > map->file_size) return false;
+        uint64_t klen = *(const uint64_t*)(map->base_ptr + pos); pos += 8;
+        pos += (size_t)klen;
+        if (pos + 4 > map->file_size) return false;
+        uint32_t vtype = *(const uint32_t*)(map->base_ptr + pos); pos += 4;
+        if (!skip_gguf_val(map->base_ptr, &pos, map->file_size, vtype)) return false;
+    }
+
+    map->tensors = (GgufTensorEntry*)malloc(map->tensor_count * sizeof(GgufTensorEntry));
+    if (!map->tensors) return false;
+
+    for (uint64_t t = 0; t < map->tensor_count; ++t) {
+        GgufTensorEntry* te = &map->tensors[t];
+        memset(te, 0, sizeof(*te));
+        if (pos + 8 > map->file_size) return false;
+        uint64_t nlen = *(const uint64_t*)(map->base_ptr + pos); pos += 8;
+        size_t copylen = nlen < 127 ? (size_t)nlen : 127;
+        memcpy(te->name, map->base_ptr + pos, copylen);
+        te->name[copylen] = '\0';
+        pos += (size_t)nlen;
+
+        te->n_dims = *(const uint32_t*)(map->base_ptr + pos); pos += 4;
+        size_t nelem = 1;
+        for (uint32_t d = 0; d < te->n_dims; ++d) {
+            te->dims[d] = *(const uint64_t*)(map->base_ptr + pos); pos += 8;
+            nelem *= (size_t)te->dims[d];
+        }
+        te->type = *(const uint32_t*)(map->base_ptr + pos); pos += 4;
+        te->offset = *(const uint64_t*)(map->base_ptr + pos); pos += 8;
+
+        if (te->type == 0) te->byte_len = nelem * 4;
+        else if (te->type == 1) te->byte_len = nelem * 2;
+        else if (te->type == 12) te->byte_len = (nelem / 256) * 144;
+        else if (te->type == 14) te->byte_len = (nelem / 256) * 210;
+        else te->byte_len = nelem;
+    }
+
+    map->tensor_data_start = (pos + 31) & ~31ULL;
     return true;
 }
 
-static void win32_safetensors_close(Win32SafetensorsMap* map) {
+static const GgufTensorEntry* win32_gguf_find_tensor(const Win32GgufMap* map, const char* name) {
+    if (!map || !map->tensors) return NULL;
+    for (uint64_t t = 0; t < map->tensor_count; ++t) {
+        if (strcmp(map->tensors[t].name, name) == 0) {
+            return &map->tensors[t];
+        }
+    }
+    return NULL;
+}
+
+static void win32_gguf_close(Win32GgufMap* map) {
+    if (map->tensors) free(map->tensors);
     if (map->base_ptr) UnmapViewOfFile(map->base_ptr);
     if (map->hMapping) CloseHandle(map->hMapping);
     if (map->hFile && map->hFile != INVALID_HANDLE_VALUE) CloseHandle(map->hFile);
     memset(map, 0, sizeof(*map));
 }
 
-static bool safetensors_find_tensor(
-    const Win32SafetensorsMap* map,
-    const char* tensor_name,
-    size_t* out_abs_offset,
-    size_t* out_byte_len
+// --- GPU Unpack Kernels: Q4_K / Q6_K to Marlin INT4 + Group-64 Scales ------
+
+static __device__ __forceinline__ void get_scale_min_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4)  | ((q[j - 0] >> 6) << 4);
+    }
+}
+
+// Each CUDA block processes 1 Q4_K block of 256 weights (4 groups of 64)
+__global__ void velox_cuda_unpack_q4_k_fused_kernel(
+    uint32_t* __restrict__ dst_w,
+    half2* __restrict__ dst_s,
+    const uint8_t* __restrict__ src_q4k,
+    size_t num_blocks_256,
+    size_t weight_off_words,
+    size_t scale_off_groups
 ) {
-    char needle[256];
-    snprintf(needle, sizeof(needle), "\"%s\"", tensor_name);
-    const char* p = strstr(map->header_json, needle);
-    if (!p) {
-        if (strcmp(tensor_name, "lm_head.weight") == 0) {
-            return safetensors_find_tensor(map, "model.embed_tokens.weight", out_abs_offset, out_byte_len);
+    size_t b = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= num_blocks_256) return;
+
+    const uint8_t* blk = src_q4k + b * 144ULL;
+    half d_half, dmin_half;
+    memcpy(&d_half, blk, sizeof(half));
+    memcpy(&dmin_half, blk + 2, sizeof(half));
+    const uint8_t* scales = blk + 4;
+    const uint8_t* qs = blk + 16;
+
+    float fd = __half2float(d_half);
+    float fdmin = __half2float(dmin_half);
+
+    for (int g = 0; g < 4; ++g) {
+        uint8_t sc0_u8, m0_u8, sc1_u8, m1_u8;
+        get_scale_min_k4(2 * g,     scales, &sc0_u8, &m0_u8);
+        get_scale_min_k4(2 * g + 1, scales, &sc1_u8, &m1_u8);
+        float d1 = fd * (float)sc0_u8;
+        float m1 = fdmin * (float)m0_u8;
+        float d2 = fd * (float)sc1_u8;
+        float m2 = fdmin * (float)m1_u8;
+
+        const uint8_t* group_qs = qs + g * 32;
+        float vals[64];
+        float grp_min = 1e30f;
+        float grp_max = -1e30f;
+
+        #pragma unroll
+        for (int l = 0; l < 32; ++l) {
+            float v0 = d1 * (float)(group_qs[l] & 0x0F) - m1;
+            float v1 = d2 * (float)(group_qs[l] >> 4)   - m2;
+            vals[l]      = v0;
+            vals[l + 32] = v1;
+            if (v0 < grp_min) grp_min = v0;
+            if (v0 > grp_max) grp_max = v0;
+            if (v1 < grp_min) grp_min = v1;
+            if (v1 > grp_max) grp_max = v1;
         }
-        return false;
+
+        float sc = (grp_max > grp_min) ? ((grp_max - grp_min) / 15.0f) : 1e-5f;
+        float mn = grp_min;
+        dst_s[scale_off_groups + b * 4ULL + (size_t)g] = __floats2half2_rn(sc, mn);
+        float inv_sc = 1.0f / sc;
+
+        for (int w = 0; w < 8; ++w) {
+            uint32_t q[8];
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                int qi = __float2int_rn((vals[w * 8 + k] - mn) * inv_sc);
+                q[k] = (uint32_t)((qi < 0) ? 0 : ((qi > 15) ? 15 : qi));
+            }
+            uint32_t packed = (q[0] <<  0) | (q[2] <<  4) | (q[4] <<  8) | (q[6] << 12)
+                            | (q[1] << 16) | (q[3] << 20) | (q[5] << 24) | (q[7] << 28);
+            dst_w[weight_off_words + b * 32ULL + g * 8ULL + (size_t)w] = packed;
+        }
+    }
+}
+
+// Each CUDA block processes 1 Q6_K block of 256 weights (4 groups of 64)
+__global__ void velox_cuda_unpack_q6_k_fused_kernel(
+    uint32_t* __restrict__ dst_w,
+    half2* __restrict__ dst_s,
+    const uint8_t* __restrict__ src_q6k,
+    size_t num_blocks_256,
+    size_t weight_off_words,
+    size_t scale_off_groups
+) {
+    size_t b = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= num_blocks_256) return;
+
+    const uint8_t* blk = src_q6k + b * 210ULL;
+    const uint8_t* ql = blk;
+    const uint8_t* qh = blk + 128;
+    const int8_t*  sc = (const int8_t*)(blk + 192);
+    half d_half;
+    memcpy(&d_half, blk + 208, sizeof(half));
+    float d = __half2float(d_half);
+
+    for (int n = 0; n < 2; ++n) {
+        const uint8_t* ql_n = ql + n * 64;
+        const uint8_t* qh_n = qh + n * 32;
+        const int8_t*  sc_n = sc + n * 8;
+        float w128[128];
+
+        #pragma unroll
+        for (int l = 0; l < 32; ++l) {
+            int is = l / 16;
+            const int8_t q1 = (int8_t)((ql_n[l + 0]  & 0xF) | (((qh_n[l] >> 0) & 3) << 4)) - 32;
+            const int8_t q2 = (int8_t)((ql_n[l + 32] & 0xF) | (((qh_n[l] >> 2) & 3) << 4)) - 32;
+            const int8_t q3 = (int8_t)((ql_n[l + 0]  >> 4)  | (((qh_n[l] >> 4) & 3) << 4)) - 32;
+            const int8_t q4 = (int8_t)((ql_n[l + 32] >> 4)  | (((qh_n[l] >> 6) & 3) << 4)) - 32;
+
+            w128[l + 0]  = d * (float)sc_n[is + 0] * (float)q1;
+            w128[l + 32] = d * (float)sc_n[is + 2] * (float)q2;
+            w128[l + 64] = d * (float)sc_n[is + 4] * (float)q3;
+            w128[l + 96] = d * (float)sc_n[is + 6] * (float)q4;
+        }
+
+        for (int sub_g = 0; sub_g < 2; ++sub_g) {
+            int g = n * 2 + sub_g;
+            const float* vals = w128 + sub_g * 64;
+            float grp_min = vals[0];
+            float grp_max = vals[0];
+            #pragma unroll
+            for (int i = 1; i < 64; ++i) {
+                float v = vals[i];
+                if (v < grp_min) grp_min = v;
+                if (v > grp_max) grp_max = v;
+            }
+
+            float sc_val = (grp_max > grp_min) ? ((grp_max - grp_min) / 15.0f) : 1e-5f;
+            float mn_val = grp_min;
+            dst_s[scale_off_groups + b * 4ULL + (size_t)g] = __floats2half2_rn(sc_val, mn_val);
+            float inv_s = 1.0f / sc_val;
+
+            for (int w = 0; w < 8; ++w) {
+                uint32_t q[8];
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    int qi = __float2int_rn((vals[w * 8 + k] - mn_val) * inv_s);
+                    q[k] = (uint32_t)((qi < 0) ? 0 : ((qi > 15) ? 15 : qi));
+                }
+                uint32_t packed = (q[0] <<  0) | (q[2] <<  4) | (q[4] <<  8) | (q[6] << 12)
+                                | (q[1] << 16) | (q[3] << 20) | (q[5] << 24) | (q[7] << 28);
+                dst_w[weight_off_words + b * 32ULL + g * 8ULL + (size_t)w] = packed;
+            }
+        }
+    }
+}
+
+// Stream and unpack a GGUF tensor into d_weight_arena and d_weight_scales
+static void load_gguf_tensor_to_arena(
+    const Win32GgufMap* map,
+    const char* tensor_name,
+    uint8_t* d_staging,
+    size_t staging_bytes,
+    uint32_t* d_weight_words,
+    half2* d_weight_scales,
+    size_t weight_off_bytes,
+    cudaStream_t stream
+) {
+    const GgufTensorEntry* te = win32_gguf_find_tensor(map, tensor_name);
+    if (!te) {
+        if (strcmp(tensor_name, "output.weight") == 0) {
+            te = win32_gguf_find_tensor(map, "token_embd.weight");
+        }
+        if (!te) return;
     }
 
-    const char* do_key = strstr(p, "\"data_offsets\"");
-    if (!do_key) return false;
-    const char* lbr = strchr(do_key, '[');
-    if (!lbr) return false;
-    size_t start = (size_t)strtoull(lbr + 1, NULL, 10);
-    const char* comma = strchr(lbr, ',');
-    if (!comma) return false;
-    size_t end = (size_t)strtoull(comma + 1, NULL, 10);
+    const uint8_t* host_src = map->base_ptr + map->tensor_data_start + te->offset;
+    size_t total_bytes = te->byte_len;
+    size_t weight_off_words = weight_off_bytes >> 2;
+    size_t scale_off_groups = weight_off_bytes >> 5;
 
-    *out_abs_offset = map->data_start_offset + start;
-    *out_byte_len = end - start;
-    return true;
+    if (te->type == 0) {
+        // FP32 Norm weight: direct copy to device
+        cudaMemcpyAsync((uint8_t*)d_weight_words + weight_off_bytes, host_src, total_bytes, cudaMemcpyHostToDevice, stream);
+        return;
+    }
+
+    size_t chunk_bytes = staging_bytes;
+    size_t processed_bytes = 0;
+    size_t cur_block_idx = 0;
+
+    while (processed_bytes < total_bytes) {
+        size_t rem = total_bytes - processed_bytes;
+        size_t take = (rem < chunk_bytes) ? rem : chunk_bytes;
+
+        // Ensure chunk is aligned to whole blocks
+        size_t block_sz = (te->type == 14) ? 210ULL : 144ULL;
+        take = (take / block_sz) * block_sz;
+        if (take == 0) take = rem;
+
+        cudaMemcpyAsync(d_staging, host_src + processed_bytes, take, cudaMemcpyHostToDevice, stream);
+        size_t num_blocks = take / block_sz;
+
+        if (num_blocks > 0) {
+            dim3 block(256);
+            dim3 grid((uint32_t)((num_blocks + 255) / 256));
+
+            if (te->type == 14) {
+                velox_cuda_unpack_q6_k_fused_kernel<<<grid, block, 0, stream>>>(
+                    d_weight_words, d_weight_scales, d_staging, num_blocks,
+                    weight_off_words + cur_block_idx * 32ULL,
+                    scale_off_groups + cur_block_idx * 4ULL
+                );
+            } else {
+                velox_cuda_unpack_q4_k_fused_kernel<<<grid, block, 0, stream>>>(
+                    d_weight_words, d_weight_scales, d_staging, num_blocks,
+                    weight_off_words + cur_block_idx * 32ULL,
+                    scale_off_groups + cur_block_idx * 4ULL
+                );
+            }
+        }
+
+        cur_block_idx += num_blocks;
+        processed_bytes += take;
+    }
 }
 
 // --- Top-5 Logits Helper for 250,624 Vocabulary -----------------------------
@@ -184,15 +454,18 @@ static void print_top5_logits(const float* logits, size_t vocab_size) {
 
 // --- Main Program Entry Point -----------------------------------------------
 int main(int argc, char** argv) {
-    const char* weights_path = "k2-horizon-3.7b-int4.safetensors";
-    uint32_t prompt_tokens[64] = {1, 1504, 346, 2024};
+    const char* weights_path = "weights/k2_horizon_q4_k_m.gguf";
+    uint32_t prompt_tokens[16384];
+    prompt_tokens[0] = 1;
+    prompt_tokens[1] = 1504;
+    prompt_tokens[2] = 346;
+    prompt_tokens[3] = 2024;
     size_t prompt_len = 4;
     size_t steps = 16;
     bool verbose = false;
     bool use_cuda_graph = true;
-    size_t max_context_tokens = 4096; // Interactive context buffer in host-pinned RAM
+    size_t max_context_tokens = 16384;
 
-    // Parse command-line arguments
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--weights") == 0 && i + 1 < argc) {
             weights_path = argv[++i];
@@ -201,7 +474,7 @@ int main(int argc, char** argv) {
             prompt_len = 0;
             char* copy = _strdup(s);
             char* token = strtok(copy, ",");
-            while (token && prompt_len < 64) {
+            while (token && prompt_len < 16384) {
                 prompt_tokens[prompt_len++] = (uint32_t)strtoul(token, NULL, 10);
                 token = strtok(NULL, ",");
             }
@@ -218,10 +491,10 @@ int main(int argc, char** argv) {
             printf("Velox Standalone CUDA Runner for K2-Horizon-3.7B\n");
             printf("Usage: velox_cuda_runner_k2.exe [options]\n");
             printf("Options:\n");
-            printf("  --weights <path>       Path to weights (.safetensors)\n");
+            printf("  --weights <path>       Path to weights (.gguf)\n");
             printf("  --tokens <t1,t2,...>   Comma-separated prompt token IDs\n");
             printf("  --steps <N>            Autoregressive decode steps (default: 16)\n");
-            printf("  --context-len <N>      Max context tokens in host-pinned KV cache (default: 4096)\n");
+            printf("  --context-len <N>      Max context tokens in host-pinned KV cache (default: 16384)\n");
             printf("  --verbose              Print token at each step\n");
             printf("  --no-cuda-graph        Disable CUDA Graph replay\n");
             return 0;
@@ -231,7 +504,6 @@ int main(int argc, char** argv) {
     timer_init();
 
     // 1. Initialize GPU Device Invariants (RTX 3050 Laptop, sm_86)
-    // cudaSetDeviceFlags MUST be called before any context initialization
     cudaSetDeviceFlags(cudaDeviceMapHost);
     int device_id = 0;
     cudaSetDevice(device_id);
@@ -244,7 +516,7 @@ int main(int argc, char** argv) {
     size_t scales_bytes = K2_WEIGHT_SCALES_BYTES;
     size_t ring_bytes = K2_HOST_RING_BYTES;
 
-    // KV Cache pool: 36 layers * 2 (K+V) * VELOX_MODEL_MAX_SEQ_LEN * 8 KV heads * 80 head_dim * 4 bytes (float)
+    // KV Cache pool: 36 layers * 2 (K+V) * VELOX_MODEL_MAX_SEQ_LEN * 8 KV heads * 128 head_dim * 4 bytes (float)
     size_t kv_pool_bytes = VELOX_NUM_LAYERS * 2ULL * VELOX_MODEL_MAX_SEQ_LEN * VELOX_NUM_KV_HEADS * VELOX_HEAD_DIM * sizeof(float);
 
     LARGE_INTEGER t_init_start;
@@ -282,26 +554,17 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Allocate KV Cache: if <= 1024 MiB, allocate in high-speed GDDR6 VRAM; otherwise in Host-Pinned System RAM
-    if (kv_pool_bytes <= 1024ULL * 1024 * 1024) {
-        err = cudaMalloc((void**)&d_kv_cache, kv_pool_bytes);
-        if (err == cudaSuccess) {
-            is_kv_in_vram = true;
-        }
+    // Allocate KV Cache: Tier 4 Host-Pinned System RAM (UVA Zero-Copy Mapping for 16K Context)
+    err = cudaHostAlloc((void**)&h_kv_cache, kv_pool_bytes, cudaHostAllocMapped);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "cudaHostAlloc h_kv_cache (%zu MiB) failed: %s\n",
+                kv_pool_bytes / (1024 * 1024), cudaGetErrorString(err));
+        return 1;
     }
-    if (!is_kv_in_vram) {
-        // Tier 4 Host-Pinned System RAM (UVA Zero-Copy Mapping for 16K Context)
-        err = cudaHostAlloc((void**)&h_kv_cache, kv_pool_bytes, cudaHostAllocMapped);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "cudaHostAlloc h_kv_cache (%zu MiB) failed: %s\n",
-                    kv_pool_bytes / (1024 * 1024), cudaGetErrorString(err));
-            return 1;
-        }
-        err = cudaHostGetDevicePointer((void**)&d_kv_cache, h_kv_cache, 0);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "cudaHostGetDevicePointer failed: %s\n", cudaGetErrorString(err));
-            return 1;
-        }
+    err = cudaHostGetDevicePointer((void**)&d_kv_cache, h_kv_cache, 0);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "cudaHostGetDevicePointer failed: %s\n", cudaGetErrorString(err));
+        return 1;
     }
 
     // Host-pinned ring buffer for zero-copy D2H token reading
@@ -315,30 +578,80 @@ int main(int argc, char** argv) {
         d_ring = h_ring;
     }
 
-    // Create execution CUDA stream
     cudaStream_t stream;
     cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
 
-    // 4. Memory-map safetensors file via Win32 zero-copy
-    Win32SafetensorsMap st_map;
-    bool has_weights_file = win32_safetensors_open(weights_path, &st_map);
-    double weight_load_ms = 0.0;
+    // 4. Memory-map GGUF file via Win32 zero-copy and stream weights into GPU
+    Win32GgufMap gguf_map;
+    bool has_weights_file = win32_gguf_open(weights_path, &gguf_map);
+    if (!has_weights_file && strcmp(weights_path, "weights/k2_horizon_q4_k_m.gguf") != 0) {
+        has_weights_file = win32_gguf_open("weights/k2_horizon_q4_k_m.gguf", &gguf_map);
+    }
 
+    double weight_load_ms = 0.0;
     if (has_weights_file) {
         LARGE_INTEGER t_load_start;
         QueryPerformanceCounter(&t_load_start);
 
-        // Stream weights into device arena
-        size_t src_off = 0, len = 0;
-        if (safetensors_find_tensor(&st_map, "model.embed_tokens.weight", &src_off, &len)) {
-            size_t copy_len = len < 320798720ULL ? len : 320798720ULL;
-            cudaMemcpyAsync(d_weight_arena, st_map.base_ptr + src_off, copy_len, cudaMemcpyHostToDevice, stream);
+        // Allocate a 16 MiB device staging buffer for streaming unpacking
+        size_t staging_bytes = 16ULL * 1024ULL * 1024ULL;
+        uint8_t* d_staging = NULL;
+        cudaMalloc((void**)&d_staging, staging_bytes);
+
+        uint32_t* d_w_u32 = (uint32_t*)d_weight_arena;
+        half2* d_s_h2 = (half2*)d_weight_scales;
+
+        // 1. Embeddings: token_embd.weight -> 0ULL
+        load_gguf_tensor_to_arena(&gguf_map, "token_embd.weight", d_staging, staging_bytes, d_w_u32, d_s_h2, 0ULL, stream);
+
+        // 2. Transformer Blocks (36 layers)
+        char tname[128];
+        for (int l = 0; l < 36; ++l) {
+            // w_q: 320798720ULL + l * (2560 * 4096 / 2)
+            snprintf(tname, sizeof(tname), "blk.%d.attn_q.weight", l);
+            load_gguf_tensor_to_arena(&gguf_map, tname, d_staging, staging_bytes, d_w_u32, d_s_h2, 320798720ULL + (size_t)l * 5242880ULL, stream);
+
+            // w_k: 509542400ULL + l * (2560 * 1024 / 2)
+            snprintf(tname, sizeof(tname), "blk.%d.attn_k.weight", l);
+            load_gguf_tensor_to_arena(&gguf_map, tname, d_staging, staging_bytes, d_w_u32, d_s_h2, 509542400ULL + (size_t)l * 1310720ULL, stream);
+
+            // w_v: 556728320ULL + l * (2560 * 1024 / 2)
+            snprintf(tname, sizeof(tname), "blk.%d.attn_v.weight", l);
+            load_gguf_tensor_to_arena(&gguf_map, tname, d_staging, staging_bytes, d_w_u32, d_s_h2, 556728320ULL + (size_t)l * 1310720ULL, stream);
+
+            // w_o: 603914240ULL + l * (4096 * 2560 / 2)
+            snprintf(tname, sizeof(tname), "blk.%d.attn_output.weight", l);
+            load_gguf_tensor_to_arena(&gguf_map, tname, d_staging, staging_bytes, d_w_u32, d_s_h2, 603914240ULL + (size_t)l * 5242880ULL, stream);
+
+            // w_gate: 792657920ULL + l * (2560 * 10240 / 2)
+            snprintf(tname, sizeof(tname), "blk.%d.ffn_gate.weight", l);
+            load_gguf_tensor_to_arena(&gguf_map, tname, d_staging, staging_bytes, d_w_u32, d_s_h2, 792657920ULL + (size_t)l * 13107200ULL, stream);
+
+            // w_up: 1264517120ULL + l * (2560 * 10240 / 2)
+            snprintf(tname, sizeof(tname), "blk.%d.ffn_up.weight", l);
+            load_gguf_tensor_to_arena(&gguf_map, tname, d_staging, staging_bytes, d_w_u32, d_s_h2, 1264517120ULL + (size_t)l * 13107200ULL, stream);
+
+            // w_down: 1736376320ULL + l * (10240 * 2560 / 2)
+            snprintf(tname, sizeof(tname), "blk.%d.ffn_down.weight", l);
+            load_gguf_tensor_to_arena(&gguf_map, tname, d_staging, staging_bytes, d_w_u32, d_s_h2, 1736376320ULL + (size_t)l * 13107200ULL, stream);
+
+            // w_input_norm: 2208235520ULL + l * (2560 * 4)
+            snprintf(tname, sizeof(tname), "blk.%d.attn_norm.weight", l);
+            load_gguf_tensor_to_arena(&gguf_map, tname, d_staging, staging_bytes, d_w_u32, d_s_h2, 2208235520ULL + (size_t)l * 10240ULL, stream);
+
+            // w_post_norm: 2208604160ULL + l * (2560 * 4)
+            snprintf(tname, sizeof(tname), "blk.%d.ffn_norm.weight", l);
+            load_gguf_tensor_to_arena(&gguf_map, tname, d_staging, staging_bytes, d_w_u32, d_s_h2, 2208604160ULL + (size_t)l * 10240ULL, stream);
         }
 
+        // 3. Final norm & output head
+        load_gguf_tensor_to_arena(&gguf_map, "output_norm.weight", d_staging, staging_bytes, d_w_u32, d_s_h2, 2208972800ULL, stream);
+        load_gguf_tensor_to_arena(&gguf_map, "output.weight", d_staging, staging_bytes, d_w_u32, d_s_h2, 2208983040ULL, stream);
+
         cudaStreamSynchronize(stream);
+        cudaFree(d_staging);
         weight_load_ms = timer_ms_since(t_load_start);
     } else {
-        // Zero-initialize weights arena for dry-run verification
         cudaMemsetAsync(d_weight_arena, 0, weight_bytes, stream);
         cudaMemsetAsync(d_weight_scales, 0, scales_bytes, stream);
     }
@@ -348,7 +661,6 @@ int main(int argc, char** argv) {
     cudaMemsetAsync(d_kv_cache, 0, kv_pool_bytes, stream);
     memset(h_ring, 0, ring_bytes);
     cudaStreamSynchronize(stream);
-    double init_total_ms = timer_ms_since(t_init_start);
 
     // 5. Construct Velox zero-allocation execution arena context
     VeloxCudaArena ctx;
@@ -361,7 +673,7 @@ int main(int argc, char** argv) {
     ctx.quant_mode = VELOX_QUANT_Q4_0;
     ctx.tied_lm_head = 0u;
 
-    // 6. Pre-capture single-step decode CUDA Graph (invariant device-resident VeloxDecodeState)
+    // 6. Pre-capture single-step decode CUDA Graph
     cudaGraph_t decode_graph = NULL;
     cudaGraphExec_t decode_graph_exec = NULL;
     if (use_cuda_graph) {
@@ -374,16 +686,13 @@ int main(int argc, char** argv) {
             }
         }
         if (err != cudaSuccess || decode_graph_exec == NULL) {
-            fprintf(stderr, "Warning: CUDA Graph capture failed (%s), falling back to eager stream\n", cudaGetErrorString(err));
             use_cuda_graph = false;
         }
     }
 
-    // Allocate output token buffer on host
     uint32_t* generated_tokens = (uint32_t*)malloc(steps * sizeof(uint32_t));
     if (!generated_tokens) return 1;
 
-    // Setup CUDA event timers for microsecond GPU profiling
     cudaEvent_t ev_prefill_start, ev_prefill_stop;
     cudaEvent_t ev_decode_start, ev_decode_stop;
     cudaEventCreate(&ev_prefill_start);
@@ -391,7 +700,7 @@ int main(int argc, char** argv) {
     cudaEventCreate(&ev_decode_start);
     cudaEventCreate(&ev_decode_stop);
 
-    // 7. Execute Prefill Phase on prompt tokens causally step-by-step
+    // 7. Execute Prefill Phase on prompt tokens
     cudaEventRecord(ev_prefill_start, stream);
 
     for (size_t pos = 0; pos < prompt_len; ++pos) {
@@ -408,7 +717,7 @@ int main(int argc, char** argv) {
     if (steps > 0) {
         generated_tokens[0] = next_tok;
         if (verbose) {
-            printf("[Step 0] Prompt Token: %u -> Next: %u\n", prompt_tokens[prompt_len - 1], next_tok);
+            printf("[Step 0] Token: %u\n", next_tok);
             fflush(stdout);
         }
     }
@@ -480,20 +789,16 @@ int main(int argc, char** argv) {
     printf("Model                  : K2-Horizon-3.7B (36 Layers, 512K Context)\n");
     printf("Target Device          : %s (Compute %d.%d, %zu MiB VRAM)\n",
            prop.name, prop.major, prop.minor, prop.totalGlobalMem / (1024 * 1024));
-    printf("Safetensors Mode       : %s\n", has_weights_file ? weights_path : "Dry-Run Feasibility Arena (0 Allocation)");
+    printf("Weights Source         : %s\n", has_weights_file ? weights_path : "Dry-Run Feasibility Arena (0 Allocation)");
     if (has_weights_file) {
         printf("Weight Stream to VRAM  : %.2f ms\n", weight_load_ms);
     }
     printf("Device VRAM Allocated  : %.2f MiB (%.2f%% of 4096 MiB RTX 3050)\n",
            (double)(weight_bytes + scales_bytes + act_arena_bytes) / (1024.0 * 1024.0),
            ((double)(weight_bytes + scales_bytes + act_arena_bytes) / (double)prop.totalGlobalMem) * 100.0);
-    if (is_kv_in_vram) {
-        printf("KV Cache Allocation    : %.2f MiB in High-Speed Dedicated GDDR6 VRAM (%llu Tokens)\n",
-               (double)kv_pool_bytes / (1024.0 * 1024.0), (unsigned long long)VELOX_MODEL_MAX_SEQ_LEN);
-    } else {
-        printf("KV Cache Allocation    : %.2f MiB in Tier 4 Host-Pinned System RAM (%llu Tokens, UVA Zero-Copy)\n",
-               (double)kv_pool_bytes / (1024.0 * 1024.0), (unsigned long long)VELOX_MODEL_MAX_SEQ_LEN);
-    }
+    printf("KV Cache Allocation    : %.2f MiB in Tier 4 Host-Pinned System RAM (%llu Tokens, UVA Zero-Copy)\n",
+           (double)kv_pool_bytes / (1024.0 * 1024.0), (unsigned long long)VELOX_MODEL_MAX_SEQ_LEN);
+
     printf("Prompt Tokens (%zu)      : [", prompt_len);
     for (size_t i = 0; i < prompt_len; ++i) {
         printf("%u%s", prompt_tokens[i], (i + 1 < prompt_len) ? ", " : "");
@@ -506,16 +811,6 @@ int main(int argc, char** argv) {
     }
     printf("]\n");
 
-    printf("Full Token Sequence    : [");
-    for (size_t i = 0; i < prompt_len; ++i) {
-        printf("%u, ", prompt_tokens[i]);
-    }
-    for (size_t i = 0; i < steps; ++i) {
-        printf("%u%s", generated_tokens[i], (i + 1 < steps) ? ", " : "");
-    }
-    printf("]\n");
-
-    // Copy and inspect final step top-5 logits from device activation arena offset 3966976ULL
     float* h_logits = (float*)malloc(VELOX_VOCAB_SIZE * sizeof(float));
     if (h_logits) {
         cudaMemcpy(h_logits, (const float*)((const uint8_t*)ctx.activation_arena + 3966976ULL), VELOX_VOCAB_SIZE * sizeof(float), cudaMemcpyDeviceToHost);
@@ -545,20 +840,10 @@ int main(int argc, char** argv) {
     cudaFree(d_weight_arena);
     cudaFree(d_weight_scales);
     cudaFree(d_activation);
-    if (is_kv_in_vram) {
-        cudaFree(d_kv_cache);
-    } else {
-        cudaFreeHost(h_kv_cache);
-    }
+    cudaFreeHost(h_kv_cache);
     cudaFreeHost(h_ring);
     if (has_weights_file) {
-        win32_safetensors_close(&st_map);
-    }
-
-    cudaError_t last_err = cudaGetLastError();
-    if (last_err != cudaSuccess) {
-        fprintf(stderr, "CUDA error detected: %s\n", cudaGetErrorString(last_err));
-        return 1;
+        win32_gguf_close(&gguf_map);
     }
 
     return 0;

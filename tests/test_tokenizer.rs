@@ -308,3 +308,19 @@ fn test_smollm_tokenizer_ground_truth_parity() {
     stream_output.push_str(&stream.flush());
     assert_eq!(stream_output, dec32);
 }
+
+#[test]
+fn test_k2_tokenizer_loading() {
+    let tok_path = Path::new("k2_tokenizer.json");
+    if !tok_path.exists() {
+        return;
+    }
+    match Tokenizer::from_file(tok_path) {
+        Ok(tok) => {
+            println!("Successfully loaded k2_tokenizer.json! Vocab size: {}", tok.vocab.len());
+        }
+        Err(e) => {
+            panic!("Failed to load k2_tokenizer.json: {}", e);
+        }
+    }
+}

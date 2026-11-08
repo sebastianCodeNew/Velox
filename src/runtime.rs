@@ -48,7 +48,6 @@ mod win32_mmap {
     const FILE_MAP_READ: Dword = 0x0004;
     const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
 
-    #[link(name = "kernel32")]
     extern "system" {
         fn CreateFileW(
             lpFileName: *const u16,

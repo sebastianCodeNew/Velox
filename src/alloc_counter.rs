@@ -56,6 +56,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 }
 
+#[cfg(test)]
 #[global_allocator]
 static GLOBAL_COUNTING_ALLOCATOR: CountingAllocator = CountingAllocator;
 

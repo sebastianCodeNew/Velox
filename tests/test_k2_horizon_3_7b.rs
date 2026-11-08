@@ -196,10 +196,10 @@ fn test_k2_horizon_3_7b_semantic_analysis_and_shape_inference() {
     assert_eq!(typed_model.constants.get("NUM_LAYERS"), Some(&36));
     assert_eq!(typed_model.constants.get("NUM_HEADS"), Some(&32));
     assert_eq!(typed_model.constants.get("NUM_KV_HEADS"), Some(&8));
-    assert_eq!(typed_model.constants.get("HEAD_DIM"), Some(&80));
+    assert_eq!(typed_model.constants.get("HEAD_DIM"), Some(&128));
     assert_eq!(typed_model.constants.get("VOCAB"), Some(&250624));
     assert_eq!(typed_model.constants.get("S_MAX"), Some(&524288));
-    assert_eq!(typed_model.constants.get("ROPE_THETA"), Some(&500000));
+    assert_eq!(typed_model.constants.get("ROPE_THETA"), Some(&10000000));
 
     // Verify concrete weight shapes
     let w_embed = typed_model.weights.iter().find(|w| w.name == "w_embed").unwrap();
@@ -207,15 +207,15 @@ fn test_k2_horizon_3_7b_semantic_analysis_and_shape_inference() {
     assert_eq!(w_embed.dtype, ScalarType::Int4);
 
     let w_q = typed_model.weights.iter().find(|w| w.name == "w_q").unwrap();
-    assert_eq!(w_q.shape, vec![36, 2560, 2560]);
+    assert_eq!(w_q.shape, vec![36, 2560, 4096]);
     assert_eq!(w_q.dtype, ScalarType::Int4);
 
     let w_k = typed_model.weights.iter().find(|w| w.name == "w_k").unwrap();
-    assert_eq!(w_k.shape, vec![36, 2560, 640]);
+    assert_eq!(w_k.shape, vec![36, 2560, 1024]);
     assert_eq!(w_k.dtype, ScalarType::Int4);
 
     let w_v = typed_model.weights.iter().find(|w| w.name == "w_v").unwrap();
-    assert_eq!(w_v.shape, vec![36, 2560, 640]);
+    assert_eq!(w_v.shape, vec![36, 2560, 1024]);
     assert_eq!(w_v.dtype, ScalarType::Int4);
 
     let w_gate = typed_model.weights.iter().find(|w| w.name == "w_gate").unwrap();
@@ -224,7 +224,7 @@ fn test_k2_horizon_3_7b_semantic_analysis_and_shape_inference() {
 
     let w_norm = typed_model.weights.iter().find(|w| w.name == "w_norm").unwrap();
     assert_eq!(w_norm.shape, vec![2560]);
-    assert_eq!(w_norm.dtype, ScalarType::F16);
+    assert_eq!(w_norm.dtype, ScalarType::F32);
 
     let w_lm_head = typed_model.weights.iter().find(|w| w.name == "w_lm_head").unwrap();
     assert_eq!(w_lm_head.shape, vec![2560, 250624]);
@@ -236,7 +236,7 @@ fn test_k2_horizon_3_7b_semantic_analysis_and_shape_inference() {
     assert_eq!(kv.tier, MemoryTier::HostPinned);
     assert_eq!(kv.layers, 36);
     assert_eq!(kv.heads, 8);
-    assert_eq!(kv.head_dim, 80);
+    assert_eq!(kv.head_dim, 128);
     assert_eq!(kv.max_seq_len, 524288);
 }
 
@@ -340,7 +340,7 @@ fn test_k2_horizon_3_7b_vir_lowering_and_optimization() {
     assert!(!rope_insts.is_empty(), "Lowered VIR must contain RoPE instructions before fusion");
     for r in rope_insts {
         if let VirInst::RoPE { theta, .. } = r {
-            assert_eq!(*theta, 500000.0, "RoPE theta must match model ROPE_THETA constant (500000)");
+            assert_eq!(*theta, 10000000.0, "RoPE theta must match model ROPE_THETA constant (10000000)");
         }
     }
 
@@ -391,10 +391,10 @@ fn test_k2_horizon_3_7b_codegen_c99_and_cuda_zero_heap_alloc() {
     assert!(c99.contains("#define VELOX_MODEL_NUM_LAYERS               36ULL"));
     assert!(c99.contains("#define VELOX_MODEL_NUM_HEADS                32ULL"));
     assert!(c99.contains("#define VELOX_MODEL_NUM_KV_HEADS             8ULL"));
-    assert!(c99.contains("#define VELOX_MODEL_HEAD_DIM                 80ULL"));
+    assert!(c99.contains("#define VELOX_MODEL_HEAD_DIM                 128ULL"));
     assert!(c99.contains("#define VELOX_MODEL_VOCAB_SIZE               250624ULL"));
     assert!(c99.contains("#define VELOX_MODEL_MAX_SEQ_LEN              524288ULL"));
-    assert!(c99.contains("#define VELOX_MODEL_ROPE_THETA               500000.0f"));
+    assert!(c99.contains("#define VELOX_MODEL_ROPE_THETA               10000000.0f"));
     assert!(c99.contains("velox_K2_Horizon_3_7B_prefill"));
     assert!(c99.contains("velox_K2_Horizon_3_7B_decode"));
 
@@ -404,11 +404,11 @@ fn test_k2_horizon_3_7b_codegen_c99_and_cuda_zero_heap_alloc() {
     assert!(cuda.contains("#define VELOX_INTERMEDIATE_DIM               10240ULL"));
     assert!(cuda.contains("#define VELOX_NUM_LAYERS                     36ULL"));
     assert!(cuda.contains("#define VELOX_VOCAB_SIZE                     250624ULL"));
-    assert!(cuda.contains("#define VELOX_MODEL_ROPE_THETA               500000.0f"));
+    assert!(cuda.contains("#define VELOX_MODEL_ROPE_THETA               10000000.0f"));
 
     // Verify dynamic model-specific norm and lm_head weight offsets in CUDA
-    assert!(cuda.contains("#define VELOX_W_NORM_START_FP32              2031288320ULL"));
-    assert!(cuda.contains("#define VELOX_W_HEAD_START_FP32              2031662080ULL"));
+    assert!(cuda.contains("#define VELOX_W_NORM_START_FP32              2208235520ULL"));
+    assert!(cuda.contains("#define VELOX_W_HEAD_START_FP32              2208983040ULL"));
     // Verify un-clamped device activation pointer macro
     assert!(cuda.contains("#define VELOX_DEV_ACT_PTR(arena_base, offset) ((float*)((uint8_t*)(arena_base) + (offset)))"));
 
@@ -474,7 +474,7 @@ fn test_k2_horizon_3_7b_cli_driver_check_prove_emit() {
     let prove_str = String::from_utf8(prove_out).expect("UTF-8 proof output");
     assert!(prove_str.contains("VELOX COMPILE-TIME VRAM FEASIBILITY PROOF CERTIFICATE"));
     assert!(prove_str.contains("VERIFIED FEASIBLE (Q.E.D.)"));
-    assert!(prove_str.contains("#define VELOX_HOST_RAM_REQUIRED_BYTES        48318513152ULL"));
+    assert!(prove_str.contains("#define VELOX_HOST_RAM_REQUIRED_BYTES        77309542400ULL"));
 
     // 3. --emit-cuda
     let tmp_cu = std::env::temp_dir().join(format!("velox_cli_k2_{}.cu", std::process::id()));
@@ -498,8 +498,8 @@ fn test_k2_horizon_3_7b_cli_driver_check_prove_emit() {
     );
     let cu_str = fs::read_to_string(&tmp_cu).expect("read cu");
     assert!(cu_str.contains("#define VELOX_VOCAB_SIZE                     250624ULL"));
-    assert!(cu_str.contains("#define VELOX_W_NORM_START_FP32              2031288320ULL"));
-    assert!(cu_str.contains("#define VELOX_W_HEAD_START_FP32              2031662080ULL"));
+    assert!(cu_str.contains("#define VELOX_W_NORM_START_FP32              2208235520ULL"));
+    assert!(cu_str.contains("#define VELOX_W_HEAD_START_FP32              2208983040ULL"));
     assert!(cu_str.contains("#define VELOX_DEV_ACT_PTR(arena_base, offset) ((float*)((uint8_t*)(arena_base) + (offset)))"));
     let _ = fs::remove_file(&tmp_cu);
 

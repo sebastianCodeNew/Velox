@@ -535,6 +535,10 @@ pub fn run_external_runner(
     cmd.arg("--steps").arg(steps.to_string());
     cmd.arg("--verbose");
 
+    if runner_path.to_string_lossy().contains("k2") {
+        cmd.arg("--context-len").arg("16384");
+    }
+
     if let Some(threads) = threads_opt {
         cmd.env("OMP_NUM_THREADS", threads.to_string());
     }
@@ -1252,21 +1256,29 @@ fn execute_compilation(
             return EXIT_COMPILATION_ERROR;
         };
 
+        let is_k2 = first_model.name.contains("K2") || first_model.name.contains("Horizon");
+
         let weights_file = if let Some(ref w_override) = cli_args.weights_path {
             w_override.clone()
+        } else if is_k2 && Path::new("weights/k2_horizon_q4_k_m.gguf").exists() {
+            "weights/k2_horizon_q4_k_m.gguf".to_string()
         } else if let Some(first_w) = first_model.weights.first() {
             first_w
                 .file_path
                 .clone()
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "smollm-135m.safetensors".to_string())
+                .unwrap_or_else(|| if is_k2 { "k2-horizon-3.7b-int4.safetensors".to_string() } else { "smollm-135m.safetensors".to_string() })
+        } else if is_k2 {
+            "k2-horizon-3.7b-int4.safetensors".to_string()
         } else {
             "smollm-135m.safetensors".to_string()
         };
 
-        // Resolve tokenizer.json path
+        // Resolve tokenizer path
         let tokenizer_path = if let Some(ref t_path) = cli_args.tokenizer_path {
             Some(PathBuf::from(t_path))
+        } else if is_k2 && Path::new("k2_tokenizer.json").exists() {
+            Some(PathBuf::from("k2_tokenizer.json"))
         } else if Path::new("tokenizer.json").exists() {
             Some(PathBuf::from("tokenizer.json"))
         } else {
@@ -1402,6 +1414,8 @@ fn execute_compilation(
 
                 let prompt_str = if trimmed.starts_with("def ") || trimmed.starts_with("fn ") || trimmed.starts_with("class ") || trimmed.starts_with("struct ") {
                     trimmed.to_string()
+                } else if is_k2 {
+                    format!("<|ifm|im_start|>user\n{}<|ifm|im_end|>\n<|ifm|im_start|>assistant\n", trimmed)
                 } else {
                     format!("USER: {}\nASSISTANT: ", trimmed)
                 };

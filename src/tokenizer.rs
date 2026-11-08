@@ -439,12 +439,24 @@ impl Tokenizer {
                                 scanner.pos += 1;
                                 break;
                             }
-                            let merge_str = scanner.parse_string()?;
-                            if let Some(space_idx) = merge_str.find(' ') {
-                                let left = merge_str[..space_idx].to_string();
-                                let right = merge_str[space_idx + 1..].to_string();
+                            if ab == b'[' {
+                                scanner.pos += 1;
+                                let left = scanner.parse_string()?;
+                                if scanner.peek() == Some(b',') {
+                                    scanner.pos += 1;
+                                }
+                                let right = scanner.parse_string()?;
+                                scanner.expect_byte(b']')?;
                                 merges.insert((left, right), rank);
                                 rank += 1;
+                            } else {
+                                let merge_str = scanner.parse_string()?;
+                                if let Some(space_idx) = merge_str.find(' ') {
+                                    let left = merge_str[..space_idx].to_string();
+                                    let right = merge_str[space_idx + 1..].to_string();
+                                    merges.insert((left, right), rank);
+                                    rank += 1;
+                                }
                             }
                             if scanner.peek() == Some(b',') {
                                 scanner.pos += 1;

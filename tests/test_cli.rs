@@ -95,19 +95,20 @@ fn call_cli(args: &[&str]) -> (i32, String, String) {
 }
 
 fn find_binary_path() -> PathBuf {
-    let debug_path = Path::new("target").join("debug").join("veloxc.exe");
-    if debug_path.exists() {
-        return debug_path;
+    let candidates = [
+        Path::new("target").join("release").join("velox-cli.exe"),
+        Path::new("target").join("debug").join("velox-cli.exe"),
+        Path::new("velox-cli.exe").to_path_buf(),
+        Path::new("target").join("release").join("veloxc.exe"),
+        Path::new("target").join("debug").join("veloxc.exe"),
+        Path::new("veloxc.exe").to_path_buf(),
+    ];
+    for c in &candidates {
+        if c.exists() {
+            return c.clone();
+        }
     }
-    let release_path = Path::new("target").join("release").join("veloxc.exe");
-    if release_path.exists() {
-        return release_path;
-    }
-    let root_path = Path::new("veloxc.exe");
-    if root_path.exists() {
-        return root_path.to_path_buf();
-    }
-    panic!("veloxc.exe binary not found for subprocess testing");
+    panic!("velox-cli.exe or veloxc.exe binary not found for subprocess testing");
 }
 
 // ============================================================================

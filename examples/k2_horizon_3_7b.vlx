@@ -20,20 +20,20 @@ model K2_Horizon_3_7B<
     const NUM_LAYERS: usize = 36,
     const NUM_HEADS: usize = 32,
     const NUM_KV_HEADS: usize = 8,
-    const HEAD_DIM: usize = 80,
-    const ROPE_THETA: usize = 500000
+    const HEAD_DIM: usize = 128,
+    const ROPE_THETA: usize = 10000000
 > {
     // Model Parameter Weights (INT4 Quantized for 4GB VRAM Feasibility)
     @vram_immutable weight w_embed: Tensor<[VOCAB, HIDDEN_DIM], int4> = 
         safetensors("k2-horizon-3.7b.safetensors", "model.embed_tokens.weight");
 
-    @vram_immutable weight w_q: Tensor<[NUM_LAYERS, HIDDEN_DIM, 2560], int4> = 
+    @vram_immutable weight w_q: Tensor<[NUM_LAYERS, HIDDEN_DIM, 4096], int4> = 
         safetensors("k2-horizon-3.7b.safetensors", "model.layers.self_attn.q_proj.weight");
-    @vram_immutable weight w_k: Tensor<[NUM_LAYERS, HIDDEN_DIM, 640], int4> = 
+    @vram_immutable weight w_k: Tensor<[NUM_LAYERS, HIDDEN_DIM, 1024], int4> = 
         safetensors("k2-horizon-3.7b.safetensors", "model.layers.self_attn.k_proj.weight");
-    @vram_immutable weight w_v: Tensor<[NUM_LAYERS, HIDDEN_DIM, 640], int4> = 
+    @vram_immutable weight w_v: Tensor<[NUM_LAYERS, HIDDEN_DIM, 1024], int4> = 
         safetensors("k2-horizon-3.7b.safetensors", "model.layers.self_attn.v_proj.weight");
-    @vram_immutable weight w_o: Tensor<[NUM_LAYERS, 2560, HIDDEN_DIM], int4> = 
+    @vram_immutable weight w_o: Tensor<[NUM_LAYERS, 4096, HIDDEN_DIM], int4> = 
         safetensors("k2-horizon-3.7b.safetensors", "model.layers.self_attn.o_proj.weight");
 
     @vram_immutable weight w_gate: Tensor<[NUM_LAYERS, HIDDEN_DIM, INTERMEDIATE_DIM], int4> = 
@@ -43,11 +43,11 @@ model K2_Horizon_3_7B<
     @vram_immutable weight w_down: Tensor<[NUM_LAYERS, INTERMEDIATE_DIM, HIDDEN_DIM], int4> = 
         safetensors("k2-horizon-3.7b.safetensors", "model.layers.mlp.down_proj.weight");
 
-    @vram_immutable weight w_input_norm: Tensor<[NUM_LAYERS, HIDDEN_DIM], f16> = 
+    @vram_immutable weight w_input_norm: Tensor<[NUM_LAYERS, HIDDEN_DIM], f32> = 
         safetensors("k2-horizon-3.7b.safetensors", "model.layers.input_layernorm.weight");
-    @vram_immutable weight w_post_norm: Tensor<[NUM_LAYERS, HIDDEN_DIM], f16> = 
+    @vram_immutable weight w_post_norm: Tensor<[NUM_LAYERS, HIDDEN_DIM], f32> = 
         safetensors("k2-horizon-3.7b.safetensors", "model.layers.post_attention_layernorm.weight");
-    @vram_immutable weight w_norm: Tensor<[HIDDEN_DIM], f16> = 
+    @vram_immutable weight w_norm: Tensor<[HIDDEN_DIM], f32> = 
         safetensors("k2-horizon-3.7b.safetensors", "model.norm.weight");
     @vram_immutable weight w_lm_head: Tensor<[HIDDEN_DIM, VOCAB], int4> = 
         safetensors("k2-horizon-3.7b.safetensors", "lm_head.weight");
