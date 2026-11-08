@@ -567,7 +567,10 @@ impl<'a> Parser<'a> {
                         }
                     }
                 }
-            } else if matches!(self.current().token_type, TokenType::Let) {
+            } else if matches!(
+                self.current().token_type,
+                TokenType::Let | TokenType::AttrPagedVram | TokenType::AttrHostPinned
+            ) {
                 match self.parse_kv_cache() {
                     Ok(kv) => kv_caches.push(kv),
                     Err(_) => {
@@ -801,14 +804,35 @@ impl<'a> Parser<'a> {
     // -------------------------------------------------------------------------
 
     pub fn parse_kv_cache(&mut self) -> Result<KVCacheDeclarationNode, ParseError> {
-        let let_tok = self.consume(TokenType::Let, "Expected 'let'", DiagnosticCode::E015)?;
+        let start_loc = self.current().span.start;
+        let mut outer_tier = None;
+        if self.check(&TokenType::AttrPagedVram) {
+            self.advance();
+            outer_tier = Some(MemoryTier::PagedVram);
+        } else if self.check(&TokenType::AttrHostPinned) {
+            self.advance();
+            outer_tier = Some(MemoryTier::HostPinned);
+        }
+
+        let _let_tok = self.consume(TokenType::Let, "Expected 'let'", DiagnosticCode::E015)?;
         let is_mut = self.match_token(&TokenType::Mut);
         let name_tok = self.parse_identifier_token("Expected KV cache identifier")?;
         self.consume(TokenType::Colon, "Expected ':' after KV cache identifier", DiagnosticCode::E015)?;
 
-        let type_spec = self.parse_type_spec()?;
+        let mut type_spec = self.parse_type_spec()?;
+        if let Some(ot) = outer_tier {
+            type_spec.tier = Some(ot);
+            match &mut type_spec.kind {
+                TypeKind::PagedKV(p) => p.tier = ot,
+                TypeKind::VirtualKV(v) => v.tier = ot,
+                TypeKind::LatentKV(l) => l.tier = ot,
+                TypeKind::StreamingKV(s) => s.tier = ot,
+                TypeKind::SpeculativeTree(t) => t.tier = ot,
+                _ => {}
+            }
+        }
         let semi_tok = self.consume(TokenType::Semicolon, "Expected ';' after KV cache declaration", DiagnosticCode::E015)?;
-        let span = let_tok.span.merge(&semi_tok.span);
+        let span = SourceSpan::new(self.file_path.clone(), start_loc, semi_tok.span.end);
 
         let mut node = KVCacheDeclarationNode::new(name_tok.text, is_mut, span);
         node.cache_type = Some(type_spec);

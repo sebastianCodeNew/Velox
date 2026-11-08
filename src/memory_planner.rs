@@ -99,6 +99,7 @@ pub struct MemoryPlan {
     pub activation_arena_bytes: u64,
     pub system_reserve_bytes: u64,
     pub total_required_vram_bytes: u64,
+    pub host_ram_bytes: u64,
     pub utilization_ratio: f64,
     pub is_feasible: bool,
     pub weight_offsets: Vec<PlannedWeightOffset>,
@@ -153,6 +154,8 @@ impl MemoryPlan {
             self.total_required_vram_bytes,
             self.total_required_vram_bytes as f64 / (1024.0 * 1024.0),
             self.utilization_ratio * 100.0);
+        let _ = writeln!(out, "#define VELOX_HOST_RAM_REQUIRED_BYTES        {}ULL /* {:.2} MiB */",
+            self.host_ram_bytes, self.host_ram_bytes as f64 / (1024.0 * 1024.0));
         let _ = writeln!(out, "#define VELOX_ARENA_ALIGNMENT_BYTES          256ULL");
         let _ = writeln!(out);
 
@@ -280,49 +283,71 @@ impl StaticMemoryPlanner {
         let b_max = model.constants.get("B_MAX").copied().unwrap_or(1) as u64;
         let s_max = model.constants.get("S_MAX").copied().unwrap_or(2048) as u64;
 
-        // 1. Plan Tier 1: Immutable Weight Arena (@vram_immutable)
+        // 1. Plan Tier 1: Immutable Weight Arena (@vram_immutable vs @host_pinned)
         // Note: When offline MLA matrix absorption (w_absorbed_q / w_absorbed_o) is present,
         // the uncompressed w_uk and w_uv are folded offline prior to deployment.
         let has_absorbed_mla = model.weights.iter().any(|w| w.is_absorbed);
         let mut weight_offset_cursor = 0u64;
+        let mut host_weight_offset_cursor = 0u64;
         let mut weight_offsets = Vec::with_capacity(model.weights.len());
 
         for w in &model.weights {
             let folded_offline = has_absorbed_mla && matches!(w.name.as_str(), "w_uk" | "w_uv");
             let effective_bytes = if folded_offline { 0 } else { w.size_bytes };
             let aligned = align_up_256(effective_bytes);
+            let is_vram = w.tier.is_device_tier();
+            let offset = if is_vram {
+                let off = weight_offset_cursor;
+                weight_offset_cursor += aligned;
+                off
+            } else {
+                let off = host_weight_offset_cursor;
+                host_weight_offset_cursor += aligned;
+                off
+            };
 
             weight_offsets.push(PlannedWeightOffset {
                 name: w.name.clone(),
-                offset_bytes: weight_offset_cursor,
+                offset_bytes: offset,
                 size_bytes: effective_bytes,
                 aligned_size_bytes: aligned,
                 shape: w.shape.clone(),
                 dtype: w.dtype,
                 is_absorbed: w.is_absorbed,
             });
-            weight_offset_cursor += aligned;
         }
         let weight_arena_bytes = weight_offset_cursor;
 
-        // 2. Plan Tier 2: Native KV-Cache Pool (@paged_vram)
+        // 2. Plan Tier 2: Native KV-Cache Pool (@paged_vram vs @host_pinned)
         let mut kv_offset_cursor = 0u64;
+        let mut host_kv_offset_cursor = 0u64;
         let mut kv_pools = Vec::with_capacity(model.kv_caches.len());
 
         for kv in &model.kv_caches {
             let (data_bytes, meta_bytes) = Self::compute_kv_cache_bytes(kv, b_max, s_max);
             let total_aligned = align_up_256(data_bytes + meta_bytes);
+            let is_vram = kv.tier.is_device_tier();
+            let offset = if is_vram {
+                let off = kv_offset_cursor;
+                kv_offset_cursor += total_aligned;
+                off
+            } else {
+                let off = host_kv_offset_cursor;
+                host_kv_offset_cursor += total_aligned;
+                off
+            };
+
             kv_pools.push(PlannedKVCachePool {
                 name: kv.name.clone(),
                 kind: kv.kind,
-                offset_bytes: kv_offset_cursor,
+                offset_bytes: offset,
                 data_bytes,
                 metadata_bytes: meta_bytes,
                 total_aligned_bytes: total_aligned,
             });
-            kv_offset_cursor += total_aligned;
         }
         let kv_cache_pool_bytes = kv_offset_cursor;
+        let host_ram_bytes = host_weight_offset_cursor + host_kv_offset_cursor;
 
         // 3. Plan Tier 3: Velox Activation Arena via Liveness & FFD Interval Graph Coloring
         let mut scope_plans = Vec::with_capacity(model.scopes.len());
@@ -387,6 +412,7 @@ impl StaticMemoryPlanner {
             activation_arena_bytes,
             system_reserve_bytes,
             total_required_vram_bytes,
+            host_ram_bytes,
             utilization_ratio,
             is_feasible,
             weight_offsets,

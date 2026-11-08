@@ -2410,7 +2410,7 @@ impl SemanticAnalyzer {
                         }
                         return EvaluatedType::Tensor {
                             shape: out_shape,
-                            dtype: if *w_dt == ScalarType::Fp8E4m3 {
+                            dtype: if *w_dt == ScalarType::Fp8E4m3 || *w_dt == ScalarType::Int4 {
                                 ScalarType::F16
                             } else {
                                 *w_dt
@@ -2469,10 +2469,56 @@ impl SemanticAnalyzer {
                         .cloned()
                         .unwrap_or(EvaluatedType::Primitive(ScalarType::F16))
                 }
-                "flash_prefill" | "flash_decode" | "flash_tree_attention" => arg_types
+                "flash_prefill" | "flash_decode" | "flash_tree_attention" | "gqa_attention" => arg_types
                     .first()
                     .cloned()
                     .unwrap_or(EvaluatedType::Primitive(ScalarType::F16)),
+                "qkv_proj" => {
+                    if let (
+                        Some(EvaluatedType::Tensor { shape: x_s, dtype: x_dt, tier: x_t }),
+                        Some(EvaluatedType::Tensor { shape: q_s, .. }),
+                        Some(EvaluatedType::Tensor { shape: k_s, .. }),
+                        Some(EvaluatedType::Tensor { shape: v_s, .. }),
+                    ) = (arg_types.first(), arg_types.get(1), arg_types.get(2), arg_types.get(3))
+                    {
+                        let mut q_shape = x_s[..x_s.len().saturating_sub(1)].to_vec();
+                        if let Some(d) = q_s.last() { q_shape.push(d.clone()); }
+                        let mut k_shape = x_s[..x_s.len().saturating_sub(1)].to_vec();
+                        if let Some(d) = k_s.last() { k_shape.push(d.clone()); }
+                        let mut v_shape = x_s[..x_s.len().saturating_sub(1)].to_vec();
+                        if let Some(d) = v_s.last() { v_shape.push(d.clone()); }
+
+                        EvaluatedType::Tuple(vec![
+                            EvaluatedType::Tensor { shape: q_shape, dtype: *x_dt, tier: *x_t },
+                            EvaluatedType::Tensor { shape: k_shape, dtype: *x_dt, tier: *x_t },
+                            EvaluatedType::Tensor { shape: v_shape, dtype: *x_dt, tier: *x_t },
+                        ])
+                    } else if arg_types.len() >= 4 {
+                        EvaluatedType::Tuple(vec![
+                            arg_types[0].clone(),
+                            arg_types[0].clone(),
+                            arg_types[0].clone(),
+                        ])
+                    } else {
+                        arg_types
+                            .first()
+                            .cloned()
+                            .unwrap_or(EvaluatedType::Primitive(ScalarType::F16))
+                    }
+                }
+                "lm_head" => {
+                    let vocab = consts.get("VOCAB").copied().unwrap_or(250624);
+                    if let Some(EvaluatedType::Tensor { shape, .. }) = arg_types.first() {
+                        let b_dim = shape.first().cloned().unwrap_or(SymbolicDim::Concrete(1));
+                        EvaluatedType::Tensor {
+                            shape: vec![b_dim, SymbolicDim::Concrete(1), SymbolicDim::Concrete(vocab)],
+                            dtype: ScalarType::F32,
+                            tier: MemoryTier::BumpSram,
+                        }
+                    } else {
+                        EvaluatedType::Primitive(ScalarType::F32)
+                    }
+                }
                 "mla_decode_absorbed" => {
                     let hidden_dim = consts.get("HIDDEN_DIM").copied().unwrap_or(7168);
                     if let Some(EvaluatedType::Tensor { shape, dtype, .. }) = arg_types.first() {
