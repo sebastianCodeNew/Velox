@@ -19,8 +19,8 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
-// Override maximum context window length for physical hardware runner (1024 tokens)
-#define VELOX_MODEL_MAX_SEQ_LEN           1024ULL
+// Configure maximum sequence length to 16,384 tokens (16K Context Window)
+#define VELOX_MODEL_MAX_SEQ_LEN           16384ULL
 
 // Include the emitted standalone CUDA model kernels & execution DAG
 #include "k2_horizon_3_7b.cu"
@@ -254,7 +254,9 @@ int main(int argc, char** argv) {
     uint8_t* d_weight_arena = NULL;
     uint8_t* d_weight_scales = NULL;
     uint8_t* d_activation = NULL;
+    uint8_t* h_kv_cache = NULL;
     uint8_t* d_kv_cache = NULL;
+    bool is_kv_in_vram = false;
     uint32_t* h_ring = NULL;
     uint32_t* d_ring = NULL;
 
@@ -280,12 +282,26 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Allocate KV Cache in high-speed device VRAM
-    err = cudaMalloc((void**)&d_kv_cache, kv_pool_bytes);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc d_kv_cache (%zu MiB) failed: %s\n",
-                kv_pool_bytes / (1024 * 1024), cudaGetErrorString(err));
-        return 1;
+    // Allocate KV Cache: if <= 1024 MiB, allocate in high-speed GDDR6 VRAM; otherwise in Host-Pinned System RAM
+    if (kv_pool_bytes <= 1024ULL * 1024 * 1024) {
+        err = cudaMalloc((void**)&d_kv_cache, kv_pool_bytes);
+        if (err == cudaSuccess) {
+            is_kv_in_vram = true;
+        }
+    }
+    if (!is_kv_in_vram) {
+        // Tier 4 Host-Pinned System RAM (UVA Zero-Copy Mapping for 16K Context)
+        err = cudaHostAlloc((void**)&h_kv_cache, kv_pool_bytes, cudaHostAllocMapped);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "cudaHostAlloc h_kv_cache (%zu MiB) failed: %s\n",
+                    kv_pool_bytes / (1024 * 1024), cudaGetErrorString(err));
+            return 1;
+        }
+        err = cudaHostGetDevicePointer((void**)&d_kv_cache, h_kv_cache, 0);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "cudaHostGetDevicePointer failed: %s\n", cudaGetErrorString(err));
+            return 1;
+        }
     }
 
     // Host-pinned ring buffer for zero-copy D2H token reading
@@ -471,8 +487,13 @@ int main(int argc, char** argv) {
     printf("Device VRAM Allocated  : %.2f MiB (%.2f%% of 4096 MiB RTX 3050)\n",
            (double)(weight_bytes + scales_bytes + act_arena_bytes) / (1024.0 * 1024.0),
            ((double)(weight_bytes + scales_bytes + act_arena_bytes) / (double)prop.totalGlobalMem) * 100.0);
-    printf("Host-Pinned KV Cache   : %.2f MiB (Mapped via UVA zero-copy, max %zu tokens)\n",
-           (double)kv_pool_bytes / (1024.0 * 1024.0), max_context_tokens);
+    if (is_kv_in_vram) {
+        printf("KV Cache Allocation    : %.2f MiB in High-Speed Dedicated GDDR6 VRAM (%llu Tokens)\n",
+               (double)kv_pool_bytes / (1024.0 * 1024.0), (unsigned long long)VELOX_MODEL_MAX_SEQ_LEN);
+    } else {
+        printf("KV Cache Allocation    : %.2f MiB in Tier 4 Host-Pinned System RAM (%llu Tokens, UVA Zero-Copy)\n",
+               (double)kv_pool_bytes / (1024.0 * 1024.0), (unsigned long long)VELOX_MODEL_MAX_SEQ_LEN);
+    }
     printf("Prompt Tokens (%zu)      : [", prompt_len);
     for (size_t i = 0; i < prompt_len; ++i) {
         printf("%u%s", prompt_tokens[i], (i + 1 < prompt_len) ? ", " : "");
@@ -524,7 +545,11 @@ int main(int argc, char** argv) {
     cudaFree(d_weight_arena);
     cudaFree(d_weight_scales);
     cudaFree(d_activation);
-    cudaFree(d_kv_cache);
+    if (is_kv_in_vram) {
+        cudaFree(d_kv_cache);
+    } else {
+        cudaFreeHost(h_kv_cache);
+    }
     cudaFreeHost(h_ring);
     if (has_weights_file) {
         win32_safetensors_close(&st_map);
