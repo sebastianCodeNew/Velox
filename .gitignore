@@ -10,6 +10,8 @@
 *.pth
 *.onnx
 tokenizer.json
+k2_tokenizer.json
+/weights/
 
 # Release binary copied to repo root by build.ps1
 /veloxc.exe
