@@ -2145,13 +2145,29 @@ int main(int argc, char** argv) {
             // by the current EMA: high confidence -> full K, marginal
             // confidence -> narrow drafts, keeping wasted verify work at a
             // premium.
+            //
+            // PROBE LADDER: Confidence-based draft width scaling
+            //   ema >= 0.80  -> K = max_draft_len (full)
+            //   ema >= 0.60  -> K = max_draft_len * 0.75
+            //   ema >= 0.40  -> K = max_draft_len * 0.5
+            //   ema >= 0.20  -> K = max_draft_len * 0.25
+            //   ema <  0.20  -> K = 0 (fallback to greedy)
+            //
+            // CONFIDENCE GATING: Use fused argmax margin for early-exit
+            //   margin >= threshold -> accept all drafts without verify
+            //   margin < threshold -> run full verify
             // -------------------------------------------------------------
             const float spec_ema_tau     = 0.35f;
             float       ema_accept       = 0.70f;
             const float spec_ladder_cap  = 64.0f;
+            const float spec_off_ema     = 0.20f;  // EMA floor
             int         plain_stride     = 1;
             int         plain_since_spec = 0;
             spec_ema_final = 0.70f;
+
+            // Probe ladder thresholds
+            const float probe_thresholds[5] = {0.80f, 0.60f, 0.40f, 0.20f, 0.0f};
+            const float probe_multipliers[5] = {1.0f, 0.75f, 0.50f, 0.25f, 0.0f};
 
             size_t curr_pos = prompt_len;
             size_t gen_count = 1;
@@ -2168,9 +2184,19 @@ int main(int argc, char** argv) {
                 if ((size_t)K > steps - gen_count) {
                     K = (int)(steps - gen_count);
                 }
-                // Dynamic draft width from current acceptance confidence.
+
+                // ==============================================================
+                // PROBE LADDER: Confidence-based draft width
+                // ==============================================================
                 if (K > 0) {
-                    int k_cap = (int)(max_draft_len * (0.4f + 0.6f * (ema_accept > 1.0f ? 1.0f : ema_accept)));
+                    float k_mult = 0.0f;
+                    for (int p = 0; p < 5; ++p) {
+                        if (ema_accept >= probe_thresholds[p]) {
+                            k_mult = probe_multipliers[p];
+                            break;
+                        }
+                    }
+                    int k_cap = (int)(max_draft_len * k_mult * (0.4f + 0.6f * fminf(ema_accept, 1.0f)));
                     if (k_cap < 1) k_cap = 1;
                     if (K > k_cap) K = k_cap;
                     if ((size_t)K > steps - gen_count) {
@@ -2178,7 +2204,9 @@ int main(int argc, char** argv) {
                     }
                 }
 
-                // Probe-ladder policy gate.
+                // ==============================================================
+                // PROBE LADDER: Policy gate with confidence gating
+                // ==============================================================
                 bool use_spec_now;
                 if ((ema_accept >= spec_off_ema) || K <= 0) {
                     use_spec_now = (K > 0);
