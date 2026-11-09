@@ -1,0 +1,9 @@
+﻿python : Traceback (most recent call last):
+At line:1 char:32
++ cd C:\Sebastian\Project\Velox; python -c "
++                                ~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Traceback (most recent call last)::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  File "<string>", line 7, in <module>
+Exception: The system cannot find the path specified. (os error 3)
