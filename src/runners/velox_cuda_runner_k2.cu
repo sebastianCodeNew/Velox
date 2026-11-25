@@ -2444,6 +2444,21 @@ int main(int argc, char** argv) {
                (double)kv_pool_bytes / (1024.0 * 1024.0), (unsigned long long)VELOX_MODEL_MAX_SEQ_LEN);
     }
 
+    // Quantization accounting for the LM head. The GGUF stores the head as
+    // Q6_K; Velox unpacks it and re-packs to 4-bit group-64 to fit the 4 GB
+    // budget. That reduces the head's weight traffic relative to an engine
+    // that reads native Q6_K, so any cross-engine throughput comparison must
+    // account for it. Reported explicitly rather than left implicit.
+    {
+        const double head_params = (double)VELOX_VOCAB_SIZE * (double)VELOX_HIDDEN_DIM;
+        const double q4_head_bytes = head_params / 2.0;          // 4 bits per weight
+        const double q6_head_bytes = head_params * 6.5 / 8.0;    // Q6_K: 6 bits + 2 bits/block
+        printf("LM Head Quantization   : GGUF Q6_K -> re-packed 4-bit group-64 (Velox)\n");
+        printf("LM Head Weight Bytes   : %.0f B (Velox) vs %.0f B native Q6_K (%.0f MiB saved)\n",
+               q4_head_bytes, q6_head_bytes, (q6_head_bytes - q4_head_bytes) / (1024.0 * 1024.0));
+        printf("                       : cross-engine comparisons are NOT quantization-fair\n");
+    }
+
     printf("Prompt Tokens (%zu)      : [", prompt_len);
     for (size_t i = 0; i < prompt_len; ++i) {
         printf("%u%s", prompt_tokens[i], (i + 1 < prompt_len) ? ", " : "");
