@@ -481,6 +481,77 @@ fn test_cli_backend_flags_parsing_direct() {
 }
 
 #[test]
+fn test_cli_sampling_flags_parse() {
+    let temp = TempDir::new("sampling_flags");
+    let file = temp.write_file("test.vlx", MINIMAL_VALID_VLX);
+
+    let (code, _, stderr) = call_cli(&[
+        "--check",
+        "--temperature",
+        "0.7",
+        "--top-k",
+        "40",
+        "--top-p",
+        "0.9",
+        "--min-p",
+        "0.05",
+        "--repetition-penalty",
+        "1.1",
+        "--frequency-penalty",
+        "0.1",
+        "--presence-penalty",
+        "0.2",
+        "--seed",
+        "42",
+        file.to_str().unwrap(),
+    ]);
+    assert_eq!(code, EXIT_SUCCESS, "stderr: {stderr}");
+}
+
+#[test]
+fn test_cli_sampling_flags_reject_bad_values() {
+    let temp = TempDir::new("sampling_bad");
+    let file = temp.write_file("test.vlx", MINIMAL_VALID_VLX);
+
+    let (code, _, stderr) = call_cli(&[
+        "--check",
+        "--top-p",
+        "not-a-number",
+        file.to_str().unwrap(),
+    ]);
+    assert_eq!(code, EXIT_USAGE_ERROR);
+    assert!(stderr.contains("invalid float for --top-p"));
+}
+
+#[test]
+fn test_cli_sampling_params_map_to_sampler_config() {
+    use veloxc::cli::CliArgs;
+
+    let args = CliArgs {
+        temperature: 0.7,
+        top_k: 40,
+        top_p: 0.9,
+        min_p: 0.05,
+        repetition_penalty: 1.1,
+        frequency_penalty: 0.2,
+        presence_penalty: 0.3,
+        seed: 42,
+        ..CliArgs::default()
+    };
+    let params = args.sampling_params();
+    assert_eq!(params.temperature, 0.7);
+    assert_eq!(params.top_k, 40);
+    assert_eq!(params.top_p, 0.9);
+    assert_eq!(params.min_p, 0.05);
+    assert_eq!(params.repetition_penalty, 1.1);
+    assert_eq!(params.frequency_penalty, 0.2);
+    assert_eq!(params.presence_penalty, 0.3);
+    assert_eq!(params.seed, 42);
+    assert!(params.validate().is_ok());
+    assert!(!params.is_greedy());
+}
+
+#[test]
 fn test_cli_run_rust_backend_with_tokens_parity() {
     let weights = Path::new("smollm-135m.safetensors");
     if !weights.exists() {

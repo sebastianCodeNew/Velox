@@ -18,6 +18,7 @@
 //! Zero external dependencies (`std` only).
 
 use crate::diagnostics::DiagnosticCode;
+use crate::sampling::{SamplerSession, SamplingParams};
 use crate::types::ScalarType;
 use std::collections::HashMap;
 use std::fs::File;
@@ -1498,6 +1499,98 @@ impl VeloxStaticExecutionEngine {
         output_buffer: &mut [u32],
     ) -> usize {
         self.generate_greedy_streaming(prompt_tokens, num_new_tokens, output_buffer, |_, _| {})
+    }
+
+    /// Runs prefill and autoregressive generation with the advanced sampler
+    /// (temperature, top-k, top-p, min-p, and repetition/frequency/presence
+    /// penalties). The sampler's scratch buffers are allocated once at stream
+    /// start; the per-token path performs no additional heap allocation when
+    /// the caller sizes `output_buffer` for `num_new_tokens`.
+    ///
+    /// This is the CPU reference engine. The CUDA runner currently exposes
+    /// argmax tokens only; a GPU sampler will be wired through the same
+    /// `SamplingParams` contract.
+    pub fn generate_sampled_streaming<F: FnMut(usize, u32)>(
+        &mut self,
+        prompt_tokens: &[u32],
+        num_new_tokens: usize,
+        params: SamplingParams,
+        output_buffer: &mut [u32],
+        on_token: F,
+    ) -> Result<usize, String> {
+        let history_capacity = prompt_tokens.len().saturating_add(num_new_tokens);
+        let mut session = SamplerSession::new(params, self.config.vocab_size, history_capacity)?;
+        Ok(self.generate_sampled_streaming_with_session(
+            prompt_tokens,
+            num_new_tokens,
+            &mut session,
+            output_buffer,
+            on_token,
+        ))
+    }
+
+    /// Runs generation using a pre-built [`SamplerSession`].
+    ///
+    /// The session owns the sampler scratch and history allocation, so this
+    /// method performs no heap allocation when the session was created with
+    /// `max_history >= prompt_tokens.len() + num_new_tokens`.
+    pub fn generate_sampled_streaming_with_session<F: FnMut(usize, u32)>(
+        &mut self,
+        prompt_tokens: &[u32],
+        num_new_tokens: usize,
+        session: &mut SamplerSession,
+        output_buffer: &mut [u32],
+        mut on_token: F,
+    ) -> usize {
+        assert!(!prompt_tokens.is_empty(), "Prompt tokens must not be empty");
+        assert!(output_buffer.len() >= num_new_tokens);
+
+        session.clear_history();
+
+        let mut pos = 0usize;
+        for &token in prompt_tokens {
+            let _ = self.forward_step(token, pos);
+            pos += 1;
+            session.push(token);
+        }
+
+        if num_new_tokens == 0 {
+            return 0;
+        }
+
+        // `forward_step` leaves the logits for the next token in `self.logits`.
+        let mut next_token = session.sample(&self.logits);
+        output_buffer[0] = next_token;
+        on_token(0, next_token);
+        session.push(next_token);
+
+        for step in 1..num_new_tokens {
+            let _ = self.forward_step(next_token, pos);
+            pos += 1;
+            next_token = session.sample(&self.logits);
+            output_buffer[step] = next_token;
+            on_token(step, next_token);
+            session.push(next_token);
+        }
+
+        num_new_tokens
+    }
+
+    /// Non-streaming variant of [`Self::generate_sampled_streaming`].
+    pub fn generate_sampled_into(
+        &mut self,
+        prompt_tokens: &[u32],
+        num_new_tokens: usize,
+        params: SamplingParams,
+        output_buffer: &mut [u32],
+    ) -> Result<usize, String> {
+        self.generate_sampled_streaming(
+            prompt_tokens,
+            num_new_tokens,
+            params,
+            output_buffer,
+            |_, _| {},
+        )
     }
 }
 

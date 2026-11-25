@@ -38,6 +38,8 @@ __pycache__/
 # Benchmark & GPU harness outputs
 /bench/results/raw/
 /gpu/build/
+build_*.log
+prefill_*.log
 
 # Local environment
 .env

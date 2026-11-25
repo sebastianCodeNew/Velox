@@ -14,6 +14,7 @@ use crate::memory_planner::StaticMemoryPlanner;
 use crate::optimizer::optimize_vir_module;
 use crate::parser::Parser;
 use crate::runtime::{TransformerConfig, VeloxStaticExecutionEngine};
+use crate::sampling::{SamplerSession, SamplingParams};
 use crate::sema::SemanticAnalyzer;
 use crate::tokens::{Token, TokenType};
 use crate::types::AbsorbKind;
@@ -145,6 +146,39 @@ pub struct CliArgs {
     pub no_color: bool,
     pub output: Option<String>,
     pub verbose: bool,
+    /// Sampling temperature; `<= 0.0` selects greedy argmax.
+    pub temperature: f32,
+    /// Keep only the highest-logit `top_k` tokens; `0` disables.
+    pub top_k: usize,
+    /// Nucleus probability mass in `(0, 1]`.
+    pub top_p: f32,
+    /// Minimum token probability relative to the top token.
+    pub min_p: f32,
+    /// Repetition penalty divisor (`> 0`); `1.0` disables.
+    pub repetition_penalty: f32,
+    /// Additive frequency penalty.
+    pub frequency_penalty: f32,
+    /// Additive one-time presence penalty.
+    pub presence_penalty: f32,
+    /// Deterministic seed for stochastic sampling.
+    pub seed: u64,
+}
+
+impl CliArgs {
+    /// Builds the validated sampler configuration for this invocation.
+    #[must_use]
+    pub fn sampling_params(&self) -> SamplingParams {
+        SamplingParams {
+            temperature: self.temperature,
+            top_k: self.top_k,
+            top_p: self.top_p,
+            min_p: self.min_p,
+            repetition_penalty: self.repetition_penalty,
+            frequency_penalty: self.frequency_penalty,
+            presence_penalty: self.presence_penalty,
+            seed: self.seed,
+        }
+    }
 }
 
 impl Default for CliArgs {
@@ -160,7 +194,7 @@ impl Default for CliArgs {
             emit_ir: false,
             run_model: false,
             chat: false,
-            backend: ExecutionBackend::Rust,
+            backend: ExecutionBackend::Auto,
             weights_path: None,
             tokenizer_path: None,
             prompt_text: None,
@@ -174,6 +208,14 @@ impl Default for CliArgs {
             no_color: false,
             output: None,
             verbose: false,
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            seed: 0x5EED_0F_5EED_0F5E,
         }
     }
 }
@@ -247,6 +289,12 @@ pub fn parse_cli_args(raw_args: &[String]) -> Result<CliAction, String> {
             idx += 1;
         } else if arg == "--run" {
             cli_args.run_model = true;
+            // The CUDA/C99 runners have no SmolLM implementation. For the
+            // CPU reference architecture, --run without an explicit backend
+            // must stay on Rust; Auto still upgrades K2 to CUDA.
+            if cli_args.backend == ExecutionBackend::Auto {
+                cli_args.backend = ExecutionBackend::Rust;
+            }
             idx += 1;
         } else if arg == "--chat" {
             cli_args.chat = true;
@@ -462,6 +510,64 @@ pub fn parse_cli_args(raw_args: &[String]) -> Result<CliAction, String> {
                 }
             }
             idx += 1;
+        } else if arg == "--temperature" {
+            cli_args.temperature = parse_f32_arg(args, idx, arg, "temperature")?;
+            idx += 2;
+        } else if let Some(v) = arg.strip_prefix("--temperature=") {
+            cli_args.temperature = parse_f32_value(v, "temperature")?;
+            idx += 1;
+        } else if arg == "--top-k" {
+            if idx + 1 >= args.len() {
+                return Err("error: flag '--top-k' requires an integer argument".to_string());
+            }
+            cli_args.top_k = parse_usize_value(&args[idx + 1], "top-k")?;
+            idx += 2;
+        } else if let Some(v) = arg.strip_prefix("--top-k=") {
+            cli_args.top_k = parse_usize_value(v, "top-k")?;
+            idx += 1;
+        } else if arg == "--top-p" {
+            cli_args.top_p = parse_f32_arg(args, idx, arg, "top-p")?;
+            idx += 2;
+        } else if let Some(v) = arg.strip_prefix("--top-p=") {
+            cli_args.top_p = parse_f32_value(v, "top-p")?;
+            idx += 1;
+        } else if arg == "--min-p" {
+            cli_args.min_p = parse_f32_arg(args, idx, arg, "min-p")?;
+            idx += 2;
+        } else if let Some(v) = arg.strip_prefix("--min-p=") {
+            cli_args.min_p = parse_f32_value(v, "min-p")?;
+            idx += 1;
+        } else if arg == "--repetition-penalty" {
+            cli_args.repetition_penalty = parse_f32_arg(args, idx, arg, "repetition-penalty")?;
+            idx += 2;
+        } else if let Some(v) = arg.strip_prefix("--repetition-penalty=") {
+            cli_args.repetition_penalty = parse_f32_value(v, "repetition-penalty")?;
+            idx += 1;
+        } else if arg == "--frequency-penalty" {
+            cli_args.frequency_penalty = parse_f32_arg(args, idx, arg, "frequency-penalty")?;
+            idx += 2;
+        } else if let Some(v) = arg.strip_prefix("--frequency-penalty=") {
+            cli_args.frequency_penalty = parse_f32_value(v, "frequency-penalty")?;
+            idx += 1;
+        } else if arg == "--presence-penalty" {
+            cli_args.presence_penalty = parse_f32_arg(args, idx, arg, "presence-penalty")?;
+            idx += 2;
+        } else if let Some(v) = arg.strip_prefix("--presence-penalty=") {
+            cli_args.presence_penalty = parse_f32_value(v, "presence-penalty")?;
+            idx += 1;
+        } else if arg == "--seed" {
+            if idx + 1 >= args.len() {
+                return Err("error: flag '--seed' requires an unsigned 64-bit integer".to_string());
+            }
+            cli_args.seed = args[idx + 1]
+                .parse::<u64>()
+                .map_err(|_| format!("error: invalid integer for --seed: '{}'", args[idx + 1]))?;
+            idx += 2;
+        } else if let Some(v) = arg.strip_prefix("--seed=") {
+            cli_args.seed = v
+                .parse::<u64>()
+                .map_err(|_| format!("error: invalid integer for --seed: '{v}'"))?;
+            idx += 1;
         } else if arg == "--format" {
             if idx + 1 >= args.len() {
                 return Err("error: flag '--format' requires an argument (choose from 'text', 'json')".to_string());
@@ -526,6 +632,23 @@ pub fn parse_cli_args(raw_args: &[String]) -> Result<CliAction, String> {
     Ok(CliAction::Run(cli_args))
 }
 
+fn parse_f32_arg(args: &[String], idx: usize, flag: &str, field: &str) -> Result<f32, String> {
+    if idx + 1 >= args.len() {
+        return Err(format!("error: flag '{flag}' requires a numeric argument"));
+    }
+    parse_f32_value(&args[idx + 1], field)
+}
+
+fn parse_f32_value(raw: &str, field: &str) -> Result<f32, String> {
+    raw.parse::<f32>()
+        .map_err(|_| format!("error: invalid float for --{field}: '{raw}'"))
+}
+
+fn parse_usize_value(raw: &str, field: &str) -> Result<usize, String> {
+    raw.parse::<usize>()
+        .map_err(|_| format!("error: invalid integer for --{field}: '{raw}'"))
+}
+
 fn parse_token_list(raw: &str) -> Result<Vec<u32>, String> {
     let mut out = Vec::new();
     for part in raw.split(',') {
@@ -565,11 +688,19 @@ options:
   --emit-cuda            Emit standalone zero-allocation NVIDIA CUDA source (.cu).
   --run                  Execute model natively using zero-copy safetensors mmap.
   --chat                 Launch interactive native coding REPL (100% zero-Python).
-  --backend <backend>    Execution backend: cuda, c99, rust, auto (default: auto).
+  --backend <backend>    Execution backend: cuda, c99, rust, auto (default: auto; K2 uses CUDA when available).
   --prompt \"<text>\"      Input text prompt (encoded via native BPE tokenizer).
   --tokens <ids>         Comma-separated input prompt token IDs for --run.
   --prompt-tokens <ids>  Alias for --tokens.
   --steps <N>            Number of tokens to generate during --run (default: 32).
+  --temperature <t>      Sampling temperature; <= 0 selects greedy argmax (default: 0).
+  --top-k <N>            Keep only the N highest-logit tokens; 0 disables (default: 0).
+  --top-p <p>            Nucleus probability mass in (0, 1] (default: 1.0).
+  --min-p <p>            Minimum token probability relative to the top token (default: 0.0).
+  --repetition-penalty <r> Divide logits of repeated tokens by r > 0 (default: 1.0).
+  --frequency-penalty <f> Subtract f * occurrence_count from repeated logits (default: 0).
+  --presence-penalty <p> Subtract p once for any repeated token (default: 0).
+  --seed <N>             Deterministic sampling seed as u64 (default: 0x5EED0F5EED0F5E).
   --speculative [K]      Enable prompt-lookup speculative decoding (CUDA runner; optional draft width, default K=3).
   --draft-len <K>        Set the max speculative draft length 1-7 (used with --speculative).
   --spec-ema <x>         Adaptive drafting: EMA acceptance floor 0.0-1.0 below which drafting pauses (default: 0.20).
@@ -1602,6 +1733,13 @@ fn execute_compilation(
                     effective_backend
                 );
             }
+            if !cli_args.sampling_params().is_greedy() {
+                let _ = writeln!(
+                    stderr,
+                    "veloxc: warning: sampling flags require --backend rust; the {:?} backend uses greedy argmax.",
+                    effective_backend
+                );
+            }
             let runner_path = match find_runner_binary(runner_name) {
                 Some(p) => p,
                 None => {
@@ -1650,11 +1788,37 @@ fn execute_compilation(
             }
         };
 
-        // Warmup iterations if requested
+        // Warmup iterations if requested. A session is built once so the
+        // sampler scratch and history allocations are excluded from the
+        // measured generation loop.
+        let sampling_params = cli_args.sampling_params();
+        if let Err(err) = sampling_params.validate() {
+            let _ = writeln!(stderr, "veloxc: invalid sampling configuration: {err}");
+            return EXIT_USAGE_ERROR;
+        }
+        let history_capacity = prompt_tokens.len().saturating_add(cli_args.steps);
+        let mut sampler_session = match SamplerSession::new(
+            sampling_params,
+            engine.config.vocab_size,
+            history_capacity,
+        ) {
+            Ok(session) => session,
+            Err(err) => {
+                let _ = writeln!(stderr, "veloxc: failed to initialize sampler: {err}");
+                return EXIT_USAGE_ERROR;
+            }
+        };
+
         if cli_args.warmup > 0 {
             let mut warmup_buf = vec![0u32; cli_args.steps];
             for _ in 0..cli_args.warmup {
-                engine.generate_greedy_into(&prompt_tokens, cli_args.steps, &mut warmup_buf);
+                engine.generate_sampled_streaming_with_session(
+                    &prompt_tokens,
+                    cli_args.steps,
+                    &mut sampler_session,
+                    &mut warmup_buf,
+                    |_, _| {},
+                );
             }
         }
 
@@ -1663,9 +1827,10 @@ fn execute_compilation(
         let mut t_prefill_stop = None;
 
         let (written, inference_heap_allocs) = crate::alloc_counter::count_allocations(|| {
-            engine.generate_greedy_streaming(
+            engine.generate_sampled_streaming_with_session(
                 &prompt_tokens,
                 cli_args.steps,
+                &mut sampler_session,
                 &mut generated_tokens,
                 |step, _tok_id| {
                     if step == 0 {
@@ -1788,17 +1953,22 @@ fn execute_compilation(
             let _ = writeln!(report, "  #{}: token_id={} logit={:.6}", rank + 1, tok_id, logit_val);
         }
         if cli_args.steps >= 4 {
-            let _ = writeln!(
-                report,
-                "Parity 4-token check   : {}",
+            let parity_label = if cli_args.sampling_params().is_greedy() {
                 if match_4 { "PASSED [359, 253, 4028, 282]" } else { "FAILED" }
-            );
+            } else {
+                "SKIPPED (stochastic sampling)"
+            };
+            let _ = writeln!(report, "Parity 4-token check   : {parity_label}");
         }
         if cli_args.steps >= 32 {
+            let parity_label = if cli_args.sampling_params().is_greedy() {
+                if match_32 { "PASSED (Exact match with Velox Rust CPU reference)" } else { "FAILED" }
+            } else {
+                "SKIPPED (stochastic sampling)"
+            };
             let _ = writeln!(
                 report,
-                "Parity 32-token check  : {}",
-                if match_32 { "PASSED (Exact match with Velox Rust CPU reference)" } else { "FAILED" }
+                "Parity 32-token check  : {parity_label}"
             );
         }
         let _ = writeln!(report, "================================================================================");

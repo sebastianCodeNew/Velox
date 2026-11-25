@@ -18,6 +18,7 @@ pub mod optimizer;
 pub mod parser;
 pub mod runtime;
 pub mod runtime_sota;
+pub mod sampling;
 pub mod sema;
 pub mod tokenizer;
 pub mod tokens;
@@ -71,6 +72,7 @@ pub use runtime::{
     CharmConfig, CharmMerger,
     TieredInferenceConfig, TieredInferenceRouter, InferenceTier,
 };
+pub use sampling::{Sampler, SamplerSession, SamplingParams};
 pub use sema::{
     EvaluatedType, FourierMotzkinSolver, SemanticAnalyzer, SymbolicDim, TypedActivation,
     TypedKVCache, TypedModel, TypedProgram, TypedScope, TypedWeight,
