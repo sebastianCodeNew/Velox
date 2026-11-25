@@ -1183,144 +1183,6 @@ __global__ void __launch_bounds__(128, 8) velox_cuda_matmul_vec_batched_q4(
 // Zero dynamic allocations; all scratch pre-allocated in arena.
 // ============================================================================
 
-// Warp-level reduction for argmax (max value + index)
-// Uses __shfl_xor_sync for efficient cross-thread communication
-__device__ inline void warp_argmax_reduce(float* val, uint32_t* idx) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        float other_val = __shfl_xor_sync(0xffffffff, *val, offset);
-        uint32_t other_idx = __shfl_xor_sync(0xffffffff, *idx, offset);
-        if (other_val > *val) {
-            *val = other_val;
-            *idx = other_idx;
-        }
-    }
-}
-
-// Block-level reduction using warp shuffle + shared memory for cross-warp
-__device__ inline void block_argmax_reduce(
-    float* val, uint32_t* idx,
-    __shared__ float s_val[32], __shared__ uint32_t s_idx[32]
-) {
-    const int lane = threadIdx.x % 32;
-    const int warp_id = threadIdx.x / 32;
-    const int num_warps = blockDim.x / 32;
-
-    // Warp-level reduction
-    warp_argmax_reduce(val, idx);
-
-    // First lane of each warp writes to shared memory
-    if (lane == 0) {
-        s_val[warp_id] = *val;
-        s_idx[warp_id] = *idx;
-    }
-    __syncthreads();
-
-    // First warp reduces across warps
-    if (warp_id == 0) {
-        float v = (lane < num_warps) ? s_val[lane] : -1.0e30f;
-        uint32_t i = (lane < num_warps) ? s_idx[lane] : 0U;
-        warp_argmax_reduce(&v, &i);
-        if (lane == 0) {
-            *val = v;
-            *idx = i;
-        }
-    }
-    __syncthreads();
-}
-
-// ============================================================================
-// FUSED: Single kernel for argmax + acceptance decision
-// Input: logits [n_rows, vocab_size]
-// Output: winner token per row + acceptance decision per draft
-// ============================================================================
-__global__ void velox_cuda_lm_head_fused_argmax_accept(
-    const float* __restrict__ logits,      // [n_rows, vocab_size]
-    uint32_t* __restrict__ winners,        // [n_rows] winner token IDs
-    float* __restrict__ top_logits,        // [n_rows] top logit value (for confidence)
-    float* __restrict__ second_logits,     // [n_rows] second best (for margin)
-    const float* __restrict__ draft_logits,// [n_rows, K] draft token logits (optional)
-    uint8_t* __restrict__ accept_mask,     // [n_rows, K] acceptance decisions (optional)
-    float accept_threshold,                // Margin threshold for acceptance
-    size_t vocab_size,
-    size_t n_rows,
-    size_t K                               // Number of draft tokens per row
-) {
-    const size_t row = blockIdx.x;
-    if (row >= n_rows) return;
-
-    const size_t tid = threadIdx.x;
-    const size_t num_blocks = gridDim.y;  // vocabulary slices per row
-    const size_t slice_size = (vocab_size + 255ULL) / 256ULL;
-    const size_t block_slice = blockIdx.y;
-    const float* row_logits = logits + row * vocab_size;
-
-    // --- Stage 1: Partial argmax per vocabulary slice ---
-    __shared__ float s_val[256];
-    __shared__ uint32_t s_idx[256];
-    __shared__ float s_warp_vals[32];
-    __shared__ uint32_t s_warp_idxs[32];
-
-    const size_t vid = block_slice * 256ULL + tid;
-    float my_val = (vid < vocab_size) ? row_logits[vid] : -1.0e30f;
-    uint32_t my_idx = (vid < vocab_size) ? (uint32_t)vid : 0U;
-
-    // Block-level reduction using warp shuffle
-    block_argmax_reduce(&my_val, &my_idx, s_warp_vals, s_warp_idxs);
-
-    // Store partial result (one per block per row)
-    if (tid == 0) {
-        const size_t slot = row * num_blocks + block_slice;
-        // We reuse the existing scratch buffers
-        extern __shared__ float dynamic_scratch[];
-        float* scratch_vals = dynamic_scratch;
-        uint32_t* scratch_idxs = (uint32_t*)(dynamic_scratch + num_blocks * n_rows);
-        scratch_vals[slot] = my_val;
-        scratch_idxs[slot] = my_idx;
-    }
-    __syncthreads();
-
-    // --- Stage 2: Final reduction + acceptance (thread 0 per row) ---
-    if (tid == 0) {
-        // Reduce across all vocabulary slices for this row
-        float best_val = -1.0e30f;
-        float second_val = -1.0e30f;
-        uint32_t best_idx = 0U;
-
-        for (size_t b = 0; b < num_blocks; ++b) {
-            const size_t slot = row * num_blocks + b;
-            float c_val = scratch_vals[slot];
-            uint32_t c_idx = scratch_idxs[slot];
-            if (c_val > best_val) {
-                second_val = best_val;
-                best_val = c_val;
-                best_idx = c_idx;
-            } else if (c_val > second_val) {
-                second_val = c_val;
-            }
-        }
-
-        // Confidence = margin between top-1 and top-2
-        float margin = best_val - second_val;
-
-        // Write winner
-        winners[row] = best_idx;
-        top_logits[row] = best_val;
-        second_logits[row] = second_val;
-
-        // --- Acceptance Decision (if draft logits provided) ---
-        if (draft_logits && accept_mask && K > 0) {
-            const float* draft_row = draft_logits + row * K;
-            uint8_t* accept_row = accept_mask + row * K;
-
-            for (size_t k = 0; k < K; ++k) {
-                float draft_val = draft_row[k];
-                // Accept if draft logit is within margin of true top
-                accept_row[k] = (draft_val >= best_val - accept_threshold) ? 1 : 0;
-            }
-        }
-    }
-}
-
 // ============================================================================
 // LEGACY: Original stage1 (kept for CUDA graph compatibility)
 // ============================================================================
@@ -1412,10 +1274,20 @@ __global__ void velox_cuda_lm_head_argmax_stage2_batched(
 }
 
 // ============================================================================
-// HARDENED: Batched LM Head Evaluator with Fused Argmax + Acceptance
+// Batched LM Head Evaluator
 // ============================================================================
-// Uses warp-level reduction and early-exit confidence gating.
-// Falls back to legacy kernels for CUDA graph compatibility.
+// A previous single-kernel "fused" variant reduced partial argmaxes across
+// blocks without a grid-wide barrier, so thread 0 of one block could read
+// scratch slots before peer blocks had written them. The two-stage reduction
+// below is the correctness-preserving implementation.
+static void velox_evaluate_lm_head_batched_legacy(
+    VeloxCudaArena* ctx,
+    const float* hidden_base,
+    size_t n_rows,
+    const size_t* d_positions,
+    cudaStream_t stream
+);
+
 static void velox_evaluate_lm_head_batched(
     VeloxCudaArena* ctx,
     const float* hidden_base,
@@ -1423,70 +1295,7 @@ static void velox_evaluate_lm_head_batched(
     const size_t* d_positions,
     cudaStream_t stream
 ) {
-    if (n_rows == 0ULL || n_rows > VELOX_SPEC_MAX_ROWS) return;
-
-    const float* final_norm_w = VELOX_DEV_NORM_PTR(ctx, 2208972800ULL);
-    float* verify_norm = VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_VERIFY_NORM_BASE);
-    float* verify_logits = VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_VERIFY_LOGITS_BASE);
-    float* scratch_vals = VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_VERIFY_STAGE1_BASE);
-    uint32_t* scratch_idxs = (uint32_t*)VELOX_DEV_ACT_PTR(
-        ctx->activation_arena, VELOX_VERIFY_STAGE1_IDXS_BASE);
-
-    // 1. Batched RMSNorm
-    velox_cuda_rmsnorm_batched<<<dim3(1, (unsigned int)n_rows), dim3(256), 0, stream>>>(
-        verify_norm, hidden_base, final_norm_w,
-        VELOX_HIDDEN_DIM, 1e-6f,
-        n_rows, VELOX_HIDDEN_DIM, VELOX_HIDDEN_DIM
-    );
-
-    // 2. Batched Q4 MatVec (LM Head)
-    velox_cuda_matmul_vec_batched_q4<<<dim3(62656ULL, (unsigned int)n_rows), dim3(128), 0, stream>>>(
-        verify_logits, verify_norm,
-        VELOX_DEV_W_Q4_PTR(ctx, 2208983040ULL),
-        VELOX_DEV_S_Q4_PTR(ctx, 2208983040ULL),
-        2560ULL, VELOX_VOCAB_SIZE, n_rows
-    );
-
-    // 3. Fused Argmax + Acceptance (NEW: warp-level reduction)
-    // Uses existing scratch buffers; no extra allocation needed
-    const size_t num_blocks = (VELOX_VOCAB_SIZE + 255ULL) / 256ULL;
-    const size_t shared_mem_per_block = 32 * sizeof(float) + 32 * sizeof(uint32_t);  // warp scratch
-
-    // Allocate temporary buffers for fused kernel outputs
-    float* top_logits = verify_norm;  // Reuse verify_norm temporarily (size n_rows)
-    float* second_logits = verify_norm + n_rows;
-    uint32_t* winners = (uint32_t*)(verify_norm + 2 * n_rows);  // Overlap safe
-
-    velox_cuda_lm_head_fused_argmax_accept<<<dim3(n_rows, num_blocks), dim3(256), shared_mem_per_block, stream>>>(
-        verify_logits,
-        winners,           // [n_rows] winner token IDs
-        top_logits,        // [n_rows] top logit
-        second_logits,     // [n_rows] second best
-        nullptr,           // No draft logits for pure verify
-        nullptr,           // No accept mask
-        0.0f,              // No threshold
-        VELOX_VOCAB_SIZE,
-        n_rows,
-        0                  // K=0 (no drafts in pure verify)
-    );
-
-    // 4. Write winners to host-pinned ring (zero-copy)
-    velox_cuda_write_ring_from_tokens<<<dim3(n_rows), dim3(1), 0, stream>>>(
-        ctx->host_pinned_ring, winners, d_positions, n_rows
-    );
-}
-
-__global__ void velox_cuda_write_ring_from_tokens(
-    uint32_t* __restrict__ host_pinned_ring,
-    const uint32_t* __restrict__ winners,
-    const size_t* __restrict__ d_positions,
-    size_t n_rows
-) {
-    const size_t row = blockIdx.x;
-    if (row >= n_rows) return;
-    const size_t pos = d_positions[row];
-    host_pinned_ring[pos & (VELOX_HOST_RING_SLOTS - 1ULL)] = winners[row];
-    __threadfence_system();
+    velox_evaluate_lm_head_batched_legacy(ctx, hidden_base, n_rows, d_positions, stream);
 }
 
 // ============================================================================
@@ -1633,9 +1442,6 @@ static void velox_batched_prefill_q4(
     uint32_t* d_tokens = (uint32_t*)((uint8_t*)ctx->activation_arena + token_dev_offset);
     size_t* d_positions = (size_t*)((uint8_t*)ctx->activation_arena + token_dev_offset + VELOX_BATCHED_PREFILL_MAX_TOKENS * sizeof(uint32_t));
 
-    cudaMemcpyAsync(d_tokens, h_prompt_tokens, prompt_len * sizeof(uint32_t), cudaMemcpyHostToDevice, stream);
-    velox_cuda_init_positions<<<1, (unsigned int)((prompt_len + 31) / 32 * 32), 0, stream>>>(d_positions, 0ULL, prompt_len);
-
     // Grid dimensions for Embedding
     const size_t embed_blocks = (dim / 8ULL + 255) / 256;
 
@@ -1644,48 +1450,76 @@ static void velox_batched_prefill_q4(
     cudaEventCreate(&ev_layers_stop);
     cudaEventCreate(&ev_head_stop);
 
-    // Step 1: Batched Embedding (all tokens simultaneously)
-    velox_cuda_embed_batched_q4<<<dim3((unsigned int)embed_blocks, (unsigned int)prompt_len), dim3(256), 0, stream>>>(
-        hidden_base, d_tokens,
-        VELOX_DEV_W_Q4_PTR(ctx, 0ULL), VELOX_DEV_S_Q4_PTR(ctx, 0ULL),
-        prompt_len, dim
-    );
-    cudaEventRecord(ev_embed_stop, stream);
+    // Chunked prefill: stream each layer's weights exactly ONCE per 16-token
+    // chunk instead of once per token.  With B=16 the register-tiled GEMV
+    // kernels still sit below the roofline ridge point (32 FLOP / 0.5625 B =
+    // 57 FLOP/B < 127 FLOP/B), so the chunk remains memory-bound and costs
+    // roughly the same as a single-token pass while advancing 16 positions.
+    // Every chunk reuses the low activation rows; cross-chunk causality is
+    // carried entirely by the KV pool, which the QKV kernel writes at each
+    // token's absolute position before that chunk's attention runs.
+    const size_t prefill_chunk = 16ULL;
+    size_t last_chunk = 0;
 
-    // Step 2: Process all 36 layers with zero local memory spills via Register-Tiled Template Kernels
-    #define DISPATCH_CASE(N) case N: velox_run_batched_layers_q4<N>(ctx, hidden_base, norm_base, q_base, act_base, d_positions, stream); break;
+    for (size_t chunk_start = 0; chunk_start < prompt_len; chunk_start += prefill_chunk) {
+        const size_t chunk = (prompt_len - chunk_start < prefill_chunk)
+                           ? (prompt_len - chunk_start)
+                           : prefill_chunk;
+        last_chunk = chunk;
 
-    switch (prompt_len) {
-        DISPATCH_CASE(1)
-        DISPATCH_CASE(2)
-        DISPATCH_CASE(3)
-        DISPATCH_CASE(4)
-        DISPATCH_CASE(5)
-        DISPATCH_CASE(6)
-        DISPATCH_CASE(7)
-        DISPATCH_CASE(8)
-        DISPATCH_CASE(9)
-        DISPATCH_CASE(10)
-        DISPATCH_CASE(11)
-        DISPATCH_CASE(12)
-        DISPATCH_CASE(13)
-        DISPATCH_CASE(14)
-        DISPATCH_CASE(15)
-        DISPATCH_CASE(16)
-        default:
-            fprintf(stderr, "[velox_batched_prefill_q4] Prompt length %zu > 16, falling back to sequential decode\n", prompt_len);
-            for (size_t pos = 0; pos < prompt_len; ++pos) {
-                velox_K2_Horizon_3_7B_decode_cuda(ctx, h_prompt_tokens[pos], pos, 1ULL, stream);
-            }
-            return;
+        cudaMemcpyAsync(d_tokens, h_prompt_tokens + chunk_start,
+                        chunk * sizeof(uint32_t), cudaMemcpyHostToDevice, stream);
+        velox_cuda_init_positions<<<1, (unsigned int)(((chunk + 31ULL) / 32ULL) * 32ULL), 0, stream>>>(
+            d_positions, chunk_start, chunk);
+
+        // Step 1: Batched Embedding for this chunk
+        velox_cuda_embed_batched_q4<<<dim3((unsigned int)embed_blocks, (unsigned int)chunk), dim3(256), 0, stream>>>(
+            hidden_base, d_tokens,
+            VELOX_DEV_W_Q4_PTR(ctx, 0ULL), VELOX_DEV_S_Q4_PTR(ctx, 0ULL),
+            chunk, dim
+        );
+        if (chunk_start == 0) {
+            cudaEventRecord(ev_embed_stop, stream);
+        }
+
+        // Step 2: Process all 36 layers with zero local memory spills via Register-Tiled Template Kernels
+        #define DISPATCH_CASE(N) case N: velox_run_batched_layers_q4<N>(ctx, hidden_base, norm_base, q_base, act_base, d_positions, stream); break;
+
+        switch (chunk) {
+            DISPATCH_CASE(1)
+            DISPATCH_CASE(2)
+            DISPATCH_CASE(3)
+            DISPATCH_CASE(4)
+            DISPATCH_CASE(5)
+            DISPATCH_CASE(6)
+            DISPATCH_CASE(7)
+            DISPATCH_CASE(8)
+            DISPATCH_CASE(9)
+            DISPATCH_CASE(10)
+            DISPATCH_CASE(11)
+            DISPATCH_CASE(12)
+            DISPATCH_CASE(13)
+            DISPATCH_CASE(14)
+            DISPATCH_CASE(15)
+            DISPATCH_CASE(16)
+            default:
+                // Unreachable while prefill_chunk <= 16; kept as a hard
+                // correctness fallback rather than silently dropping tokens.
+                fprintf(stderr, "[velox_batched_prefill_q4] Chunk %zu > 16, falling back to sequential decode\n", chunk);
+                for (size_t pos = 0; pos < chunk; ++pos) {
+                    velox_K2_Horizon_3_7B_decode_cuda(
+                        ctx, h_prompt_tokens[chunk_start + pos], chunk_start + pos, 1ULL, stream);
+                }
+                break;
+        }
+        #undef DISPATCH_CASE
     }
-    #undef DISPATCH_CASE
 
     cudaEventRecord(ev_layers_stop, stream);
 
     // Step 3: Copy last token's hidden state and evaluate LM head
     float* decode_hidden = VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL);
-    float* last_hidden = hidden_base + (prompt_len - 1) * dim;
+    float* last_hidden = hidden_base + (last_chunk - 1) * dim;
     cudaMemcpyAsync(decode_hidden, last_hidden, dim * sizeof(float), cudaMemcpyDeviceToDevice, stream);
 
     cudaEventRecord(ev_head_stop, stream);

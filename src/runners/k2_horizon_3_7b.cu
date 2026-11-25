@@ -8,6 +8,31 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ > 11 || (__CUDACC_VER_MAJOR__ == 11 && __CUDACC_VER_MINOR__ >= 8))
+#include <cuda_fp8.h>
+#else
+// CUDA < 11.8 has no FP8 type or conversion intrinsics. The FP8 execution
+// path is unused for GGUF Q4/Q6 checkpoints, but the type must still exist so
+// the shared arena and SOTA kernel signatures compile. This is a byte-sized
+// E4M3 (bias 7) storage type plus an exact software decoder.
+typedef unsigned char __nv_fp8_e4m3;
+
+__device__ __forceinline__ float __e4m3_to_float(__nv_fp8_e4m3 x) {
+    const uint32_t bits = (uint32_t)x;
+    const uint32_t sign = (bits >> 7) & 1u;
+    const uint32_t exp  = (bits >> 3) & 0xFu;
+    const uint32_t mant = bits & 0x7u;
+    float val;
+    if (exp == 0u) {
+        val = ldexpf((float)mant, -9);            // subnormal: mant * 2^-9
+    } else if (exp == 0xFu && mant == 0x7u) {
+        val = __int_as_float(0x7fffffff);         // E4M3 FN NaN encoding
+    } else {
+        val = ldexpf(1.0f + (float)mant * 0.125f, (int)exp - 7);
+    }
+    return sign ? -val : val;
+}
+#endif
 #include <stdint.h>
 #include <stddef.h>
 #include <math.h>
@@ -46,6 +71,7 @@
 #define VELOX_QUANT_Q4_0                     2u
 #define VELOX_QUANT_FP8                      3u
 #define VELOX_QUANT_INT4_MARLIN              4u  // Marlin INT4 w4a16
+#define VELOX_PERSISTENT_KERNEL_MAX_SMS      32ULL  // sm_86 upper bound; unused on GGUF paths
 
 typedef struct VeloxCudaArena {
     const uint8_t* __restrict__ weight_arena;
@@ -119,13 +145,6 @@ typedef struct VeloxDecodeState {
             velox_cuda_embed_kernel<<<grid, block, 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), d_state, VELOX_DEV_W_PTR(ctx->weight_arena, 0ULL), active_mask); \
         } \
     } while(0)
-
-#define VELOX_DISPATCH_LAYER_NORM(ctx, norm_offset, weight_offset, stream, active_mask) \
-    velox_cuda_layer_norm_kernel<<<dim3(1), dim3(256), 0, stream>>>( \
-        VELOX_DEV_ACT_PTR(ctx->activation_arena, norm_offset), \
-        VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), \
-        VELOX_DEV_NORM_PTR(ctx, 2208235520ULL + weight_offset), \
-        VELOX_HIDDEN_DIM, 0.000001f, active_mask)
 
 #define VELOX_DISPATCH_QKV(ctx, qkv_offset, norm_offset, layer, stream, active_mask) \
     do { \
@@ -1926,6 +1945,11 @@ __global__ void __launch_bounds__(128, 8) velox_cuda_swiglu_down_residual_kernel
         VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_ACT_OFFSET), \
         VELOX_DEV_W_Q4_PTR(ctx, 1736376320ULL), \
         VELOX_DEV_S_Q4_PTR(ctx, 1736376320ULL), 0ULL, active_mask)
+
+// Sequential single-token prefill graph step. This body was accidentally left
+// at file scope when the INT4 Marlin dispatch macros were inserted in 688f585.
+extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
+    VeloxCudaArena* ctx, uint64_t active_mask, cudaStream_t stream) {
     dim3 grid((VELOX_HIDDEN_DIM + 255) / 256);
     dim3 block(256);
     VeloxDecodeState* d_state = VELOX_DEV_STATE(ctx);
@@ -2960,6 +2984,20 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_cuda(VeloxCudaArena* ctx, uint32_t
     velox_cuda_set_decode_state<<<1, 1, 0, stream>>>(VELOX_DEV_STATE(ctx), token_in, (unsigned long long)step);
     velox_K2_Horizon_3_7B_prefill_graph_step_cuda(ctx, active_mask, stream);
 }
+
+// Defined below; the decode graph's FP8 branch references it first.
+__global__ void velox_cuda_flash_attn3_fp8(
+    float* __restrict__ dst_attn,
+    const __nv_fp8_e4m3* __restrict__ q,
+    const __nv_fp8_e4m3* __restrict__ k,
+    const __nv_fp8_e4m3* __restrict__ v,
+    const float* __restrict__ q_scale,
+    const float* __restrict__ k_scale,
+    const float* __restrict__ v_scale,
+    size_t layer,
+    const VeloxDecodeState* __restrict__ state,
+    uint64_t active_mask
+);
 
 extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx, uint64_t active_mask, cudaStream_t stream) {
     dim3 grid((VELOX_HIDDEN_DIM + 255) / 256);
@@ -4139,9 +4177,9 @@ __global__ void __launch_bounds__(256) velox_cuda_persistent_gemm(
     uint64_t active_mask
 ) {
     if ((active_mask & 1ULL) == 0ULL) return;
-    extern __shared__ float smem[];
-    float* As = smem;
-    float* Bs = smem + 16 * 16;  // 16x16 tile
+    extern __shared__ float smem_f32[];
+    float* As = smem_f32;
+    float* Bs = smem_f32 + 16 * 16;  // 16x16 tile
     uint64_t tile_id = atomicAdd((unsigned long long*)work_queue, 1ULL);
     while (tile_id < num_tiles) {
         size_t tile_m = (tile_id / (N / 16)) * 16;
@@ -4220,7 +4258,7 @@ __global__ void __launch_bounds__(256) velox_cuda_strataflux_fetch(
 // SOTA 2026: FlashAttention-3 FP8 Launch Helper
 // ============================================================================
 
-__device__ inline size_t velox_flash_attn3_fp8_shared_mem(size_t head_dim) {
+__host__ __device__ inline size_t velox_flash_attn3_fp8_shared_mem(size_t head_dim) {
     return (3 * head_dim + (head_dim / 32) * 4) * sizeof(__nv_fp8_e4m3);
 }
 
