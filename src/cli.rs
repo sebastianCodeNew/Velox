@@ -172,6 +172,8 @@ pub struct CliArgs {
     pub presence_penalty: f32,
     /// Deterministic seed for stochastic sampling.
     pub seed: u64,
+    /// Text-level stop strings; generation ends at the earliest match.
+    pub stop_strings: Vec<String>,
 }
 
 impl CliArgs {
@@ -228,6 +230,7 @@ impl Default for CliArgs {
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
             seed: 0x5EED_0F_5EED_0F5E,
+            stop_strings: Vec::new(),
         }
     }
 }
@@ -612,6 +615,15 @@ pub fn parse_cli_args(raw_args: &[String]) -> Result<CliAction, String> {
                     .map_err(|_| format!("error: invalid integer for --spec-seed: '{v}'"))?,
             );
             idx += 1;
+        } else if arg == "--stop" {
+            if idx + 1 >= args.len() {
+                return Err("error: flag '--stop' requires a string argument".to_string());
+            }
+            cli_args.stop_strings.push(args[idx + 1].clone());
+            idx += 2;
+        } else if let Some(v) = arg.strip_prefix("--stop=") {
+            cli_args.stop_strings.push(v.to_string());
+            idx += 1;
         } else if arg == "--format" {
             if idx + 1 >= args.len() {
                 return Err("error: flag '--format' requires an argument (choose from 'text', 'json')".to_string());
@@ -674,6 +686,15 @@ pub fn parse_cli_args(raw_args: &[String]) -> Result<CliAction, String> {
         cli_args.input_file = positional_files.remove(0);
     }
     Ok(CliAction::Run(cli_args))
+}
+
+/// Returns the byte offset of the earliest stop-string match in `text`.
+fn find_stop_string(text: &str, stops: &[String]) -> Option<usize> {
+    stops
+        .iter()
+        .filter(|stop| !stop.is_empty())
+        .filter_map(|stop| text.find(stop.as_str()))
+        .min()
 }
 
 fn parse_f32_arg(args: &[String], idx: usize, flag: &str, field: &str) -> Result<f32, String> {
@@ -747,6 +768,7 @@ options:
   --frequency-penalty <f> Subtract f * occurrence_count from repeated logits (default: 0).
   --presence-penalty <p> Subtract p once for any repeated token (default: 0).
   --seed <N>             Deterministic sampling seed as u64 (default: 0x5EED0F5EED0F5E).
+  --stop <text>          Stop generation at this text (repeatable).
   --speculative [K]      Enable prompt-lookup speculative decoding (CUDA runner; optional draft width, default K=3).
   --draft-len <K>        Set the max speculative draft length 1-7 (used with --speculative).
   --spec-ema <x>         Adaptive drafting: EMA acceptance floor 0.0-1.0 below which drafting pauses (default: 0.20).
@@ -826,7 +848,7 @@ struct PersistentRunner {
 }
 
 impl PersistentRunner {
-    fn spawn(exe: &Path, weights: &str, steps: usize) -> Result<Self, String> {
+    fn spawn(exe: &Path, weights: &str, steps: usize, stop_tokens: &[u32]) -> Result<Self, String> {
         use std::io::BufRead;
         let mut child = Command::new(exe)
             .arg("--weights")
@@ -834,6 +856,14 @@ impl PersistentRunner {
             .arg("--serve-stdin")
             .arg("--steps")
             .arg(steps.to_string())
+            .arg("--stop-tokens")
+            .arg(
+                stop_tokens
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -1819,8 +1849,22 @@ fn execute_compilation(
 
             // Keep one runner alive for the whole session when the backend
             // supports it; fall back to the one-shot path otherwise.
+            // K2 is a reasoning model: it narrates a long thinking block before
+            // answering, so a small step budget truncates mid-sentence. Stop
+            // tokens make a generous budget safe -- generation ends exactly at
+            // the turn boundary instead of running to the cap.
+            let chat_steps = cli_args.steps.max(256);
+            let stop_ids: Vec<u32> = tok
+                .special_tokens
+                .iter()
+                .filter(|(text, _)| text.contains("im_end") || text.contains("endoftext"))
+                .map(|(_, id)| *id)
+                .collect();
+
             let mut persistent: Option<PersistentRunner> = match (effective_backend, runner_path.as_ref()) {
-                (ExecutionBackend::Cuda, Some(path)) => PersistentRunner::spawn(path, &weights_file, cli_args.steps).ok(),
+                (ExecutionBackend::Cuda, Some(path)) => {
+                    PersistentRunner::spawn(path, &weights_file, chat_steps, &stop_ids).ok()
+                }
                 _ => None,
             };
             if persistent.is_none() && effective_backend == ExecutionBackend::Cuda {
@@ -1889,7 +1933,27 @@ fn execute_compilation(
                 if let Some(ref mut session) = persistent {
                     match session.generate(&turn_tokens) {
                         Ok(ids) => {
-                            latest_response = tok.decode(&ids);
+                            // Decode incrementally so a stop string can cut the
+                            // reply at the exact match, mirroring llama.cpp's
+                            // text-level stop handling.
+                            let mut decoder = tok.streaming_decoder();
+                            let mut text = String::new();
+                            let mut stopped = false;
+                            for id in &ids {
+                                text.push_str(&decoder.decode_token(*id));
+                                if find_stop_string(&text, &cli_args.stop_strings).is_some() {
+                                    stopped = true;
+                                    break;
+                                }
+                            }
+                            if !stopped {
+                                text.push_str(&decoder.flush());
+                            } else if let Some(pos) =
+                                find_stop_string(&text, &cli_args.stop_strings)
+                            {
+                                text.truncate(pos);
+                            }
+                            latest_response = text;
                             let _ = write!(stdout, "{}", latest_response);
                             let _ = stdout.flush();
                         }

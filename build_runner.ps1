@@ -21,6 +21,17 @@ if (-not (Test-Path "velox_cuda_runner_k2.exe")) {
     Write-Error "nvcc reported success but velox_cuda_runner_k2.exe is missing"
     exit 1
 }
-Copy-Item "velox_cuda_runner_k2.exe" "src\runners\velox_cuda_runner_k2.exe" -Force
+$srcTime = (Get-Item "velox_cuda_runner_k2.exe").LastWriteTime
+try {
+    Copy-Item "velox_cuda_runner_k2.exe" "src\runners\velox_cuda_runner_k2.exe" -Force -ErrorAction Stop
+} catch {
+    Write-Error "failed to sync runner into src\runners (is a chat session still running?): $_"
+    exit 1
+}
+$dstTime = (Get-Item "src\runners\velox_cuda_runner_k2.exe").LastWriteTime
+if ($dstTime -lt $srcTime) {
+    Write-Error "synced runner is older than the build output; src\runners copy is stale"
+    exit 1
+}
 Write-Host "[OK] Synced velox_cuda_runner_k2.exe -> src\runners\"
 

@@ -1447,6 +1447,15 @@ static void velox_evaluate_lm_head_batched_legacy(
 
 static int g_spec_stochastic = 0;
 static int g_suppress_report = 0;
+static uint32_t g_stop_tokens[16];
+static int g_num_stop_tokens = 0;
+
+static int velox_is_stop_token(uint32_t token) {
+    for (int i = 0; i < g_num_stop_tokens; ++i) {
+        if (g_stop_tokens[i] == token) return 1;
+    }
+    return 0;
+}
 static unsigned long long g_spec_seed = 0x5EED0F5EED0F5EULL;
 static unsigned long long g_spec_nonce = 0ULL;
 
@@ -1813,6 +1822,15 @@ int main(int argc, char** argv) {
             max_draft_len = atoi(argv[++i]);
             if (max_draft_len <= 0) max_draft_len = 3;
             if (max_draft_len > 7) max_draft_len = 7;
+        } else if (strcmp(argv[i], "--stop-tokens") == 0 && i + 1 < argc) {
+            const char* list = argv[++i];
+            char* copy = _strdup(list);
+            char* tok = strtok(copy, ",");
+            while (tok && g_num_stop_tokens < 16) {
+                g_stop_tokens[g_num_stop_tokens++] = (uint32_t)strtoul(tok, NULL, 10);
+                tok = strtok(NULL, ",");
+            }
+            free(copy);
         } else if (strcmp(argv[i], "--serve-stdin") == 0) {
             serve_stdin = true;
         } else if (strcmp(argv[i], "--spec-stochastic") == 0) {
@@ -1841,6 +1859,7 @@ int main(int argc, char** argv) {
             printf("  --draft-len <K>        Set max draft candidate length (default: 3, max: 7)\n");
             printf("  --spec-ema <x>         Adaptive drafting: EMA acceptance floor (default 0.20)\n");
             printf("  --serve-stdin          Persistent mode: load weights once, read prompts from stdin\n");
+            printf("  --stop-tokens <ids>    Comma-separated token IDs that end generation\n");
             printf("  --spec-stochastic      Lossless stochastic verification (accept with p(draft))\n");
             printf("  --spec-seed <N>        Seed for stochastic verification nonces\n");
             printf("  --steps <N>            Autoregressive decode steps (default: 16)\n");
@@ -2169,15 +2188,17 @@ int main(int argc, char** argv) {
 
             size_t gen = 0;
             uint32_t next_tok = ctx.host_pinned_ring[(n - 1) & (VELOX_HOST_RING_SLOTS - 1ULL)];
-            if (turn_steps > 0 && gen < 1024) turn_out[gen++] = next_tok;
+            int stopped = velox_is_stop_token(next_tok);
+            if (turn_steps > 0 && gen < 1024 && !stopped) turn_out[gen++] = next_tok;
 
             size_t pos = n;
-            for (size_t s = 1; s < turn_steps && gen < 1024; ++s) {
+            for (size_t s = 1; s < turn_steps && gen < 1024 && !stopped; ++s) {
                 velox_K2_Horizon_3_7B_decode_cuda(&ctx, next_tok, pos, 1ULL, stream);
                 cudaStreamSynchronize(stream);
                 next_tok = ctx.host_pinned_ring[pos & (VELOX_HOST_RING_SLOTS - 1ULL)];
-                turn_out[gen++] = next_tok;
                 pos++;
+                if (velox_is_stop_token(next_tok)) break;
+                turn_out[gen++] = next_tok;
             }
 
             for (size_t i = 0; i < gen; ++i) {
