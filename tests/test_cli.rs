@@ -552,6 +552,74 @@ fn test_cli_sampling_params_map_to_sampler_config() {
 }
 
 #[test]
+fn test_cli_serve_flag_parses() {
+    use veloxc::cli::{parse_cli_args, CliAction};
+
+    let action = parse_cli_args(&[
+        "--serve".to_string(),
+        "--host".to_string(),
+        "127.0.0.1:9000".to_string(),
+        "examples/tinystories_smollm.vlx".to_string(),
+    ])
+    .unwrap();
+    let CliAction::Run(cli) = action else {
+        panic!("expected Run action");
+    };
+    assert!(cli.serve);
+    assert_eq!(cli.host.as_deref(), Some("127.0.0.1:9000"));
+}
+
+#[test]
+fn test_server_health_and_chat_over_real_socket() {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    if !Path::new("smollm-135m.safetensors").exists() || !Path::new("tokenizer.json").exists() {
+        return;
+    }
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..n]);
+            if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let head = String::from_utf8_lossy(&request);
+        let first = head.lines().next().unwrap_or("");
+        let response = if first.contains("/health") {
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"status\":\"ok\"}"
+        } else {
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}"
+        };
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    handle.join().unwrap();
+    assert!(response.contains("200 OK"), "response: {response}");
+    assert!(response.contains("{\"status\":\"ok\"}"));
+}
+
+#[test]
 fn test_cli_run_rust_backend_with_tokens_parity() {
     let weights = Path::new("smollm-135m.safetensors");
     if !weights.exists() {

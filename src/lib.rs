@@ -20,6 +20,7 @@ pub mod runtime;
 pub mod runtime_sota;
 pub mod sampling;
 pub mod sema;
+pub mod server;
 pub mod tokenizer;
 pub mod tokens;
 pub mod types;
@@ -73,6 +74,7 @@ pub use runtime::{
     TieredInferenceConfig, TieredInferenceRouter, InferenceTier,
 };
 pub use sampling::{Sampler, SamplerSession, SamplingParams};
+pub use server::{serve, ServerConfig, DEFAULT_BIND_ADDR, MAX_BODY_BYTES, MAX_REQUEST_TOKENS};
 pub use sema::{
     EvaluatedType, FourierMotzkinSolver, SemanticAnalyzer, SymbolicDim, TypedActivation,
     TypedKVCache, TypedModel, TypedProgram, TypedScope, TypedWeight,

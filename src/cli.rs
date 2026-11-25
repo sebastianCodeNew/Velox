@@ -132,6 +132,10 @@ pub struct CliArgs {
     pub emit_ir: bool,
     pub run_model: bool,
     pub chat: bool,
+    /// Start the OpenAI-compatible HTTP server instead of a one-shot run.
+    pub serve: bool,
+    /// Bind address for `--serve` (`host:port`).
+    pub host: Option<String>,
     pub backend: ExecutionBackend,
     pub weights_path: Option<String>,
     pub tokenizer_path: Option<String>,
@@ -194,6 +198,8 @@ impl Default for CliArgs {
             emit_ir: false,
             run_model: false,
             chat: false,
+            serve: false,
+            host: None,
             backend: ExecutionBackend::Auto,
             weights_path: None,
             tokenizer_path: None,
@@ -299,6 +305,18 @@ pub fn parse_cli_args(raw_args: &[String]) -> Result<CliAction, String> {
         } else if arg == "--chat" {
             cli_args.chat = true;
             cli_args.run_model = true;
+            idx += 1;
+        } else if arg == "--serve" {
+            cli_args.serve = true;
+            idx += 1;
+        } else if arg == "--host" {
+            if idx + 1 >= args.len() {
+                return Err("error: flag '--host' requires an address (host:port)".to_string());
+            }
+            cli_args.host = Some(args[idx + 1].clone());
+            idx += 2;
+        } else if let Some(host) = arg.strip_prefix("--host=") {
+            cli_args.host = Some(host.to_string());
             idx += 1;
         } else if arg == "--no-color" {
             cli_args.no_color = true;
@@ -688,6 +706,8 @@ options:
   --emit-cuda            Emit standalone zero-allocation NVIDIA CUDA source (.cu).
   --run                  Execute model natively using zero-copy safetensors mmap.
   --chat                 Launch interactive native coding REPL (100% zero-Python).
+  --serve                Start the OpenAI-compatible HTTP server (default 127.0.0.1:8080).
+  --host <host:port>     Bind address for --serve (default 127.0.0.1:8080).
   --backend <backend>    Execution backend: cuda, c99, rust, auto (default: auto; K2 uses CUDA when available).
   --prompt \"<text>\"      Input text prompt (encoded via native BPE tokenizer).
   --tokens <ids>         Comma-separated input prompt token IDs for --run.
@@ -1342,11 +1362,55 @@ pub fn run_cli(args: &[String]) -> i32 {
     run_cli_with_io(args, &mut stdout, &mut stderr)
 }
 
+fn execute_server(cli_args: &CliArgs, stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32 {
+    let weights_file = cli_args
+        .weights_path
+        .clone()
+        .unwrap_or_else(|| "smollm-135m.safetensors".to_string());
+    let tokenizer_path = cli_args
+        .tokenizer_path
+        .clone()
+        .unwrap_or_else(|| "tokenizer.json".to_string());
+    let host = cli_args
+        .host
+        .clone()
+        .unwrap_or_else(|| crate::server::DEFAULT_BIND_ADDR.to_string());
+
+    let _ = writeln!(
+        stdout,
+        "velox server: model={}, weights={}, tokenizer={}, bind={}",
+        cli_args.input_file, weights_file, tokenizer_path, host
+    );
+    let _ = stdout.flush();
+
+    let config = crate::server::ServerConfig {
+        bind_addr: host,
+        weights_path: weights_file,
+        tokenizer_path,
+        model_file: cli_args.input_file.clone(),
+        max_seq_len: 2048,
+        worker_threads: cli_args.threads.unwrap_or(4).max(1),
+        default_max_tokens: cli_args.steps.clamp(1, crate::server::MAX_REQUEST_TOKENS),
+    };
+
+    match crate::server::serve(config) {
+        Ok(()) => EXIT_SUCCESS,
+        Err(err) => {
+            let _ = writeln!(stderr, "veloxc: server error: {err}");
+            EXIT_IO_ERROR
+        }
+    }
+}
+
 fn execute_compilation(
     cli_args: &CliArgs,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> i32 {
+    if cli_args.serve {
+        return execute_server(cli_args, stdout, stderr);
+    }
+
     let input_path = Path::new(&cli_args.input_file);
 
     // 1. Verify existence (I/O check)
