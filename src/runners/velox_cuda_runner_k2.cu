@@ -553,7 +553,7 @@ __global__ void __launch_bounds__(256) velox_cuda_rmsnorm_batched(
 // Template Register-Tiled Batched Fused QKV Q4: 1D grid dim3(qkv_blocks)
 // Zero local memory spills: BATCH is compile-time constant, unrolled strictly into hardware registers!
 template<int BATCH>
-__global__ void __launch_bounds__(128, 2) velox_cuda_fused_qkv_batched_q4(
+__global__ void __launch_bounds__(128, 8) velox_cuda_fused_qkv_batched_q4(
     float* __restrict__ q_base,
     float* __restrict__ kv_pool,
     const float* __restrict__ norm_base,
@@ -790,7 +790,7 @@ __global__ void __launch_bounds__(32, 16) velox_cuda_gqa_attn_batched(
 
 // Template Register-Tiled Batched OutProj + Residual Q4: 1D grid dim3(out_blocks)
 template<int BATCH>
-__global__ void __launch_bounds__(128, 2) velox_cuda_out_proj_residual_batched_q4(
+__global__ void __launch_bounds__(128, 8) velox_cuda_out_proj_residual_batched_q4(
     float* __restrict__ hidden_base,
     const float* __restrict__ q_base,
     const uint32_t* __restrict__ w_out, const half2* __restrict__ s_out,
@@ -857,7 +857,7 @@ __global__ void __launch_bounds__(128, 2) velox_cuda_out_proj_residual_batched_q
 
 // Template Register-Tiled Batched SwiGLU Gate+Up Q4: 1D grid dim3(inter_blocks)
 template<int BATCH>
-__global__ void __launch_bounds__(128, 2) velox_cuda_swiglu_gate_up_batched_q4(
+__global__ void __launch_bounds__(128, 6) velox_cuda_swiglu_gate_up_batched_q4(
     float* __restrict__ act_base,
     const float* __restrict__ norm_base,
     const uint32_t* __restrict__ w_gate, const half2* __restrict__ s_gate,
@@ -947,7 +947,7 @@ __global__ void __launch_bounds__(128, 2) velox_cuda_swiglu_gate_up_batched_q4(
 
 // Template Register-Tiled Batched SwiGLU Down + Residual Q4: 1D grid dim3(out_blocks)
 template<int BATCH>
-__global__ void __launch_bounds__(128, 2) velox_cuda_swiglu_down_residual_batched_q4(
+__global__ void __launch_bounds__(128, 8) velox_cuda_swiglu_down_residual_batched_q4(
     float* __restrict__ hidden_base,
     const float* __restrict__ act_base,
     const uint32_t* __restrict__ w_down, const half2* __restrict__ s_down,
