@@ -174,6 +174,8 @@ pub struct CliArgs {
     pub seed: u64,
     /// Text-level stop strings; generation ends at the earliest match.
     pub stop_strings: Vec<String>,
+    /// Suppress the model's `?` reasoning block in chat output.
+    pub hide_thinking: bool,
 }
 
 impl CliArgs {
@@ -231,6 +233,7 @@ impl Default for CliArgs {
             presence_penalty: 0.0,
             seed: 0x5EED_0F_5EED_0F5E,
             stop_strings: Vec::new(),
+            hide_thinking: true,
         }
     }
 }
@@ -615,6 +618,9 @@ pub fn parse_cli_args(raw_args: &[String]) -> Result<CliAction, String> {
                     .map_err(|_| format!("error: invalid integer for --spec-seed: '{v}'"))?,
             );
             idx += 1;
+        } else if arg == "--show-thinking" {
+            cli_args.hide_thinking = false;
+            idx += 1;
         } else if arg == "--stop" {
             if idx + 1 >= args.len() {
                 return Err("error: flag '--stop' requires a string argument".to_string());
@@ -686,6 +692,24 @@ pub fn parse_cli_args(raw_args: &[String]) -> Result<CliAction, String> {
         cli_args.input_file = positional_files.remove(0);
     }
     Ok(CliAction::Run(cli_args))
+}
+
+/// Strips the model's `?` reasoning block, returning only the final answer.
+///
+/// If the block was never closed (generation hit the cap mid-thought) the
+/// reasoning is discarded and a short marker is returned instead, so a
+/// truncated think never dumps raw chain-of-thought into the chat.
+fn strip_thinking(text: &str) -> String {
+    const OPEN: &str = "?";
+    const CLOSE: &str = "?";
+    if let Some(start) = text.find(OPEN) {
+        let after = &text[start + OPEN.len()..];
+        if let Some(end) = after.find(CLOSE) {
+            return after[end + CLOSE.len()..].trim().to_string();
+        }
+        return "[thinking truncated ? raise --steps]".to_string();
+    }
+    text.trim().to_string()
 }
 
 /// Returns the byte offset of the earliest stop-string match in `text`.
@@ -769,6 +793,7 @@ options:
   --presence-penalty <p> Subtract p once for any repeated token (default: 0).
   --seed <N>             Deterministic sampling seed as u64 (default: 0x5EED0F5EED0F5E).
   --stop <text>          Stop generation at this text (repeatable).
+  --show-thinking        Show the model's ? reasoning block (hidden by default).
   --speculative [K]      Enable prompt-lookup speculative decoding (CUDA runner; optional draft width, default K=3).
   --draft-len <K>        Set the max speculative draft length 1-7 (used with --speculative).
   --spec-ema <x>         Adaptive drafting: EMA acceptance floor 0.0-1.0 below which drafting pauses (default: 0.20).
@@ -1853,7 +1878,7 @@ fn execute_compilation(
             // answering, so a small step budget truncates mid-sentence. Stop
             // tokens make a generous budget safe -- generation ends exactly at
             // the turn boundary instead of running to the cap.
-            let chat_steps = cli_args.steps.max(256);
+            let chat_steps = cli_args.steps.max(512);
             let stop_ids: Vec<u32> = tok
                 .special_tokens
                 .iter()
@@ -1953,7 +1978,11 @@ fn execute_compilation(
                             {
                                 text.truncate(pos);
                             }
-                            latest_response = text;
+                            latest_response = if cli_args.hide_thinking {
+                                strip_thinking(&text)
+                            } else {
+                                text
+                            };
                             let _ = write!(stdout, "{}", latest_response);
                             let _ = stdout.flush();
                         }
