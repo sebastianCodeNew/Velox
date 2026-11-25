@@ -814,6 +814,80 @@ pub fn find_runner_binary(binary_name: &str) -> Option<PathBuf> {
     None
 }
 
+/// A long-lived CUDA runner that keeps the checkpoint resident between turns.
+///
+/// The one-shot path re-reads ~2.9 GB of weights per message. In persistent
+/// mode the runner loads once and only clears the KV pool between prompts, so
+/// every turn after the first costs a prefill instead of a model load.
+struct PersistentRunner {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    reader: std::io::BufReader<std::process::ChildStdout>,
+}
+
+impl PersistentRunner {
+    fn spawn(exe: &Path, weights: &str, steps: usize) -> Result<Self, String> {
+        use std::io::BufRead;
+        let mut child = Command::new(exe)
+            .arg("--weights")
+            .arg(weights)
+            .arg("--serve-stdin")
+            .arg("--steps")
+            .arg(steps.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|err| format!("failed to spawn persistent runner: {err}"))?;
+        let stdin = child.stdin.take().ok_or("runner stdin unavailable")?;
+        let stdout = child.stdout.take().ok_or("runner stdout unavailable")?;
+        let _ = BufRead::fill_buf(&mut std::io::BufReader::new(std::io::empty()));
+        Ok(Self {
+            child,
+            stdin,
+            reader: std::io::BufReader::new(stdout),
+        })
+    }
+
+    /// Sends one prompt (token IDs) and returns the generated token IDs.
+    fn generate(&mut self, tokens: &[u32]) -> Result<Vec<u32>, String> {
+        use std::io::BufRead;
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let line = tokens
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        writeln!(self.stdin, "{line}").map_err(|err| format!("runner stdin write failed: {err}"))?;
+        self.stdin
+            .flush()
+            .map_err(|err| format!("runner stdin flush failed: {err}"))?;
+
+        let mut reply = String::new();
+        let read = self
+            .reader
+            .read_line(&mut reply)
+            .map_err(|err| format!("runner stdout read failed: {err}"))?;
+        if read == 0 {
+            return Err("runner closed its output stream".to_string());
+        }
+        Ok(reply
+            .trim()
+            .split(',')
+            .filter_map(|part| part.trim().parse::<u32>().ok())
+            .collect())
+    }
+}
+
+impl Drop for PersistentRunner {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Dispatches execution to a standalone compiled C99 or CUDA runner process,
 /// streaming tokens to stdout and parsing the output report.
 pub fn run_external_runner(
@@ -1743,6 +1817,19 @@ fn execute_compilation(
 
             let mut latest_response = String::new();
 
+            // Keep one runner alive for the whole session when the backend
+            // supports it; fall back to the one-shot path otherwise.
+            let mut persistent: Option<PersistentRunner> = match (effective_backend, runner_path.as_ref()) {
+                (ExecutionBackend::Cuda, Some(path)) => PersistentRunner::spawn(path, &weights_file, cli_args.steps).ok(),
+                _ => None,
+            };
+            if persistent.is_none() && effective_backend == ExecutionBackend::Cuda {
+                let _ = writeln!(
+                    stderr,
+                    "veloxc: persistent runner unavailable, falling back to one process per turn"
+                );
+            }
+
             loop {
                 let _ = write!(stdout, "\x1b[1;36mvelox[{}]> \x1b[0m", first_model.name);
                 let _ = stdout.flush();
@@ -1799,7 +1886,18 @@ fn execute_compilation(
                 let _ = write!(stdout, "\n\x1b[1;32mvelox-assistant> \x1b[0m");
                 let _ = stdout.flush();
 
-                if let Some(ref r_path) = runner_path {
+                if let Some(ref mut session) = persistent {
+                    match session.generate(&turn_tokens) {
+                        Ok(ids) => {
+                            latest_response = tok.decode(&ids);
+                            let _ = write!(stdout, "{}", latest_response);
+                            let _ = stdout.flush();
+                        }
+                        Err(err) => {
+                            let _ = writeln!(stderr, "veloxc: persistent runner error: {err}");
+                        }
+                    }
+                } else if let Some(ref r_path) = runner_path {
                     let streaming_decoder = tok.streaming_decoder();
                     let _ = run_external_runner(
                         r_path,

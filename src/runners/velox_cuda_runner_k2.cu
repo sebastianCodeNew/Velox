@@ -1446,6 +1446,7 @@ static void velox_evaluate_lm_head_batched_legacy(
 );
 
 static int g_spec_stochastic = 0;
+static int g_suppress_report = 0;
 static unsigned long long g_spec_seed = 0x5EED0F5EED0F5EULL;
 static unsigned long long g_spec_nonce = 0ULL;
 
@@ -1721,8 +1722,13 @@ static void velox_batched_prefill_q4(
     cudaEventElapsedTime(&t_embed_ms, ev_embed_stop, ev_embed_stop);
     cudaEventElapsedTime(&t_layers_ms, ev_embed_stop, ev_layers_stop);
     cudaEventElapsedTime(&t_head_ms, ev_layers_stop, ev_head_stop);
-    printf("  [Prefill Timing Breakdown] 36 Layers: %.3f ms (%.3f ms/layer), LM Head: %.3f ms\n",
-           t_layers_ms, t_layers_ms / 36.0f, t_head_ms);
+    if (g_suppress_report) {
+        fprintf(stderr, "[prefill] 36 layers %.3f ms (%.3f ms/layer), LM head %.3f ms\n",
+                t_layers_ms, t_layers_ms / 36.0f, t_head_ms);
+    } else {
+        printf("  [Prefill Timing Breakdown] 36 Layers: %.3f ms (%.3f ms/layer), LM Head: %.3f ms\n",
+               t_layers_ms, t_layers_ms / 36.0f, t_head_ms);
+    }
 
     cudaEventDestroy(ev_embed_stop);
     cudaEventDestroy(ev_layers_stop);
@@ -1778,6 +1784,7 @@ int main(int argc, char** argv) {
     bool verbose = false;
     bool use_cuda_graph = true;
     bool use_speculative = false;
+    bool serve_stdin = false;
     int max_draft_len = 3;
     float spec_off_ema = 0.20f;
     size_t max_context_tokens = 16384;
@@ -1806,6 +1813,8 @@ int main(int argc, char** argv) {
             max_draft_len = atoi(argv[++i]);
             if (max_draft_len <= 0) max_draft_len = 3;
             if (max_draft_len > 7) max_draft_len = 7;
+        } else if (strcmp(argv[i], "--serve-stdin") == 0) {
+            serve_stdin = true;
         } else if (strcmp(argv[i], "--spec-stochastic") == 0) {
             g_spec_stochastic = 1;
         } else if (strcmp(argv[i], "--spec-seed") == 0 && i + 1 < argc) {
@@ -1831,6 +1840,7 @@ int main(int argc, char** argv) {
             printf("  --speculative [K]      Enable Prompt-Lookup Speculative Decoding (default draft K=3)\n");
             printf("  --draft-len <K>        Set max draft candidate length (default: 3, max: 7)\n");
             printf("  --spec-ema <x>         Adaptive drafting: EMA acceptance floor (default 0.20)\n");
+            printf("  --serve-stdin          Persistent mode: load weights once, read prompts from stdin\n");
             printf("  --spec-stochastic      Lossless stochastic verification (accept with p(draft))\n");
             printf("  --spec-seed <N>        Seed for stochastic verification nonces\n");
             printf("  --steps <N>            Autoregressive decode steps (default: 16)\n");
@@ -2106,6 +2116,97 @@ int main(int argc, char** argv) {
         if (verbose) {
             printf("[CUDA Graph] Speculative verify graphs captured: %d/7 (B=2..8)\n", verify_graphs_ready);
         }
+    }
+
+    // ==========================================================================
+    // Persistent stdin mode: load the checkpoint ONCE, then serve many prompts.
+    //
+    // The one-shot path below re-reads ~2.9 GB of weights for every message.
+    // Here the arena, weights and CUDA graphs stay resident and only the KV
+    // pool is cleared between turns (576 MiB memset versus a full reload), so
+    // turn 2+ costs one prefill instead of a model load.
+    //
+    // Protocol (deliberately trivial, no JSON on the wire):
+    //   stdin  : comma-separated token IDs, one prompt per line
+    //   stdout : comma-separated generated token IDs, one reply per line
+    // Diagnostics go to stderr so stdout stays machine-parseable.
+    // ==========================================================================
+    if (serve_stdin) {
+        char line[1 << 16];
+        uint32_t turn_tokens[16384];
+        uint32_t turn_out[1024];
+        size_t turn_steps = steps;
+
+        g_suppress_report = 1;
+        fprintf(stderr, "[serve] ready: weights resident, awaiting prompts on stdin\n");
+        fflush(stderr);
+
+        while (fgets(line, sizeof(line), stdin)) {
+            size_t n = 0;
+            char* cursor = line;
+            while (*cursor && n < 16384) {
+                char* end = NULL;
+                unsigned long v = strtoul(cursor, &end, 10);
+                if (end == cursor) break;          // no digits: skip/stop
+                turn_tokens[n++] = (uint32_t)v;
+                cursor = (*end == ',') ? end + 1 : end;
+            }
+            if (n == 0) {
+                continue;                          // blank line: ignore
+            }
+
+            // Reset only the KV pool; weights and graphs stay resident.
+            cudaMemsetAsync(d_kv_cache, 0, kv_pool_bytes, stream);
+
+            if (n > 1) {
+                velox_batched_prefill_q4(&ctx, turn_tokens, n, stream);
+            } else {
+                for (size_t pos = 0; pos < n; ++pos) {
+                    velox_K2_Horizon_3_7B_decode_cuda(&ctx, turn_tokens[pos], pos, 1ULL, stream);
+                }
+            }
+            cudaStreamSynchronize(stream);
+
+            size_t gen = 0;
+            uint32_t next_tok = ctx.host_pinned_ring[(n - 1) & (VELOX_HOST_RING_SLOTS - 1ULL)];
+            if (turn_steps > 0 && gen < 1024) turn_out[gen++] = next_tok;
+
+            size_t pos = n;
+            for (size_t s = 1; s < turn_steps && gen < 1024; ++s) {
+                velox_K2_Horizon_3_7B_decode_cuda(&ctx, next_tok, pos, 1ULL, stream);
+                cudaStreamSynchronize(stream);
+                next_tok = ctx.host_pinned_ring[pos & (VELOX_HOST_RING_SLOTS - 1ULL)];
+                turn_out[gen++] = next_tok;
+                pos++;
+            }
+
+            for (size_t i = 0; i < gen; ++i) {
+                printf("%u%s", turn_out[i], (i + 1 < gen) ? "," : "");
+            }
+            printf("\n");
+            fflush(stdout);
+        }
+
+        fprintf(stderr, "[serve] stdin closed, shutting down\n");
+        if (decode_graph_exec) cudaGraphExecDestroy(decode_graph_exec);
+        if (decode_graph) cudaGraphDestroy(decode_graph);
+        for (int b = 2; b <= 8; ++b) {
+            if (verify_graph_exec[b]) cudaGraphExecDestroy(verify_graph_exec[b]);
+        }
+        cudaStreamDestroy(stream);
+        cudaFree(d_weight_arena);
+        cudaFree(d_weight_scales);
+        cudaFree(d_activation);
+        if (is_kv_in_vram) {
+            cudaFree(d_kv_cache);
+        } else if (h_kv_cache) {
+            cudaFreeHost(h_kv_cache);
+        }
+        cudaFreeHost(h_ring);
+        if (has_weights_file) {
+            win32_gguf_close(&gguf_map);
+        }
+        return 0;
     }
 
     uint32_t* generated_tokens = (uint32_t*)malloc(steps * sizeof(uint32_t));
