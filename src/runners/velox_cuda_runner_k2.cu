@@ -474,6 +474,14 @@ static void load_gguf_tensor_to_arena(
 #define VELOX_VERIFY_STAGE1_IDXS_BASE     (VELOX_VERIFY_STAGE1_BASE + VELOX_VERIFY_STAGE1_VALS_SIZE)
 #define VELOX_VERIFY_STAGE1_IDXS_SIZE     (VELOX_SPEC_MAX_ROWS * VELOX_VERIFY_STAGE1_NUM_BLOCKS * 4ULL)  // uint32_t
 #define VELOX_VERIFY_REGION_END           (VELOX_VERIFY_STAGE1_IDXS_BASE + VELOX_VERIFY_STAGE1_IDXS_SIZE)
+// Stochastic speculative-verify outputs (one row per candidate).
+#define VELOX_VERIFY_STOCH_BASE             VELOX_VERIFY_REGION_END
+#define VELOX_VERIFY_STOCH_OUT_OFF          (VELOX_VERIFY_STOCH_BASE)
+#define VELOX_VERIFY_STOCH_ACC_OFF          (VELOX_VERIFY_STOCH_OUT_OFF + VELOX_SPEC_MAX_ROWS * 4ULL)
+#define VELOX_VERIFY_STOCH_PDRAFT_OFF       (VELOX_VERIFY_STOCH_ACC_OFF + VELOX_SPEC_MAX_ROWS * 4ULL)
+#define VELOX_VERIFY_STOCH_NONCE_OFF        (VELOX_VERIFY_STOCH_PDRAFT_OFF + VELOX_SPEC_MAX_ROWS * 4ULL)
+#define VELOX_SPEC_STOCH_INVALID            0xFFFFFFFFu
+
 
 
 // Batched Embed Q4: blockIdx.y = token index
@@ -1290,6 +1298,139 @@ __global__ void velox_cuda_lm_head_argmax_stage2_batched(
 }
 
 // ============================================================================
+// Lossless Stochastic Speculative Verification (Leviathan et al., 2023)
+//
+// Prompt-lookup drafting is deterministic, so the draft distribution is a
+// point mass: q(draft) = 1. The generic acceptance rule min(1, p/q) therefore
+// reduces to "accept with probability p(draft)", and a rejection must sample
+// from the normalized residual max(0, p - q): the target distribution with
+// the drafted token removed.
+//
+// Three passes over the vocabulary row: max (softmax stability), sum of
+// exp(l - max), then a residual sample on rejection. The sampling walk reuses
+// the per-thread partial sums so only the winning 256-element segment is
+// re-examined.
+// ============================================================================
+__global__ void __launch_bounds__(256, 4) velox_cuda_spec_stochastic_kernel(
+    const float* __restrict__ logits,
+    const uint32_t* __restrict__ draft_tokens,
+    size_t vocab_size, size_t n_rows,
+    size_t row_stride,
+    const uint64_t* __restrict__ nonce_ptr,
+    uint32_t* __restrict__ out_tokens,
+    uint32_t* __restrict__ accepted,
+    float* __restrict__ out_p_draft
+) {
+    const size_t row = blockIdx.x;
+    if (row >= n_rows) return;
+    const size_t tid = threadIdx.x;
+    const float* row_logits = logits + (row * row_stride);
+    const uint32_t draft = (draft_tokens != nullptr && row + 1ULL < n_rows)
+                            ? draft_tokens[row + 1ULL] : VELOX_SPEC_STOCH_INVALID;
+
+    __shared__ float s_max[256];
+    __shared__ float s_part[256];
+    __shared__ float s_red[256];
+    __shared__ float s_edraft;
+
+    float local_max = -INFINITY;
+    for (size_t i = tid; i < vocab_size; i += 256ULL) {
+        const float v = row_logits[i];
+        if (v > local_max) local_max = v;
+    }
+    s_max[tid] = local_max;
+    __syncthreads();
+    for (size_t stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride && s_max[tid + stride] > s_max[tid]) s_max[tid] = s_max[tid + stride];
+        __syncthreads();
+    }
+    const float row_max = s_max[0];
+
+    float local_sum = 0.0f;
+    for (size_t i = tid; i < vocab_size; i += 256ULL) {
+        local_sum += __expf(row_logits[i] - row_max);
+    }
+    s_part[tid] = local_sum;
+    if (tid == 0) {
+        s_edraft = (draft < vocab_size) ? __expf(row_logits[draft] - row_max) : 0.0f;
+    }
+    __syncthreads();
+
+    // Reduce in a separate buffer so s_part keeps the untouched per-thread
+    // sums that the residual sampling walk depends on.
+    s_red[tid] = s_part[tid];
+    __syncthreads();
+    for (size_t stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) s_red[tid] += s_red[tid + stride];
+        __syncthreads();
+    }
+    const float Z = s_red[0];
+    const float e_draft = s_edraft;
+    __syncthreads();
+
+    if (tid != 0) return;
+
+    if (!(Z > 0.0f) || !isfinite(Z)) {
+        out_tokens[row] = 0u;
+        accepted[row] = 0u;
+        out_p_draft[row] = 0.0f;
+        return;
+    }
+
+    // Deterministic per-(row, nonce) uniform in [0, 1) via SplitMix64.
+    const uint64_t nonce = *nonce_ptr;
+    uint64_t h = nonce ^ (0x9E3779B97F4A7C15ULL * (uint64_t)(row + 1ULL));
+    h ^= h >> 30; h *= 0xBF58476D1CE4E5B9ULL;
+    h ^= h >> 27; h *= 0x94D049BB133111EBULL;
+    h ^= h >> 31;
+    const float coin = (float)(h >> 40) * (1.0f / 16777216.0f);
+
+    const float p_draft = (draft < vocab_size) ? (e_draft / Z) : 0.0f;
+    out_p_draft[row] = p_draft;
+
+    if (draft < vocab_size && coin < p_draft) {
+        out_tokens[row] = draft;
+        accepted[row] = 1u;
+        return;
+    }
+    accepted[row] = 0u;
+
+    // Rejection: sample from the residual target distribution (draft removed).
+    const float residual = Z - e_draft;
+    if (!(residual > 0.0f)) {
+        float best = -INFINITY;
+        uint32_t best_idx = 0u;
+        for (size_t i = 0; i < vocab_size; ++i) {
+            const float v = row_logits[i];
+            if (v > best) { best = v; best_idx = (uint32_t)i; }
+        }
+        out_tokens[row] = best_idx;
+        return;
+    }
+
+    const float target = coin * residual;
+    float cumulative = 0.0f;
+    uint32_t chosen = VELOX_SPEC_STOCH_INVALID;
+    for (size_t seg = 0; seg < 256; ++seg) {
+        const float seg_sum = s_part[seg];
+        if (cumulative + seg_sum < target) {
+            cumulative += seg_sum;
+            continue;
+        }
+        float local = 0.0f;
+        for (size_t i = seg; i < vocab_size; i += 256ULL) {
+            const uint32_t idx = (uint32_t)i;
+            if (idx == draft) continue;
+            local += __expf(row_logits[i] - row_max);
+            if (cumulative + local >= target) { chosen = idx; break; }
+        }
+        break;
+    }
+    out_tokens[row] = (chosen == VELOX_SPEC_STOCH_INVALID) ? 0u : chosen;
+}
+
+
+// ============================================================================
 // Batched LM Head Evaluator
 // ============================================================================
 // A previous single-kernel "fused" variant reduced partial argmaxes across
@@ -1304,13 +1445,46 @@ static void velox_evaluate_lm_head_batched_legacy(
     cudaStream_t stream
 );
 
+static int g_spec_stochastic = 0;
+static unsigned long long g_spec_seed = 0x5EED0F5EED0F5EULL;
+static unsigned long long g_spec_nonce = 0ULL;
+
 static void velox_evaluate_lm_head_batched(
     VeloxCudaArena* ctx,
     const float* hidden_base,
     size_t n_rows,
     const size_t* d_positions,
+    const uint32_t* d_draft_tokens,
     cudaStream_t stream
 ) {
+    if (g_spec_stochastic) {
+        const float* final_norm_w = VELOX_DEV_NORM_PTR(ctx, 2208972800ULL);
+        float* verify_norm = VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_VERIFY_NORM_BASE);
+        float* verify_logits = VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_VERIFY_LOGITS_BASE);
+
+        velox_cuda_rmsnorm_batched<<<dim3(1, (unsigned int)n_rows), dim3(256), 0, stream>>>(
+            verify_norm, hidden_base, final_norm_w,
+            VELOX_HIDDEN_DIM, 1e-6f,
+            n_rows, VELOX_HIDDEN_DIM, VELOX_HIDDEN_DIM
+        );
+        velox_cuda_matmul_vec_batched_q4<<<dim3(62656ULL, (unsigned int)n_rows), dim3(128), 0, stream>>>(
+            verify_logits, verify_norm,
+            VELOX_DEV_W_Q4_PTR(ctx, 2208983040ULL),
+            VELOX_DEV_S_Q4_PTR(ctx, 2208983040ULL),
+            2560ULL, VELOX_VOCAB_SIZE, n_rows
+        );
+
+        const uint64_t* nonce_ptr = (const uint64_t*)((uint8_t*)ctx->activation_arena + VELOX_VERIFY_STOCH_NONCE_OFF);
+        velox_cuda_spec_stochastic_kernel<<<dim3((unsigned int)n_rows), dim3(256), 0, stream>>>(
+            verify_logits, d_draft_tokens,
+            VELOX_VOCAB_SIZE, n_rows, VELOX_VOCAB_SIZE,
+            nonce_ptr,
+            (uint32_t*)((uint8_t*)ctx->activation_arena + VELOX_VERIFY_STOCH_OUT_OFF),
+            (uint32_t*)((uint8_t*)ctx->activation_arena + VELOX_VERIFY_STOCH_ACC_OFF),
+            (float*)((uint8_t*)ctx->activation_arena + VELOX_VERIFY_STOCH_PDRAFT_OFF)
+        );
+        return;
+    }
     velox_evaluate_lm_head_batched_legacy(ctx, hidden_base, n_rows, d_positions, stream);
 }
 
@@ -1388,7 +1562,9 @@ static void velox_verify_forward_full(
         default: break;
     }
 
-    velox_evaluate_lm_head_batched(ctx, hidden, (size_t)batch, d_positions, stream);
+    const uint32_t* d_tokens = (const uint32_t*)((uint8_t*)ctx->activation_arena
+        + (VELOX_BATCHED_PREFILL_ACT_BASE + VELOX_BATCHED_PREFILL_MAX_TOKENS * (VELOX_INTERMEDIATE_DIM * 4ULL + 0ULL)));
+    velox_evaluate_lm_head_batched(ctx, hidden, (size_t)batch, d_positions, d_tokens, stream);
 }
 #undef RUN_VERIFY_BATCH
 
@@ -1630,6 +1806,10 @@ int main(int argc, char** argv) {
             max_draft_len = atoi(argv[++i]);
             if (max_draft_len <= 0) max_draft_len = 3;
             if (max_draft_len > 7) max_draft_len = 7;
+        } else if (strcmp(argv[i], "--spec-stochastic") == 0) {
+            g_spec_stochastic = 1;
+        } else if (strcmp(argv[i], "--spec-seed") == 0 && i + 1 < argc) {
+            g_spec_seed = (unsigned long long)strtoull(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--spec-ema") == 0 && i + 1 < argc) {
             spec_off_ema = (float)atof(argv[++i]);
             if (spec_off_ema < 0.0f) spec_off_ema = 0.0f;
@@ -1651,6 +1831,8 @@ int main(int argc, char** argv) {
             printf("  --speculative [K]      Enable Prompt-Lookup Speculative Decoding (default draft K=3)\n");
             printf("  --draft-len <K>        Set max draft candidate length (default: 3, max: 7)\n");
             printf("  --spec-ema <x>         Adaptive drafting: EMA acceptance floor (default 0.20)\n");
+            printf("  --spec-stochastic      Lossless stochastic verification (accept with p(draft))\n");
+            printf("  --spec-seed <N>        Seed for stochastic verification nonces\n");
             printf("  --steps <N>            Autoregressive decode steps (default: 16)\n");
             printf("  --context-len <N>      Max context tokens in host-pinned KV cache (default: 16384)\n");
             printf("  --verbose              Print token at each step\n");
@@ -2094,6 +2276,12 @@ int main(int argc, char** argv) {
 
                     cudaMemcpyAsync(d_tokens, candidates, B * sizeof(uint32_t), cudaMemcpyHostToDevice, stream);
                     velox_cuda_init_positions<<<1, 32, 0, stream>>>(d_positions, curr_pos, B);
+                    if (g_spec_stochastic) {
+                        g_spec_nonce = g_spec_seed + (unsigned long long)spec_steps;
+                        uint64_t nonce_dev = (uint64_t)g_spec_nonce;
+                        cudaMemcpyAsync((uint8_t*)ctx.activation_arena + VELOX_VERIFY_STOCH_NONCE_OFF,
+                                        &nonce_dev, sizeof(uint64_t), cudaMemcpyHostToDevice, stream);
+                    }
 
                     if (verify_graph_exec[B] != NULL) {
                         // Graph replay: the captured batch reads the d_tokens and
@@ -2109,11 +2297,27 @@ int main(int argc, char** argv) {
                     }
                     cudaStreamSynchronize(stream);
 
+                    uint32_t stoch_out[8];
+                    uint32_t stoch_acc[8];
+                    if (g_spec_stochastic) {
+                        cudaMemcpy(stoch_out,
+                            (uint8_t*)ctx.activation_arena + VELOX_VERIFY_STOCH_OUT_OFF,
+                            B * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+                        cudaMemcpy(stoch_acc,
+                            (uint8_t*)ctx.activation_arena + VELOX_VERIFY_STOCH_ACC_OFF,
+                            B * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+                    }
+
                     for (int t = 0; t < B && gen_count < steps; ++t) {
-                        const uint32_t winner = h_ring[(curr_pos + (size_t)t) & (VELOX_HOST_RING_SLOTS - 1ULL)];
+                        const uint32_t winner = g_spec_stochastic
+                            ? stoch_out[t]
+                            : h_ring[(curr_pos + (size_t)t) & (VELOX_HOST_RING_SLOTS - 1ULL)];
+                        const int accepted_now = g_spec_stochastic
+                            ? (stoch_acc[t] != 0u ? 1 : 0)
+                            : (winner == candidates[t + 1] ? 1 : 0);
 
                         if (t < B - 1) {
-                            if (winner == candidates[t + 1]) {
+                            if (accepted_now) {
                                 total_accepted++;
                                 accepted_in_step++;
                                 generated_tokens[gen_count++] = candidates[t + 1];

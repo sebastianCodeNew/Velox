@@ -107,6 +107,10 @@ pub struct SpecOptions {
     pub draft_len: Option<u32>,
     /// Adaptive acceptance EMA floor in 0.0..=1.0 below which drafting pauses.
     pub spec_ema: Option<f32>,
+    /// Use lossless stochastic verification (accept with probability p(draft)).
+    pub stochastic: bool,
+    /// Seed for the per-step stochastic verification nonces.
+    pub seed: Option<u64>,
 }
 
 impl Default for SpecOptions {
@@ -115,6 +119,8 @@ impl Default for SpecOptions {
             speculative: false,
             draft_len: None,
             spec_ema: None,
+            stochastic: false,
+            seed: None,
         }
     }
 }
@@ -586,6 +592,26 @@ pub fn parse_cli_args(raw_args: &[String]) -> Result<CliAction, String> {
                 .parse::<u64>()
                 .map_err(|_| format!("error: invalid integer for --seed: '{v}'"))?;
             idx += 1;
+        } else if arg == "--spec-stochastic" {
+            cli_args.spec.speculative = true;
+            cli_args.spec.stochastic = true;
+            idx += 1;
+        } else if arg == "--spec-seed" {
+            if idx + 1 >= args.len() {
+                return Err("error: flag '--spec-seed' requires an unsigned 64-bit integer".to_string());
+            }
+            cli_args.spec.seed = Some(
+                args[idx + 1]
+                    .parse::<u64>()
+                    .map_err(|_| format!("error: invalid integer for --spec-seed: '{}'", args[idx + 1]))?,
+            );
+            idx += 2;
+        } else if let Some(v) = arg.strip_prefix("--spec-seed=") {
+            cli_args.spec.seed = Some(
+                v.parse::<u64>()
+                    .map_err(|_| format!("error: invalid integer for --spec-seed: '{v}'"))?,
+            );
+            idx += 1;
         } else if arg == "--format" {
             if idx + 1 >= args.len() {
                 return Err("error: flag '--format' requires an argument (choose from 'text', 'json')".to_string());
@@ -724,6 +750,8 @@ options:
   --speculative [K]      Enable prompt-lookup speculative decoding (CUDA runner; optional draft width, default K=3).
   --draft-len <K>        Set the max speculative draft length 1-7 (used with --speculative).
   --spec-ema <x>         Adaptive drafting: EMA acceptance floor 0.0-1.0 below which drafting pauses (default: 0.20).
+  --spec-stochastic      Lossless stochastic verification: accept a draft with probability p(draft).
+  --spec-seed <N>        Seed for stochastic verification nonces (default: 0x5EED0F5EED0F5E).
   --weights <path>       Override path to .safetensors weights file for --run.
   --tokenizer <path>     Path to tokenizer.json (default: tokenizer.json).
   --benchmark            Print detailed inference latency, throughput, and allocations.
@@ -823,6 +851,12 @@ pub fn run_external_runner(
     }
     if let Some(spec_ema) = spec.spec_ema {
         cmd.arg("--spec-ema").arg(spec_ema.to_string());
+    }
+    if spec.stochastic {
+        cmd.arg("--spec-stochastic");
+    }
+    if let Some(seed) = spec.seed {
+        cmd.arg("--spec-seed").arg(seed.to_string());
     }
 
     if runner_path.to_string_lossy().contains("k2") {
