@@ -1,5 +1,6 @@
 # Rust build output
 /target/
+/target-v2/
 **/*.rs.bk
 
 # Model weights & checkpoints (large binary artifacts)
