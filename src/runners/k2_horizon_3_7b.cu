@@ -218,11 +218,6 @@ typedef struct VeloxDecodeState {
         VELOX_DEV_ACT_PTR(ctx->activation_arena, rope_offset), (float*)ctx->kv_cache_pool, \
         layer * 100, d_state, VELOX_MODEL_ROPE_THETA, active_mask)
 
-#define VELOX_DISPATCH_GQA(ctx, gqa_offset, layer, stream, active_mask) \
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>( \
-        VELOX_DEV_ACT_PTR(ctx->activation_arena, gqa_offset), (float*)ctx->kv_cache_pool, \
-        layer * 100, d_state, active_mask)
-
 #define VELOX_DISPATCH_OUT_PROJ(ctx, out_offset, residual_offset, stream, active_mask) \
     do { \
         if (ctx->quant_mode == VELOX_QUANT_FP16) { \
@@ -569,80 +564,177 @@ __global__ void __launch_bounds__(128, 8) velox_cuda_fused_rope_kernel(
     }
 }
 
-// 1.3e Parallel GQA Attention Kernel (9 blocks across heads)
-__global__ void __launch_bounds__(256, 4) velox_cuda_gqa_attn_kernel(
+// ============================================================================
+// 1.3e Split-K Flash-Decoding GQA Attention
+//
+// Why this replaces the previous kernel:
+//   The old kernel launched ONE 256-thread block per head and, for every
+//   context position, performed a 256-wide shared-memory tree reduction with
+//   a __syncthreads() per level -- 10 barriers per position. Only 128 of the
+//   256 threads had useful work, and with a single decode token the grid was
+//   just 32 blocks, so the GPU could not hide memory latency at all.
+//
+//   This version uses one WAVE (32 lanes) per (head, split). Each lane owns
+//   4 of the 128 head dims, so the dot product is a 5-instruction
+//   __shfl_down_sync reduction with NO shared memory and NO __syncthreads.
+//   The context is partitioned into VELOX_ATTN_SPLITS ranges so a single
+//   decode step exposes 32 * SPLITS blocks instead of 32. A second kernel
+//   combines the per-split (m, l, acc) partials with a numerically stable
+//   online-softmax merge.
+// ============================================================================
+
+#define VELOX_ATTN_SPLITS                 8ULL
+#define VELOX_ATTN_PARTIAL_FLOATS         (VELOX_NUM_HEADS * VELOX_ATTN_SPLITS * (2ULL + VELOX_HEAD_DIM))
+#define VELOX_ATTN_PARTIAL_BYTES          (VELOX_ATTN_PARTIAL_FLOATS * 4ULL)
+// Place the split scratch at the tail of the activation arena so it never
+// collides with the prefill or speculative-verify regions.
+#define VELOX_ATTN_SPLIT_BASE             (VELOX_ACTIVATION_ARENA_BYTES - VELOX_ATTN_PARTIAL_BYTES)
+#define VELOX_ATTN_SPLIT_M(ctx)           ((float*)((uint8_t*)(ctx)->activation_arena + VELOX_ATTN_SPLIT_BASE))
+#define VELOX_ATTN_SPLIT_L(ctx)           (VELOX_ATTN_SPLIT_M(ctx) + VELOX_NUM_HEADS * VELOX_ATTN_SPLITS)
+#define VELOX_ATTN_SPLIT_ACC(ctx)         (VELOX_ATTN_SPLIT_L(ctx) + VELOX_NUM_HEADS * VELOX_ATTN_SPLITS)
+
+// The split kernel needs the arena base for its partial buffers. Passing the
+// arena pointer explicitly keeps the kernel free of global state.
+__global__ void __launch_bounds__(32, 16) velox_cuda_gqa_attn_split(
     float* __restrict__ dst_attn,
     const float* __restrict__ kv_pool,
+    float* __restrict__ partial_m,
+    float* __restrict__ partial_l,
+    float* __restrict__ partial_acc,
     size_t layer,
     const VeloxDecodeState* __restrict__ state,
+    size_t num_splits,
     uint64_t active_mask
 ) {
     if ((active_mask & 1ULL) == 0ULL) return;
-    const size_t step = (size_t)state->step;
-    const size_t H = VELOX_NUM_HEADS;
-    const size_t KV_H = VELOX_NUM_KV_HEADS;
-    const size_t D = VELOX_HEAD_DIM;
+
+    const size_t step  = (size_t)state->step;
+    const size_t H     = VELOX_NUM_HEADS;
+    const size_t KV_H  = VELOX_NUM_KV_HEADS;
+    const size_t D     = VELOX_HEAD_DIM;
     const size_t max_s = VELOX_MODEL_MAX_SEQ_LEN;
     const size_t safe_step = (step < max_s) ? step : (max_s - 1);
     const size_t seq_len = safe_step + 1;
-    const size_t kv_dim = KV_H * D;
-    const size_t layer_kv_stride = 2ULL * max_s * kv_dim;
 
-    const size_t h = blockIdx.x;
-    if (h >= H) return;
-    const size_t tid = threadIdx.x;
+    const size_t h     = blockIdx.x;
+    const size_t split = blockIdx.y;
+    if (h >= H || split >= num_splits) return;
+
+    const size_t lane = threadIdx.x;
     const size_t kv_group = H / KV_H;
     const size_t kv_h = h / kv_group;
 
+    const size_t kv_dim = KV_H * D;
+    const size_t layer_kv_stride = 2ULL * max_s * kv_dim;
     const float* k_layer = kv_pool + (layer * layer_kv_stride);
     const float* v_layer = k_layer + (max_s * kv_dim);
 
-    __shared__ float s_q[128];
-    if (tid < D) {
-        s_q[tid] = dst_attn[h * D + tid];
-    }
-    __syncthreads();
+    const size_t per_split = (seq_len + num_splits - 1ULL) / num_splits;
+    const size_t s_begin = split * per_split;
+    const size_t s_end   = (s_begin + per_split < seq_len) ? (s_begin + per_split) : seq_len;
 
-    float scale = 1.0f / sqrtf((float)D);
-    float acc_d = 0.0f;
+    const float* q_head = dst_attn + (h * D);
+    const float q0 = q_head[lane];
+    const float q1 = q_head[lane + 32ULL];
+    const float q2 = q_head[lane + 64ULL];
+    const float q3 = q_head[lane + 96ULL];
+
+    const float scale = 1.0f / sqrtf((float)D);
     float m = -INFINITY;
     float l = 0.0f;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
 
-    for (size_t t = 0; t < seq_len; ++t) {
-        const float* k_t = k_layer + (t * kv_dim) + (kv_h * D);
-        const float* v_t = v_layer + (t * kv_dim) + (kv_h * D);
+    for (size_t s = s_begin; s < s_end; ++s) {
+        const float* k_t = k_layer + (s * kv_dim) + (kv_h * D);
+        const float* v_t = v_layer + (s * kv_dim) + (kv_h * D);
 
-        __shared__ float s_dot[256];
-        float my_dot = 0.0f;
-        if (tid < D) {
-            my_dot = s_q[tid] * k_t[tid];
+        float dot = q0 * k_t[lane] + q1 * k_t[lane + 32ULL]
+                  + q2 * k_t[lane + 64ULL] + q3 * k_t[lane + 96ULL];
+        // Butterfly all-reduce so every lane holds the full dot product.
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            dot += __shfl_xor_sync(0xffffffffu, dot, off);
         }
-        s_dot[tid] = my_dot;
-        __syncthreads();
-        // Tree reduction bounded by the launched block size (power of two, <= 256). Reducing a
-        // fixed 256-wide span would read never-written shared memory when blockDim.x < 256.
-        for (size_t s = blockDim.x / 2; s > 0; s >>= 1) {
-            if (tid < s) s_dot[tid] += s_dot[tid + s];
-            __syncthreads();
-        }
-        float dot = s_dot[0] * scale;
+        dot *= scale;
 
-        float new_m = (dot > m) ? dot : m;
-        float alpha = (m == -INFINITY) ? 0.0f : expf(m - new_m);
-        float beta = (new_m == -INFINITY) ? 0.0f : expf(dot - new_m);
+        const float new_m = (dot > m) ? dot : m;
+        const float alpha = (m == -INFINITY) ? 0.0f : __expf(m - new_m);
+        const float beta  = (new_m == -INFINITY) ? 0.0f : __expf(dot - new_m);
         l = l * alpha + beta;
         m = new_m;
 
-        if (tid < D) {
-            acc_d = acc_d * alpha + beta * v_t[tid];
-        }
-        __syncthreads();
+        a0 = a0 * alpha + beta * v_t[lane];
+        a1 = a1 * alpha + beta * v_t[lane + 32ULL];
+        a2 = a2 * alpha + beta * v_t[lane + 64ULL];
+        a3 = a3 * alpha + beta * v_t[lane + 96ULL];
     }
 
-    if (tid < D) {
-        dst_attn[h * D + tid] = (l > 0.0f) ? (acc_d / l) : 0.0f;
-    }
+    const size_t slot = h * num_splits + split;
+    partial_m[slot] = m;
+    partial_l[slot] = l;
+    float* acc = partial_acc + (slot * D);
+    acc[lane]          = a0;
+    acc[lane + 32ULL]  = a1;
+    acc[lane + 64ULL]  = a2;
+    acc[lane + 96ULL]  = a3;
 }
+
+// Numerically stable merge of the per-split partials (flash-decoding combine).
+__global__ void __launch_bounds__(128, 4) velox_cuda_gqa_attn_combine(
+    float* __restrict__ dst_attn,
+    const float* __restrict__ partial_m,
+    const float* __restrict__ partial_l,
+    const float* __restrict__ partial_acc,
+    size_t num_splits,
+    uint64_t active_mask
+) {
+    if ((active_mask & 1ULL) == 0ULL) return;
+
+    const size_t h   = blockIdx.x;
+    const size_t tid = threadIdx.x;
+    const size_t H   = VELOX_NUM_HEADS;
+    const size_t D   = VELOX_HEAD_DIM;
+    if (h >= H || tid >= D) return;
+
+    float g_m = -INFINITY;
+    for (size_t s = 0; s < num_splits; ++s) {
+        const float m_i = partial_m[h * num_splits + s];
+        g_m = (m_i > g_m) ? m_i : g_m;
+    }
+
+    if (g_m == -INFINITY) {
+        dst_attn[h * D + tid] = 0.0f;
+        return;
+    }
+
+    float g_l = 0.0f;
+    for (size_t s = 0; s < num_splits; ++s) {
+        const size_t slot = h * num_splits + s;
+        g_l += partial_l[slot] * __expf(partial_m[slot] - g_m);
+    }
+
+    float acc = 0.0f;
+    for (size_t s = 0; s < num_splits; ++s) {
+        const size_t slot = h * num_splits + s;
+        acc += partial_acc[slot * D + tid] * __expf(partial_m[slot] - g_m);
+    }
+
+    dst_attn[h * D + tid] = (g_l > 0.0f) ? (acc / g_l) : 0.0f;
+}
+
+// Launches the split pass and the combine pass for one layer. Every decode
+// call site routes through this helper so the two launches stay paired.
+#define VELOX_DISPATCH_GQA(ctx, gqa_offset, layer, stream, active_mask) \
+    do { \
+        velox_cuda_gqa_attn_split<<<dim3(VELOX_NUM_HEADS, VELOX_ATTN_SPLITS), dim3(32), 0, stream>>>( \
+            VELOX_DEV_ACT_PTR((ctx)->activation_arena, (gqa_offset)), (const float*)(ctx)->kv_cache_pool, \
+            VELOX_ATTN_SPLIT_M(ctx), VELOX_ATTN_SPLIT_L(ctx), VELOX_ATTN_SPLIT_ACC(ctx), \
+            (layer), d_state, VELOX_ATTN_SPLITS, (active_mask)); \
+        velox_cuda_gqa_attn_combine<<<dim3(VELOX_NUM_HEADS), dim3(128), 0, stream>>>( \
+            VELOX_DEV_ACT_PTR((ctx)->activation_arena, (gqa_offset)), \
+            VELOX_ATTN_SPLIT_M(ctx), VELOX_ATTN_SPLIT_L(ctx), VELOX_ATTN_SPLIT_ACC(ctx), \
+            VELOX_ATTN_SPLITS, (active_mask)); \
+    } while(0)
 
 // 1.3f Multi-Block Out Projection + Residual Kernel (144 blocks on SmolLM-135M)
 __global__ void __launch_bounds__(128, 8) velox_cuda_out_proj_residual_kernel(
@@ -1969,7 +2061,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 134217728ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 0ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 134217728ULL), (float*)ctx->kv_cache_pool, 0ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 134217728ULL), (float*)ctx->kv_cache_pool, 0ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 134217728ULL, 0ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 134217728ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 0ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -1997,7 +2089,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 469762048ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 1ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 469762048ULL), (float*)ctx->kv_cache_pool, 1ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 469762048ULL), (float*)ctx->kv_cache_pool, 1ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 469762048ULL, 1ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 469762048ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 1ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2025,7 +2117,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 805306368ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 2ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 805306368ULL), (float*)ctx->kv_cache_pool, 2ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 805306368ULL), (float*)ctx->kv_cache_pool, 2ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 805306368ULL, 2ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 805306368ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 2ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2053,7 +2145,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1140850688ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 3ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1140850688ULL), (float*)ctx->kv_cache_pool, 3ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1140850688ULL), (float*)ctx->kv_cache_pool, 3ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 1140850688ULL, 3ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1140850688ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 3ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2081,7 +2173,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1476395008ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 4ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1476395008ULL), (float*)ctx->kv_cache_pool, 4ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1476395008ULL), (float*)ctx->kv_cache_pool, 4ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 1476395008ULL, 4ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1476395008ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 4ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2109,7 +2201,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1811939328ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 5ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1811939328ULL), (float*)ctx->kv_cache_pool, 5ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1811939328ULL), (float*)ctx->kv_cache_pool, 5ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 1811939328ULL, 5ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1811939328ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 5ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2137,7 +2229,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2147483648ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 6ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2147483648ULL), (float*)ctx->kv_cache_pool, 6ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2147483648ULL), (float*)ctx->kv_cache_pool, 6ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 2147483648ULL, 6ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 2147483648ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 6ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2165,7 +2257,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2483027968ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 7ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2483027968ULL), (float*)ctx->kv_cache_pool, 7ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2483027968ULL), (float*)ctx->kv_cache_pool, 7ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 2483027968ULL, 7ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 2483027968ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 7ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2193,7 +2285,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2818572288ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 8ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2818572288ULL), (float*)ctx->kv_cache_pool, 8ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2818572288ULL), (float*)ctx->kv_cache_pool, 8ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 2818572288ULL, 8ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 2818572288ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 8ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2221,7 +2313,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 3154116608ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 9ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 3154116608ULL), (float*)ctx->kv_cache_pool, 9ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 3154116608ULL), (float*)ctx->kv_cache_pool, 9ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 3154116608ULL, 9ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 3154116608ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 9ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2249,7 +2341,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 3489660928ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 10ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 3489660928ULL), (float*)ctx->kv_cache_pool, 10ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 3489660928ULL), (float*)ctx->kv_cache_pool, 10ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 3489660928ULL, 10ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 3489660928ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 10ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2277,7 +2369,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 3825205248ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 11ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 3825205248ULL), (float*)ctx->kv_cache_pool, 11ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 3825205248ULL), (float*)ctx->kv_cache_pool, 11ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 3825205248ULL, 11ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 3825205248ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 11ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2305,7 +2397,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 4160749568ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 12ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 4160749568ULL), (float*)ctx->kv_cache_pool, 12ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 4160749568ULL), (float*)ctx->kv_cache_pool, 12ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 4160749568ULL, 12ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 4160749568ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 12ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2333,7 +2425,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 4496293888ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 13ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 4496293888ULL), (float*)ctx->kv_cache_pool, 13ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 4496293888ULL), (float*)ctx->kv_cache_pool, 13ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 4496293888ULL, 13ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 4496293888ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 13ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2361,7 +2453,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 4831838208ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 14ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 4831838208ULL), (float*)ctx->kv_cache_pool, 14ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 4831838208ULL), (float*)ctx->kv_cache_pool, 14ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 4831838208ULL, 14ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 4831838208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 14ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2389,7 +2481,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 5167382528ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 15ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 5167382528ULL), (float*)ctx->kv_cache_pool, 15ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 5167382528ULL), (float*)ctx->kv_cache_pool, 15ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 5167382528ULL, 15ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 5167382528ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 15ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2417,7 +2509,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 5502926848ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 16ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 5502926848ULL), (float*)ctx->kv_cache_pool, 16ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 5502926848ULL), (float*)ctx->kv_cache_pool, 16ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 5502926848ULL, 16ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 5502926848ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 16ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2445,7 +2537,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 5838471168ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 17ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 5838471168ULL), (float*)ctx->kv_cache_pool, 17ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 5838471168ULL), (float*)ctx->kv_cache_pool, 17ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 5838471168ULL, 17ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 5838471168ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 17ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2473,7 +2565,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 6174015488ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 18ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 6174015488ULL), (float*)ctx->kv_cache_pool, 18ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 6174015488ULL), (float*)ctx->kv_cache_pool, 18ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 6174015488ULL, 18ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 6174015488ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 18ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2501,7 +2593,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 6509559808ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 19ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 6509559808ULL), (float*)ctx->kv_cache_pool, 19ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 6509559808ULL), (float*)ctx->kv_cache_pool, 19ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 6509559808ULL, 19ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 6509559808ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 19ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2529,7 +2621,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 6845104128ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 20ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 6845104128ULL), (float*)ctx->kv_cache_pool, 20ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 6845104128ULL), (float*)ctx->kv_cache_pool, 20ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 6845104128ULL, 20ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 6845104128ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 20ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2557,7 +2649,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 7180648448ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 21ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 7180648448ULL), (float*)ctx->kv_cache_pool, 21ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 7180648448ULL), (float*)ctx->kv_cache_pool, 21ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 7180648448ULL, 21ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 7180648448ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 21ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2585,7 +2677,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 7516192768ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 22ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 7516192768ULL), (float*)ctx->kv_cache_pool, 22ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 7516192768ULL), (float*)ctx->kv_cache_pool, 22ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 7516192768ULL, 22ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 7516192768ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 22ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2613,7 +2705,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 7851737088ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 23ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 7851737088ULL), (float*)ctx->kv_cache_pool, 23ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 7851737088ULL), (float*)ctx->kv_cache_pool, 23ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 7851737088ULL, 23ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 7851737088ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 23ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2641,7 +2733,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 8187281408ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 24ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 8187281408ULL), (float*)ctx->kv_cache_pool, 24ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 8187281408ULL), (float*)ctx->kv_cache_pool, 24ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 8187281408ULL, 24ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 8187281408ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 24ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2669,7 +2761,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 8522825728ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 25ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 8522825728ULL), (float*)ctx->kv_cache_pool, 25ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 8522825728ULL), (float*)ctx->kv_cache_pool, 25ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 8522825728ULL, 25ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 8522825728ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 25ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2697,7 +2789,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 8858370048ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 26ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 8858370048ULL), (float*)ctx->kv_cache_pool, 26ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 8858370048ULL), (float*)ctx->kv_cache_pool, 26ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 8858370048ULL, 26ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 8858370048ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 26ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2725,7 +2817,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 9193914368ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 27ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 9193914368ULL), (float*)ctx->kv_cache_pool, 27ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 9193914368ULL), (float*)ctx->kv_cache_pool, 27ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 9193914368ULL, 27ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 9193914368ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 27ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2753,7 +2845,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 9529458688ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 28ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 9529458688ULL), (float*)ctx->kv_cache_pool, 28ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 9529458688ULL), (float*)ctx->kv_cache_pool, 28ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 9529458688ULL, 28ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 9529458688ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 28ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2781,7 +2873,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 9865003008ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 29ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 9865003008ULL), (float*)ctx->kv_cache_pool, 29ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 9865003008ULL), (float*)ctx->kv_cache_pool, 29ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 9865003008ULL, 29ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 9865003008ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 29ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2809,7 +2901,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 10200547328ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 30ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 10200547328ULL), (float*)ctx->kv_cache_pool, 30ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 10200547328ULL), (float*)ctx->kv_cache_pool, 30ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 10200547328ULL, 30ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 10200547328ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 30ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2837,7 +2929,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 10536091648ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 31ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 10536091648ULL), (float*)ctx->kv_cache_pool, 31ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 10536091648ULL), (float*)ctx->kv_cache_pool, 31ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 10536091648ULL, 31ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 10536091648ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 31ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2865,7 +2957,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 10871635968ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 32ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 10871635968ULL), (float*)ctx->kv_cache_pool, 32ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 10871635968ULL), (float*)ctx->kv_cache_pool, 32ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 10871635968ULL, 32ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 10871635968ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 32ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2893,7 +2985,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 11207180288ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 33ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 11207180288ULL), (float*)ctx->kv_cache_pool, 33ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 11207180288ULL), (float*)ctx->kv_cache_pool, 33ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 11207180288ULL, 33ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 11207180288ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 33ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2921,7 +3013,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 11542724608ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 34ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 11542724608ULL), (float*)ctx->kv_cache_pool, 34ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 11542724608ULL), (float*)ctx->kv_cache_pool, 34ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 11542724608ULL, 34ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 11542724608ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 34ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -2949,7 +3041,7 @@ extern "C" void velox_K2_Horizon_3_7B_prefill_graph_step_cuda(
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 11878268928ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 35ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 11878268928ULL), (float*)ctx->kv_cache_pool, 35ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 11878268928ULL), (float*)ctx->kv_cache_pool, 35ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 11878268928ULL, 35ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 11878268928ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 113246208ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 35ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3040,7 +3132,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1022976ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 0ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1022976ULL), (float*)ctx->kv_cache_pool, 0ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1022976ULL), (float*)ctx->kv_cache_pool, 0ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 1022976ULL, 0ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1022976ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 0ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3068,7 +3160,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1186816ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 1ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1186816ULL), (float*)ctx->kv_cache_pool, 1ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1186816ULL), (float*)ctx->kv_cache_pool, 1ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 1186816ULL, 1ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1186816ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 1ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3096,7 +3188,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1350656ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 2ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1350656ULL), (float*)ctx->kv_cache_pool, 2ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1350656ULL), (float*)ctx->kv_cache_pool, 2ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 1350656ULL, 2ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1350656ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 2ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3124,7 +3216,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1514496ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 3ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1514496ULL), (float*)ctx->kv_cache_pool, 3ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1514496ULL), (float*)ctx->kv_cache_pool, 3ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 1514496ULL, 3ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1514496ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 3ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3152,7 +3244,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1678336ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 4ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1678336ULL), (float*)ctx->kv_cache_pool, 4ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1678336ULL), (float*)ctx->kv_cache_pool, 4ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 1678336ULL, 4ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1678336ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 4ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3180,7 +3272,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1842176ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 5ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1842176ULL), (float*)ctx->kv_cache_pool, 5ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1842176ULL), (float*)ctx->kv_cache_pool, 5ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 1842176ULL, 5ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1842176ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 5ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3208,7 +3300,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2006016ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 6ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2006016ULL), (float*)ctx->kv_cache_pool, 6ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2006016ULL), (float*)ctx->kv_cache_pool, 6ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 2006016ULL, 6ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 2006016ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 6ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3236,7 +3328,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2169856ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 7ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2169856ULL), (float*)ctx->kv_cache_pool, 7ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2169856ULL), (float*)ctx->kv_cache_pool, 7ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 2169856ULL, 7ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 2169856ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 7ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3264,7 +3356,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2333696ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 8ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2333696ULL), (float*)ctx->kv_cache_pool, 8ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2333696ULL), (float*)ctx->kv_cache_pool, 8ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 2333696ULL, 8ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 2333696ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 8ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3292,7 +3384,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2497536ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 9ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2497536ULL), (float*)ctx->kv_cache_pool, 9ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2497536ULL), (float*)ctx->kv_cache_pool, 9ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 2497536ULL, 9ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 2497536ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 9ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3320,7 +3412,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2661376ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 10ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2661376ULL), (float*)ctx->kv_cache_pool, 10ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2661376ULL), (float*)ctx->kv_cache_pool, 10ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 2661376ULL, 10ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 2661376ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 10ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3348,7 +3440,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2825216ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 11ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2825216ULL), (float*)ctx->kv_cache_pool, 11ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2825216ULL), (float*)ctx->kv_cache_pool, 11ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 2825216ULL, 11ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 2825216ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 11ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3376,7 +3468,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2989056ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 12ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2989056ULL), (float*)ctx->kv_cache_pool, 12ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 2989056ULL), (float*)ctx->kv_cache_pool, 12ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 2989056ULL, 12ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 2989056ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 12ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3404,7 +3496,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 3152896ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 13ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 3152896ULL), (float*)ctx->kv_cache_pool, 13ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 3152896ULL), (float*)ctx->kv_cache_pool, 13ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 3152896ULL, 13ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 3152896ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 13ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3432,7 +3524,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 3316736ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 14ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 3316736ULL), (float*)ctx->kv_cache_pool, 14ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 3316736ULL), (float*)ctx->kv_cache_pool, 14ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 3316736ULL, 14ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 3316736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 14ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3460,7 +3552,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 3480576ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 15ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 3480576ULL), (float*)ctx->kv_cache_pool, 15ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 3480576ULL), (float*)ctx->kv_cache_pool, 15ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 3480576ULL, 15ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 3480576ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 15ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3488,7 +3580,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 3644416ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 16ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 3644416ULL), (float*)ctx->kv_cache_pool, 16ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 3644416ULL), (float*)ctx->kv_cache_pool, 16ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 3644416ULL, 16ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 3644416ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 16ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3516,7 +3608,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 3808256ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 17ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 3808256ULL), (float*)ctx->kv_cache_pool, 17ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 3808256ULL), (float*)ctx->kv_cache_pool, 17ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 3808256ULL, 17ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 3808256ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 17ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3544,7 +3636,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 3972096ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 18ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 3972096ULL), (float*)ctx->kv_cache_pool, 18ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 3972096ULL), (float*)ctx->kv_cache_pool, 18ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 3972096ULL, 18ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 3972096ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 18ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3572,7 +3664,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 4135936ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 19ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 4135936ULL), (float*)ctx->kv_cache_pool, 19ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 4135936ULL), (float*)ctx->kv_cache_pool, 19ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 4135936ULL, 19ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 4135936ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 19ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3600,7 +3692,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 4299776ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 20ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 4299776ULL), (float*)ctx->kv_cache_pool, 20ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 4299776ULL), (float*)ctx->kv_cache_pool, 20ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 4299776ULL, 20ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 4299776ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 20ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3628,7 +3720,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 4463616ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 21ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 4463616ULL), (float*)ctx->kv_cache_pool, 21ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 4463616ULL), (float*)ctx->kv_cache_pool, 21ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 4463616ULL, 21ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 4463616ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 21ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3656,7 +3748,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 4627456ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 22ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 4627456ULL), (float*)ctx->kv_cache_pool, 22ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 4627456ULL), (float*)ctx->kv_cache_pool, 22ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 4627456ULL, 22ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 4627456ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 22ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3684,7 +3776,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 4791296ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 23ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 4791296ULL), (float*)ctx->kv_cache_pool, 23ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 4791296ULL), (float*)ctx->kv_cache_pool, 23ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 4791296ULL, 23ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 4791296ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 23ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3712,7 +3804,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 4955136ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 24ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 4955136ULL), (float*)ctx->kv_cache_pool, 24ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 4955136ULL), (float*)ctx->kv_cache_pool, 24ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 4955136ULL, 24ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 4955136ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 24ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3740,7 +3832,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 5118976ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 25ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 5118976ULL), (float*)ctx->kv_cache_pool, 25ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 5118976ULL), (float*)ctx->kv_cache_pool, 25ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 5118976ULL, 25ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 5118976ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 25ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3768,7 +3860,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 5282816ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 26ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 5282816ULL), (float*)ctx->kv_cache_pool, 26ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 5282816ULL), (float*)ctx->kv_cache_pool, 26ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 5282816ULL, 26ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 5282816ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 26ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3796,7 +3888,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 5446656ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 27ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 5446656ULL), (float*)ctx->kv_cache_pool, 27ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 5446656ULL), (float*)ctx->kv_cache_pool, 27ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 5446656ULL, 27ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 5446656ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 27ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3824,7 +3916,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 5610496ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 28ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 5610496ULL), (float*)ctx->kv_cache_pool, 28ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 5610496ULL), (float*)ctx->kv_cache_pool, 28ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 5610496ULL, 28ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 5610496ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 28ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3852,7 +3944,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 5774336ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 29ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 5774336ULL), (float*)ctx->kv_cache_pool, 29ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 5774336ULL), (float*)ctx->kv_cache_pool, 29ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 5774336ULL, 29ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 5774336ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 29ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3880,7 +3972,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 5938176ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 30ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 5938176ULL), (float*)ctx->kv_cache_pool, 30ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 5938176ULL), (float*)ctx->kv_cache_pool, 30ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 5938176ULL, 30ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 5938176ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 30ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3908,7 +4000,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 6102016ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 31ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 6102016ULL), (float*)ctx->kv_cache_pool, 31ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 6102016ULL), (float*)ctx->kv_cache_pool, 31ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 6102016ULL, 31ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 6102016ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 31ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3936,7 +4028,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 6265856ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 32ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 6265856ULL), (float*)ctx->kv_cache_pool, 32ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 6265856ULL), (float*)ctx->kv_cache_pool, 32ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 6265856ULL, 32ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 6265856ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 32ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3964,7 +4056,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 6429696ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 33ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 6429696ULL), (float*)ctx->kv_cache_pool, 33ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 6429696ULL), (float*)ctx->kv_cache_pool, 33ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 6429696ULL, 33ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 6429696ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 33ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -3992,7 +4084,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 6593536ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 34ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 6593536ULL), (float*)ctx->kv_cache_pool, 34ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 6593536ULL), (float*)ctx->kv_cache_pool, 34ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 6593536ULL, 34ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 6593536ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 34ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {
@@ -4020,7 +4112,7 @@ extern "C" void velox_K2_Horizon_3_7B_decode_graph_step_cuda(VeloxCudaArena* ctx
         velox_cuda_fused_qkv_warp_kernel<<<dim3(1536), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 6757376ULL), (float*)ctx->kv_cache_pool, VELOX_DEV_ACT_PTR(ctx->activation_arena, VELOX_SCRATCH_NORM_OFFSET), VELOX_DEV_W_PTR(ctx->weight_arena, 320798720ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 509542400ULL), VELOX_DEV_W_PTR(ctx->weight_arena, 556728320ULL), 35ULL, d_state, active_mask);
     }
     velox_cuda_fused_rope_kernel<<<dim3(20), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 6757376ULL), (float*)ctx->kv_cache_pool, 35ULL, d_state, VELOX_MODEL_ROPE_THETA, active_mask);
-    velox_cuda_gqa_attn_kernel<<<dim3(VELOX_NUM_HEADS), dim3(VELOX_HEAD_DIM), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 6757376ULL), (float*)ctx->kv_cache_pool, 35ULL, d_state, active_mask);
+    VELOX_DISPATCH_GQA(ctx, 6757376ULL, 35ULL, stream, active_mask);
     if (ctx->quant_mode == VELOX_QUANT_FP16) {
         velox_cuda_out_proj_residual_kernel_f16<<<dim3(640), dim3(128), 0, stream>>>(VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 6757376ULL), VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL), VELOX_DEV_W_F16_PTR(ctx, 603914240ULL), 35ULL, active_mask);
     } else if (ctx->quant_mode == VELOX_QUANT_Q4_0) {

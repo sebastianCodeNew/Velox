@@ -705,9 +705,16 @@ __global__ void __launch_bounds__(128, 8) velox_cuda_rope_batched(
     }
 }
 
-// Batched GQA Attention: ONE block per (head, token), blockIdx.x = head, blockIdx.y = token
-// Causal mask: token at position pos can attend to positions 0..pos
-__global__ void __launch_bounds__(256, 4) velox_cuda_gqa_attn_batched(
+// Batched GQA Attention (warp-per-(head, token)).
+//
+// One WAVE (32 lanes) handles one (head, token) pair; each lane owns 4 of the
+// 128 head dims. The dot product is a 5-step __shfl_down_sync reduction, so
+// the kernel uses ZERO shared memory and ZERO __syncthreads, versus the
+// previous 256-thread block that executed a 10-barrier tree reduction per
+// context position with half its threads idle.
+//
+// Causal mask: token at position pos attends to positions 0..pos.
+__global__ void __launch_bounds__(32, 16) velox_cuda_gqa_attn_batched(
     float* __restrict__ q_base,
     const float* __restrict__ kv_pool,
     size_t layer, size_t prompt_len,
@@ -716,60 +723,69 @@ __global__ void __launch_bounds__(256, 4) velox_cuda_gqa_attn_batched(
 ) {
     const size_t t = blockIdx.y;
     if (t >= prompt_len) return;
-    const size_t pos = d_positions[t];
+    const size_t h = blockIdx.x;
     const size_t H = VELOX_NUM_HEADS;
+    if (h >= H) return;
+
     const size_t KV_H = VELOX_NUM_KV_HEADS;
     const size_t D = VELOX_HEAD_DIM;
     const size_t max_s = VELOX_MODEL_MAX_SEQ_LEN;
+    const size_t pos = d_positions[t];
     const size_t safe_pos = (pos < max_s) ? pos : (max_s - 1);
     const size_t seq_len = safe_pos + 1;
+
+    const size_t lane = threadIdx.x;
     const size_t kv_dim = KV_H * D;
     const size_t layer_kv_stride = 2ULL * max_s * kv_dim;
-    const size_t h = blockIdx.x;
-    if (h >= H) return;
-    const size_t tid = threadIdx.x;
     const size_t kv_group = H / KV_H;
     const size_t kv_h = h / kv_group;
+
     const float* k_layer = kv_pool + (layer * layer_kv_stride);
     const float* v_layer = k_layer + (max_s * kv_dim);
-    float* q = q_base + t * q_stride;
-    __shared__ float s_q[128];
-    if (tid < D) {
-        s_q[tid] = q[h * D + tid];
-    }
-    __syncthreads();
-    float scale = 1.0f / sqrtf((float)D);
-    float acc_d = 0.0f;
+    float* q = q_base + (size_t)t * q_stride;
+
+    const float q0 = q[h * D + lane];
+    const float q1 = q[h * D + lane + 32ULL];
+    const float q2 = q[h * D + lane + 64ULL];
+    const float q3 = q[h * D + lane + 96ULL];
+
+    const float scale = 1.0f / sqrtf((float)D);
     float m = -INFINITY;
     float l = 0.0f;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+
     for (size_t s = 0; s < seq_len; ++s) {
         const float* k_t = k_layer + (s * kv_dim) + (kv_h * D);
         const float* v_t = v_layer + (s * kv_dim) + (kv_h * D);
-        __shared__ float s_dot[256];
-        float my_dot = 0.0f;
-        if (tid < D) {
-            my_dot = s_q[tid] * k_t[tid];
+
+        float dot = q0 * k_t[lane] + q1 * k_t[lane + 32ULL]
+                  + q2 * k_t[lane + 64ULL] + q3 * k_t[lane + 96ULL];
+        // Butterfly all-reduce: every lane must end with the FULL sum,
+        // because m/l/alpha/beta are shared across the warp. A down-shift
+        // reduction would leave the total only in lane 0.
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            dot += __shfl_xor_sync(0xffffffffu, dot, off);
         }
-        s_dot[tid] = my_dot;
-        __syncthreads();
-        for (size_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-            if (tid < stride) s_dot[tid] += s_dot[tid + stride];
-            __syncthreads();
-        }
-        float dot = s_dot[0] * scale;
-        float new_m = (dot > m) ? dot : m;
-        float alpha = (m == -INFINITY) ? 0.0f : expf(m - new_m);
-        float beta = (new_m == -INFINITY) ? 0.0f : expf(dot - new_m);
+        dot *= scale;
+
+        const float new_m = (dot > m) ? dot : m;
+        const float alpha = (m == -INFINITY) ? 0.0f : __expf(m - new_m);
+        const float beta  = (new_m == -INFINITY) ? 0.0f : __expf(dot - new_m);
         l = l * alpha + beta;
         m = new_m;
-        if (tid < D) {
-            acc_d = acc_d * alpha + beta * v_t[tid];
-        }
-        __syncthreads();
+
+        a0 = a0 * alpha + beta * v_t[lane];
+        a1 = a1 * alpha + beta * v_t[lane + 32ULL];
+        a2 = a2 * alpha + beta * v_t[lane + 64ULL];
+        a3 = a3 * alpha + beta * v_t[lane + 96ULL];
     }
-    if (tid < D) {
-        q[h * D + tid] = (l > 0.0f) ? (acc_d / l) : 0.0f;
-    }
+
+    const float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    q[h * D + lane]         = a0 * inv_l;
+    q[h * D + lane + 32ULL] = a1 * inv_l;
+    q[h * D + lane + 64ULL] = a2 * inv_l;
+    q[h * D + lane + 96ULL] = a3 * inv_l;
 }
 
 // Template Register-Tiled Batched OutProj + Residual Q4: 1D grid dim3(out_blocks)
@@ -1048,7 +1064,7 @@ static void velox_run_batched_layers_q4(
         );
 
         // 2d. Attention (batched across heads AND tokens)
-        velox_cuda_gqa_attn_batched<<<dim3((unsigned int)VELOX_NUM_HEADS, (unsigned int)B), dim3(VELOX_HEAD_DIM), 0, stream>>>(
+        velox_cuda_gqa_attn_batched<<<dim3((unsigned int)VELOX_NUM_HEADS, (unsigned int)B), dim3(32), 0, stream>>>(
             q_base, (float*)ctx->kv_cache_pool,
             layer, B, num_q, d_positions
         );
