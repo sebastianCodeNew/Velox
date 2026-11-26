@@ -1517,9 +1517,12 @@ static uint32_t velox_sample_logits(const float* dev_logits, float* h) {
     return 0;
 }
 
-// Decode equivalence harness: 0 = generated decode DAG (production),
-// 1 = batched B=1 kernels. Used to find the first divergent token.
-static int g_decode_path = 0;
+// Decode implementation. 1 = batched B=1 kernels (production): the generated
+// decode DAG addresses per-layer buffers at ~12.2 GB in a 125 MiB arena, so its
+// logits cannot be read back and FP16 KV would require changing 309 sites. The
+// batched path is token-identical (verified) and uses static arena offsets.
+// 0 = generated DAG, retained as the reference oracle for --decode-path dag.
+static int g_decode_path = 1;
 
 static uint32_t g_stop_tokens[16];
 static int g_num_stop_tokens = 0;
@@ -1906,7 +1909,7 @@ int main(int argc, char** argv) {
             g_sample_seed = (unsigned long long)strtoull(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--decode-path") == 0 && i + 1 < argc) {
             const char* v = argv[++i];
-            g_decode_path = (strcmp(v, "batched") == 0) ? 1 : 0;
+            g_decode_path = (strcmp(v, "dag") == 0) ? 0 : 1;
         } else if (strcmp(argv[i], "--stop-tokens") == 0 && i + 1 < argc) {
             const char* list = argv[++i];
             char* copy = _strdup(list);
@@ -1945,7 +1948,7 @@ int main(int argc, char** argv) {
             printf("  --spec-ema <x>         Adaptive drafting: EMA acceptance floor (default 0.20)\n");
             printf("  --serve-stdin          Persistent mode: load weights once, read prompts from stdin\n");
             printf("  --stop-tokens <ids>    Comma-separated token IDs that end generation\n");
-            printf("  --decode-path <p>      dag (default) or batched; debug equivalence harness\n");
+            printf("  --decode-path <p>      batched (default) or dag; dag is the reference oracle\n");
             printf("  --temperature <t>      Sampling temperature; <= 0 keeps greedy argmax\n");
             printf("  --top-k <n>            Keep only the n highest-logit tokens (0 disables)\n");
             printf("  --min-p <p>            Minimum probability relative to the top token\n");
