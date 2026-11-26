@@ -168,3 +168,29 @@ format changes, so rollback is always safe.
 
 The 2% divergence threshold in section 4 is a policy choice. If the user wants
 stricter quality, tighten to 0.5% and accept a smaller or no speedup.
+
+## 10. Result: FP16 SwiGLU is slower (measured)
+
+Both variants were implemented and measured at 1024 tokens on the RTX 3050:
+
+| Variant | Layer-0 fingerprint | Prefill 1024 |
+|---|---|---|
+| FP32 reference | 0.380322 | 8532 ms |
+| half2, FP32 accumulate | 0.380470 (correct) | 9788 ms |
+| half2, FP16 accumulate, scalar accumulator | 0.379834 (correct) | 9708 ms |
+
+An intermediate FP16-accumulate version reported 7545 ms, but that was an
+artifact of a bug that dropped the `min * sum(x)` term and therefore did less
+work. With the math corrected, FP16 is **slower**, not faster.
+
+Two real bugs were found and fixed on the way, both worth recording:
+
+1. The conversion kernel covered only 256 of 2560 elements (128 threads x 2)
+   and needed a grid-stride loop.
+2. A half2 accumulator adds `min * sum(x)` twice, once per component. The
+   accumulator must be a scalar half.
+
+Conclusion: the ALU is not the binding constraint for these kernels, so
+widening the datapath does not help. The remaining options are tensor cores
+(phase 3) or accepting the current prefill performance. This plan is closed
+without a landed change.
