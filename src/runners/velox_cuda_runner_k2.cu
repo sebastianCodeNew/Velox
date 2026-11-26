@@ -20,7 +20,7 @@
 #include <cuda_fp16.h>
 
 // Configure maximum sequence length to 2,048 tokens (High-speed VRAM Resident)
-#define VELOX_MODEL_MAX_SEQ_LEN           2048ULL
+#define VELOX_MODEL_MAX_SEQ_LEN           4096ULL
 
 // Include the emitted standalone CUDA model kernels & execution DAG
 #include "k2_horizon_3_7b.cu"
@@ -563,7 +563,7 @@ __global__ void __launch_bounds__(256) velox_cuda_rmsnorm_batched(
 template<int BATCH>
 __global__ void __launch_bounds__(128, 8) velox_cuda_fused_qkv_batched_q4(
     float* __restrict__ q_base,
-    float* __restrict__ kv_pool,
+    __half* __restrict__ kv_pool,
     const float* __restrict__ norm_base,
     const uint32_t* __restrict__ w_q, const half2* __restrict__ s_q,
     const uint32_t* __restrict__ w_k, const half2* __restrict__ s_k,
@@ -580,8 +580,8 @@ __global__ void __launch_bounds__(128, 8) velox_cuda_fused_qkv_batched_q4(
     const size_t num_kv = VELOX_NUM_KV_HEADS * VELOX_HEAD_DIM;
     if (global_row >= num_q + 2ULL * num_kv) return;
     const size_t max_s = VELOX_MODEL_MAX_SEQ_LEN;
-    float* k_layer = kv_pool + (layer * 2ULL * max_s * num_kv);
-    float* v_layer = k_layer + (max_s * num_kv);
+    __half* k_layer = kv_pool + (layer * 2ULL * max_s * num_kv);
+    __half* v_layer = k_layer + (max_s * num_kv);
 
     const uint32_t* __restrict__ row_w = NULL;
     const half2* __restrict__ row_s = NULL;
@@ -646,12 +646,12 @@ __global__ void __launch_bounds__(128, 8) velox_cuda_fused_qkv_batched_q4(
                 const size_t k_row = global_row - num_q;
                 const size_t pos = d_positions[t];
                 const size_t safe_pos = (pos < max_s) ? pos : (max_s - 1);
-                k_layer[safe_pos * num_kv + k_row] = a;
+                k_layer[safe_pos * num_kv + k_row] = __float2half(a);
             } else {
                 const size_t v_row = global_row - num_q - num_kv;
                 const size_t pos = d_positions[t];
                 const size_t safe_pos = (pos < max_s) ? pos : (max_s - 1);
-                v_layer[safe_pos * num_kv + v_row] = a;
+                v_layer[safe_pos * num_kv + v_row] = __float2half(a);
             }
         }
     }
@@ -660,7 +660,7 @@ __global__ void __launch_bounds__(128, 8) velox_cuda_fused_qkv_batched_q4(
 // Batched RoPE: dim3(rope_blocks, prompt_len)
 __global__ void __launch_bounds__(128, 8) velox_cuda_rope_batched(
     float* __restrict__ q_base,
-    float* __restrict__ kv_pool,
+    __half* __restrict__ kv_pool,
     size_t layer, size_t prompt_len,
     size_t q_stride,
     const size_t* __restrict__ d_positions,
@@ -682,8 +682,8 @@ __global__ void __launch_bounds__(128, 8) velox_cuda_rope_batched(
     const size_t safe_pos = (pos < max_s) ? pos : (max_s - 1);
     const size_t kv_dim = KV_H * D;
     const size_t layer_kv_stride = 2ULL * max_s * kv_dim;
-    float* k_layer = kv_pool + (layer * layer_kv_stride);
-    float* k_slot = k_layer + (safe_pos * kv_dim);
+    __half* k_layer = kv_pool + (layer * layer_kv_stride);
+    __half* k_slot = k_layer + (safe_pos * kv_dim);
     float* q = q_base + t * q_stride;
     if (idx < q_pairs) {
         size_t h = idx / half_d;
@@ -705,11 +705,11 @@ __global__ void __launch_bounds__(128, 8) velox_cuda_rope_batched(
         float angle = (float)safe_pos * freq;
         float cos_a = cosf(angle);
         float sin_a = sinf(angle);
-        float* k_head = k_slot + (h * D);
-        float x1 = k_head[j];
-        float x2 = k_head[j + half_d];
-        k_head[j] = x1 * cos_a - x2 * sin_a;
-        k_head[j + half_d] = x2 * cos_a + x1 * sin_a;
+        __half* k_head = k_slot + (h * D);
+        float x1 = __half2float(k_head[j]);
+        float x2 = __half2float(k_head[j + half_d]);
+        k_head[j] = __float2half(x1 * cos_a - x2 * sin_a);
+        k_head[j + half_d] = __float2half(x2 * cos_a + x1 * sin_a);
     }
 }
 
@@ -724,7 +724,7 @@ __global__ void __launch_bounds__(128, 8) velox_cuda_rope_batched(
 // Causal mask: token at position pos attends to positions 0..pos.
 __global__ void __launch_bounds__(32, 16) velox_cuda_gqa_attn_batched(
     float* __restrict__ q_base,
-    const float* __restrict__ kv_pool,
+    const __half* __restrict__ kv_pool,
     size_t layer, size_t prompt_len,
     size_t q_stride,
     const size_t* __restrict__ d_positions
@@ -748,8 +748,8 @@ __global__ void __launch_bounds__(32, 16) velox_cuda_gqa_attn_batched(
     const size_t kv_group = H / KV_H;
     const size_t kv_h = h / kv_group;
 
-    const float* k_layer = kv_pool + (layer * layer_kv_stride);
-    const float* v_layer = k_layer + (max_s * kv_dim);
+    const __half* k_layer = kv_pool + (layer * layer_kv_stride);
+    const __half* v_layer = k_layer + (max_s * kv_dim);
     float* q = q_base + (size_t)t * q_stride;
 
     const float q0 = q[h * D + lane];
@@ -763,11 +763,11 @@ __global__ void __launch_bounds__(32, 16) velox_cuda_gqa_attn_batched(
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
 
     for (size_t s = 0; s < seq_len; ++s) {
-        const float* k_t = k_layer + (s * kv_dim) + (kv_h * D);
-        const float* v_t = v_layer + (s * kv_dim) + (kv_h * D);
+        const __half* k_t = k_layer + (s * kv_dim) + (kv_h * D);
+        const __half* v_t = v_layer + (s * kv_dim) + (kv_h * D);
 
-        float dot = q0 * k_t[lane] + q1 * k_t[lane + 32ULL]
-                  + q2 * k_t[lane + 64ULL] + q3 * k_t[lane + 96ULL];
+        float dot = q0 * __half2float(k_t[lane]) + q1 * __half2float(k_t[lane + 32ULL])
+                  + q2 * __half2float(k_t[lane + 64ULL]) + q3 * __half2float(k_t[lane + 96ULL]);
         // Butterfly all-reduce: every lane must end with the FULL sum,
         // because m/l/alpha/beta are shared across the warp. A down-shift
         // reduction would leave the total only in lane 0.
@@ -783,10 +783,10 @@ __global__ void __launch_bounds__(32, 16) velox_cuda_gqa_attn_batched(
         l = l * alpha + beta;
         m = new_m;
 
-        a0 = a0 * alpha + beta * v_t[lane];
-        a1 = a1 * alpha + beta * v_t[lane + 32ULL];
-        a2 = a2 * alpha + beta * v_t[lane + 64ULL];
-        a3 = a3 * alpha + beta * v_t[lane + 96ULL];
+        a0 = a0 * alpha + beta * __half2float(v_t[lane]);
+        a1 = a1 * alpha + beta * __half2float(v_t[lane + 32ULL]);
+        a2 = a2 * alpha + beta * __half2float(v_t[lane + 64ULL]);
+        a3 = a3 * alpha + beta * __half2float(v_t[lane + 96ULL]);
     }
 
     const float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
@@ -1058,7 +1058,7 @@ static void velox_run_batched_layers_q4(
 
         // 2b. Batched QKV Projection (Register-Tiled: 1D grid, weights loaded ONCE into registers)
         velox_cuda_fused_qkv_batched_q4<B><<<dim3((unsigned int)qkv_blocks), dim3(128), 0, stream>>>(
-            q_base, (float*)ctx->kv_cache_pool, norm_base,
+            q_base, (__half*)ctx->kv_cache_pool, norm_base,
             VELOX_DEV_W_Q4_PTR(ctx, 320798720ULL), VELOX_DEV_S_Q4_PTR(ctx, 320798720ULL),
             VELOX_DEV_W_Q4_PTR(ctx, 509542400ULL), VELOX_DEV_S_Q4_PTR(ctx, 509542400ULL),
             VELOX_DEV_W_Q4_PTR(ctx, 556728320ULL), VELOX_DEV_S_Q4_PTR(ctx, 556728320ULL),
@@ -1067,13 +1067,13 @@ static void velox_run_batched_layers_q4(
 
         // 2c. Batched RoPE rotation on Q and K
         velox_cuda_rope_batched<<<dim3((unsigned int)rope_blocks, (unsigned int)B), dim3(128), 0, stream>>>(
-            q_base, (float*)ctx->kv_cache_pool,
+            q_base, (__half*)ctx->kv_cache_pool,
             layer, B, num_q, d_positions, VELOX_MODEL_ROPE_THETA
         );
 
         // 2d. Attention (batched across heads AND tokens)
         velox_cuda_gqa_attn_batched<<<dim3((unsigned int)VELOX_NUM_HEADS, (unsigned int)B), dim3(32), 0, stream>>>(
-            q_base, (float*)ctx->kv_cache_pool,
+            q_base, (__half*)ctx->kv_cache_pool,
             layer, B, num_q, d_positions
         );
 
@@ -1979,7 +1979,7 @@ int main(int argc, char** argv) {
     size_t ring_bytes = K2_HOST_RING_BYTES;
 
     // KV Cache pool: 36 layers * 2 (K+V) * VELOX_MODEL_MAX_SEQ_LEN * 8 KV heads * 128 head_dim * 4 bytes (float)
-    size_t kv_pool_bytes = VELOX_NUM_LAYERS * 2ULL * VELOX_MODEL_MAX_SEQ_LEN * VELOX_NUM_KV_HEADS * VELOX_HEAD_DIM * sizeof(float);
+    size_t kv_pool_bytes = VELOX_NUM_LAYERS * 2ULL * VELOX_MODEL_MAX_SEQ_LEN * VELOX_NUM_KV_HEADS * VELOX_HEAD_DIM * sizeof(__half);
 
     LARGE_INTEGER t_init_start;
     QueryPerformanceCounter(&t_init_start);
