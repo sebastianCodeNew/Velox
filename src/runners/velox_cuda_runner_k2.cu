@@ -1026,6 +1026,50 @@ __global__ void velox_cuda_init_positions(size_t* d_positions, size_t base_pos, 
     if (idx < n) d_positions[idx] = base_pos + idx;
 }
 
+// ============================================================================
+// Per-stage prefill timing (CUDA events). Used to attribute the prefill cost
+// to a specific kernel when ncu is unavailable (GPU counters need admin).
+// ============================================================================
+#define VELOX_STAGE_COUNT 8
+static cudaEvent_t g_stage_ev[VELOX_STAGE_COUNT][2];
+static float g_stage_ms[VELOX_STAGE_COUNT];
+static int g_stage_init = 0;
+
+static void velox_stage_init(void) {
+    if (g_stage_init) return;
+    for (int i = 0; i < VELOX_STAGE_COUNT; ++i) {
+        cudaEventCreate(&g_stage_ev[i][0]);
+        cudaEventCreate(&g_stage_ev[i][1]);
+        g_stage_ms[i] = 0.0f;
+    }
+    g_stage_init = 1;
+}
+
+static void velox_stage_reset(void) {
+    for (int i = 0; i < VELOX_STAGE_COUNT; ++i) g_stage_ms[i] = 0.0f;
+}
+
+static void velox_stage_report(cudaStream_t stream) {
+    cudaStreamSynchronize(stream);
+    for (int i = 0; i < VELOX_STAGE_COUNT; ++i) {
+        cudaEventElapsedTime(&g_stage_ms[i], g_stage_ev[i][0], g_stage_ev[i][1]);
+    }
+    static const char* names[VELOX_STAGE_COUNT] = {
+        "rmsnorm", "qkv", "rope", "attn", "out_proj", "ffn_norm", "gate_up", "down"
+    };
+    float total = 0.0f;
+    for (int i = 0; i < VELOX_STAGE_COUNT; ++i) total += g_stage_ms[i];
+    fprintf(stderr, "[prefill stages] total %.3f ms over 36 layers\n", total);
+    for (int i = 0; i < VELOX_STAGE_COUNT; ++i) {
+        fprintf(stderr, "  %-9s %8.3f ms  %5.1f%%  (%.4f ms/layer)\n",
+                names[i], g_stage_ms[i], 100.0 * g_stage_ms[i] / (total > 0.0f ? total : 1.0f),
+                g_stage_ms[i] / 36.0f);
+    }
+}
+
+#define VELOX_STAGE_BEGIN(IDX) cudaEventRecord(g_stage_ev[IDX][0], stream)
+#define VELOX_STAGE_END(IDX)   cudaEventRecord(g_stage_ev[IDX][1], stream)
+
 // Template Batched Layer Runner: executes all 36 layers for B tokens in parallel
 template<int B>
 static void velox_run_batched_layers_q4(
@@ -1051,12 +1095,15 @@ static void velox_run_batched_layers_q4(
     for (size_t layer = 0; layer < 36; ++layer) {
         // 2a. Batched Pre-Attention RMSNorm
         const float* attn_norm_w = VELOX_DEV_NORM_PTR(ctx, 2208235520ULL) + (layer * dim);
+        VELOX_STAGE_BEGIN(0);
         velox_cuda_rmsnorm_batched<<<dim3(1, (unsigned int)B), dim3(256), 0, stream>>>(
             norm_base, hidden_base, attn_norm_w, dim, 1e-6f,
             B, dim, dim
         );
+        VELOX_STAGE_END(0);
 
         // 2b. Batched QKV Projection (Register-Tiled: 1D grid, weights loaded ONCE into registers)
+        VELOX_STAGE_BEGIN(1);
         velox_cuda_fused_qkv_batched_q4<B><<<dim3((unsigned int)qkv_blocks), dim3(128), 0, stream>>>(
             q_base, (__half*)ctx->kv_cache_pool, norm_base,
             VELOX_DEV_W_Q4_PTR(ctx, 320798720ULL), VELOX_DEV_S_Q4_PTR(ctx, 320798720ULL),
@@ -1064,47 +1111,60 @@ static void velox_run_batched_layers_q4(
             VELOX_DEV_W_Q4_PTR(ctx, 556728320ULL), VELOX_DEV_S_Q4_PTR(ctx, 556728320ULL),
             layer, dim, num_q, d_positions
         );
+        VELOX_STAGE_END(1);
 
         // 2c. Batched RoPE rotation on Q and K
+        VELOX_STAGE_BEGIN(2);
         velox_cuda_rope_batched<<<dim3((unsigned int)rope_blocks, (unsigned int)B), dim3(128), 0, stream>>>(
             q_base, (__half*)ctx->kv_cache_pool,
             layer, B, num_q, d_positions, VELOX_MODEL_ROPE_THETA
         );
+        VELOX_STAGE_END(2);
 
         // 2d. Attention (batched across heads AND tokens)
+        VELOX_STAGE_BEGIN(3);
         velox_cuda_gqa_attn_batched<<<dim3((unsigned int)VELOX_NUM_HEADS, (unsigned int)B), dim3(32), 0, stream>>>(
             q_base, (__half*)ctx->kv_cache_pool,
             layer, B, num_q, d_positions
         );
+        VELOX_STAGE_END(3);
 
         // 2e. Batched OutProj + Residual (Register-Tiled: 1D grid, weights loaded ONCE into registers)
+        VELOX_STAGE_BEGIN(4);
         velox_cuda_out_proj_residual_batched_q4<B><<<dim3((unsigned int)out_blocks), dim3(128), 0, stream>>>(
             hidden_base, q_base,
             VELOX_DEV_W_Q4_PTR(ctx, 603914240ULL), VELOX_DEV_S_Q4_PTR(ctx, 603914240ULL),
             layer, dim, num_q
         );
+        VELOX_STAGE_END(4);
 
         // 2f. Batched Post-Attention RMSNorm
         const float* ffn_norm_w = VELOX_DEV_NORM_PTR(ctx, 2208604160ULL) + (layer * dim);
+        VELOX_STAGE_BEGIN(5);
         velox_cuda_rmsnorm_batched<<<dim3(1, (unsigned int)B), dim3(256), 0, stream>>>(
             norm_base, hidden_base, ffn_norm_w, dim, 1e-6f,
             B, dim, dim
         );
+        VELOX_STAGE_END(5);
 
         // 2g. Batched SwiGLU Gate+Up (Register-Tiled: 1D grid, weights loaded ONCE into registers)
+        VELOX_STAGE_BEGIN(6);
         velox_cuda_swiglu_gate_up_batched_q4<B><<<dim3((unsigned int)inter_blocks), dim3(128), 0, stream>>>(
             act_base, norm_base,
             VELOX_DEV_W_Q4_PTR(ctx, 792657920ULL), VELOX_DEV_S_Q4_PTR(ctx, 792657920ULL),
             VELOX_DEV_W_Q4_PTR(ctx, 1264517120ULL), VELOX_DEV_S_Q4_PTR(ctx, 1264517120ULL),
             layer, dim, inter_dim
         );
+        VELOX_STAGE_END(6);
 
         // 2h. Batched SwiGLU Down + Residual (Register-Tiled: 1D grid, weights loaded ONCE into registers)
+        VELOX_STAGE_BEGIN(7);
         velox_cuda_swiglu_down_residual_batched_q4<B><<<dim3((unsigned int)out_blocks), dim3(128), 0, stream>>>(
             hidden_base, act_base,
             VELOX_DEV_W_Q4_PTR(ctx, 1736376320ULL), VELOX_DEV_S_Q4_PTR(ctx, 1736376320ULL),
             layer, dim, inter_dim
         );
+        VELOX_STAGE_END(7);
     }
 }
 
@@ -1524,6 +1584,15 @@ static uint32_t velox_sample_logits(const float* dev_logits, float* h) {
 // 0 = generated DAG, retained as the reference oracle for --decode-path dag.
 static int g_decode_path = 1;
 
+// Captured prefill chunk graphs (B = 1..16). On Windows/WDDM a kernel launch
+// costs ~0.46 ms of host time, so a 1024-token prefill (18k launches) spends
+// 99% of its time launching. Replaying one graph per chunk collapses ~288
+// launches into one.
+static cudaGraphExec_t g_prefill_graph[17];
+static int g_prefill_graphs_ready = 0;
+static int g_prefill_replays = 0;
+static int g_prefill_direct = 0;
+
 static uint32_t g_stop_tokens[16];
 static int g_num_stop_tokens = 0;
 
@@ -1699,6 +1768,51 @@ static int velox_prompt_lookup_draft(
 // Batched Prefill Entry Point: processes all prompt tokens through all 36 layers
 // in a single pass, streaming each layer's weights exactly once.
 // =============================================================================
+// One prefill chunk: embed B tokens, then run all 36 layers.
+// Extracted so the same sequence can be captured into a CUDA graph and replayed.
+static void velox_prefill_chunk_body(
+    VeloxCudaArena* ctx,
+    size_t chunk,
+    float* hidden_base, float* norm_base, float* q_base, float* act_base,
+    uint32_t* d_tokens, size_t* d_positions,
+    size_t embed_blocks, size_t dim,
+    const uint32_t* h_prompt_tokens, size_t chunk_start,
+    cudaStream_t stream
+) {
+    velox_cuda_embed_batched_q4<<<dim3((unsigned int)embed_blocks, (unsigned int)chunk), dim3(256), 0, stream>>>(
+        hidden_base, d_tokens,
+        VELOX_DEV_W_Q4_PTR(ctx, 0ULL), VELOX_DEV_S_Q4_PTR(ctx, 0ULL),
+        chunk, dim
+    );
+
+    #define DISPATCH_CASE(N) case N: velox_run_batched_layers_q4<N>(ctx, hidden_base, norm_base, q_base, act_base, d_positions, stream); break;
+    switch (chunk) {
+        DISPATCH_CASE(1)
+        DISPATCH_CASE(2)
+        DISPATCH_CASE(3)
+        DISPATCH_CASE(4)
+        DISPATCH_CASE(5)
+        DISPATCH_CASE(6)
+        DISPATCH_CASE(7)
+        DISPATCH_CASE(8)
+        DISPATCH_CASE(9)
+        DISPATCH_CASE(10)
+        DISPATCH_CASE(11)
+        DISPATCH_CASE(12)
+        DISPATCH_CASE(13)
+        DISPATCH_CASE(14)
+        DISPATCH_CASE(15)
+        DISPATCH_CASE(16)
+        default:
+            fprintf(stderr, "[velox_prefill_chunk_body] chunk %zu > 16\n", chunk);
+            for (size_t pos = 0; pos < chunk; ++pos) {
+                velox_K2_Horizon_3_7B_decode_cuda(ctx, h_prompt_tokens[chunk_start + pos], chunk_start + pos, 1ULL, stream);
+            }
+            break;
+    }
+    #undef DISPATCH_CASE
+}
+
 static void velox_batched_prefill_q4(
     VeloxCudaArena* ctx,
     const uint32_t* h_prompt_tokens,
@@ -1737,6 +1851,8 @@ static void velox_batched_prefill_q4(
     // Every chunk reuses the low activation rows; cross-chunk causality is
     // carried entirely by the KV pool, which the QKV kernel writes at each
     // token's absolute position before that chunk's attention runs.
+    velox_stage_init();
+    velox_stage_reset();
     const size_t prefill_chunk = 16ULL;
     size_t last_chunk = 0;
 
@@ -1751,50 +1867,24 @@ static void velox_batched_prefill_q4(
         velox_cuda_init_positions<<<1, (unsigned int)(((chunk + 31ULL) / 32ULL) * 32ULL), 0, stream>>>(
             d_positions, chunk_start, chunk);
 
-        // Step 1: Batched Embedding for this chunk
-        velox_cuda_embed_batched_q4<<<dim3((unsigned int)embed_blocks, (unsigned int)chunk), dim3(256), 0, stream>>>(
-            hidden_base, d_tokens,
-            VELOX_DEV_W_Q4_PTR(ctx, 0ULL), VELOX_DEV_S_Q4_PTR(ctx, 0ULL),
-            chunk, dim
-        );
         if (chunk_start == 0) {
             cudaEventRecord(ev_embed_stop, stream);
         }
 
-        // Step 2: Process all 36 layers with zero local memory spills via Register-Tiled Template Kernels
-        #define DISPATCH_CASE(N) case N: velox_run_batched_layers_q4<N>(ctx, hidden_base, norm_base, q_base, act_base, d_positions, stream); break;
-
-        switch (chunk) {
-            DISPATCH_CASE(1)
-            DISPATCH_CASE(2)
-            DISPATCH_CASE(3)
-            DISPATCH_CASE(4)
-            DISPATCH_CASE(5)
-            DISPATCH_CASE(6)
-            DISPATCH_CASE(7)
-            DISPATCH_CASE(8)
-            DISPATCH_CASE(9)
-            DISPATCH_CASE(10)
-            DISPATCH_CASE(11)
-            DISPATCH_CASE(12)
-            DISPATCH_CASE(13)
-            DISPATCH_CASE(14)
-            DISPATCH_CASE(15)
-            DISPATCH_CASE(16)
-            default:
-                // Unreachable while prefill_chunk <= 16; kept as a hard
-                // correctness fallback rather than silently dropping tokens.
-                fprintf(stderr, "[velox_batched_prefill_q4] Chunk %zu > 16, falling back to sequential decode\n", chunk);
-                for (size_t pos = 0; pos < chunk; ++pos) {
-                    velox_K2_Horizon_3_7B_decode_cuda(
-                        ctx, h_prompt_tokens[chunk_start + pos], chunk_start + pos, 1ULL, stream);
-                }
-                break;
+        if (g_prefill_graphs_ready && g_prefill_graph[chunk]) {
+            g_prefill_replays++;
+            cudaGraphLaunch(g_prefill_graph[chunk], stream);
+        } else {
+            g_prefill_direct++;
+            velox_prefill_chunk_body(ctx, chunk, hidden_base, norm_base, q_base, act_base,
+                                     d_tokens, d_positions, embed_blocks, dim,
+                                     h_prompt_tokens, chunk_start, stream);
         }
-        #undef DISPATCH_CASE
     }
 
     cudaEventRecord(ev_layers_stop, stream);
+    fprintf(stderr, "[prefill graph] replays=%d direct=%d\n", g_prefill_replays, g_prefill_direct);
+    velox_stage_report(stream);
 
     // Step 3: Copy last token's hidden state and evaluate LM head
     float* decode_hidden = VELOX_DEV_ACT_PTR(ctx->activation_arena, 1012736ULL);
@@ -2347,6 +2437,40 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // Capture one prefill graph per chunk width (B = 1..16). Each graph bakes
+    // in the embed + 36-layer sequence, collapsing ~288 kernel launches into
+    // one replay. Inputs (d_tokens, d_positions) are refreshed on the same
+    // stream before each launch, exactly like the verify graphs.
+    for (int b = 0; b <= 16; ++b) g_prefill_graph[b] = NULL;
+    if (use_cuda_graph && has_weights_file) {
+        int captured = 0;
+        for (int B = 1; B <= 16; ++B) {
+            cudaGraph_t graph = NULL;
+            cudaGraphExec_t exec = NULL;
+            cudaError_t st = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+            if (st == cudaSuccess) {
+                const size_t cap_dim = VELOX_HIDDEN_DIM;
+                const size_t cap_embed_blocks = (cap_dim / 8ULL + 255) / 256;
+                velox_prefill_chunk_body(&ctx, (size_t)B, hidden_base, norm_base, q_base, act_base,
+                                         d_tokens, d_positions, cap_embed_blocks, cap_dim,
+                                         prompt_tokens, 0, stream);
+                st = cudaStreamEndCapture(stream, &graph);
+            }
+            if (st == cudaSuccess && graph != NULL) {
+                st = cudaGraphInstantiate(&exec, graph, NULL, NULL, 0);
+                if (st == cudaSuccess && exec != NULL) {
+                    g_prefill_graph[B] = exec;
+                    captured++;
+                }
+            }
+            if (st != cudaSuccess || exec == NULL) {
+                if (graph) cudaGraphDestroy(graph);
+            }
+        }
+        g_prefill_graphs_ready = (captured == 16);
+        fprintf(stderr, "[prefill graph] captured %d/16 ready=%d\n", captured, g_prefill_graphs_ready);
+    }
+
     uint32_t* generated_tokens = (uint32_t*)malloc(steps * sizeof(uint32_t));
     if (!generated_tokens) return 1;
 
@@ -2753,6 +2877,9 @@ int main(int argc, char** argv) {
     if (decode_graph) cudaGraphDestroy(decode_graph);
     for (int b = 2; b <= 8; ++b) {
         if (verify_graph_exec[b]) cudaGraphExecDestroy(verify_graph_exec[b]);
+    }
+    for (int b = 1; b <= 16; ++b) {
+        if (g_prefill_graph[b]) cudaGraphExecDestroy(g_prefill_graph[b]);
     }
     cudaEventDestroy(ev_prefill_start);
     cudaEventDestroy(ev_prefill_stop);
