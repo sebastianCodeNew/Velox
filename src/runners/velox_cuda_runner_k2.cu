@@ -1098,6 +1098,8 @@ static void velox_run_batched_layers_q4(
     float* q_base,
     float* act_base,
     const size_t* d_positions,
+    float* kv_base,
+    size_t max_s,
     cudaStream_t stream
 ) {
     const size_t dim = VELOX_HIDDEN_DIM;
@@ -1128,7 +1130,7 @@ static void velox_run_batched_layers_q4(
             VELOX_DEV_W_Q4_PTR(ctx, 320798720ULL), VELOX_DEV_S_Q4_PTR(ctx, 320798720ULL),
             VELOX_DEV_W_Q4_PTR(ctx, 509542400ULL), VELOX_DEV_S_Q4_PTR(ctx, 509542400ULL),
             VELOX_DEV_W_Q4_PTR(ctx, 556728320ULL), VELOX_DEV_S_Q4_PTR(ctx, 556728320ULL),
-            layer, dim, num_q, VELOX_MODEL_MAX_SEQ_LEN, d_positions
+            layer, dim, num_q, max_s, d_positions
         );
         VELOX_STAGE_END(1);
 
@@ -1713,7 +1715,7 @@ static void velox_evaluate_lm_head_batched_legacy(
 // B candidate rows, run all 36 fused layers in one weights-stream pass,
 // and batch-evaluate the LM head. Shared by the CUDA-graph capture prologue
 // and the legacy fallback so both paths dispatch through the same code.
-#define RUN_VERIFY_BATCH(N) case N: velox_run_batched_layers_q4<N>(ctx, hidden, norm, q, act, d_positions, stream); break;
+#define RUN_VERIFY_BATCH(N) case N: velox_run_batched_layers_q4<N>(ctx, hidden, norm, q, act, d_positions, (float*)ctx->kv_cache_pool, VELOX_MODEL_MAX_SEQ_LEN, stream); break;
 static void velox_verify_forward_full(
     VeloxCudaArena* ctx,
     int batch,
@@ -1808,7 +1810,7 @@ static void velox_prefill_chunk_body(
         chunk, dim
     );
 
-    #define DISPATCH_CASE(N) case N: velox_run_batched_layers_q4<N>(ctx, hidden_base, norm_base, q_base, act_base, d_positions, stream); break;
+    #define DISPATCH_CASE(N) case N: velox_run_batched_layers_q4<N>(ctx, hidden_base, norm_base, q_base, act_base, d_positions, (float*)ctx->kv_cache_pool, VELOX_MODEL_MAX_SEQ_LEN, stream); break;
     switch (chunk) {
         DISPATCH_CASE(1)
         DISPATCH_CASE(2)
@@ -2423,7 +2425,7 @@ int main(int argc, char** argv) {
                         hidden_base, d_tokens,
                         VELOX_DEV_W_Q4_PTR(&ctx, 0ULL), VELOX_DEV_S_Q4_PTR(&ctx, 0ULL),
                         1, VELOX_HIDDEN_DIM);
-                    velox_run_batched_layers_q4<1>(&ctx, hidden_base, norm_base, q_base, act_base, d_positions, stream);
+                    velox_run_batched_layers_q4<1>(&ctx, hidden_base, norm_base, q_base, act_base, d_positions, (float*)ctx.kv_cache_pool, VELOX_MODEL_MAX_SEQ_LEN, stream);
                     velox_evaluate_lm_head_batched(&ctx, hidden_base, 1, d_positions, d_tokens, stream);
                 } else {
                     velox_K2_Horizon_3_7B_decode_cuda(&ctx, next_tok, pos, 1ULL, stream);
