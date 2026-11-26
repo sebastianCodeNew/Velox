@@ -570,6 +570,7 @@ __global__ void __launch_bounds__(128, 8) velox_cuda_fused_qkv_batched_q4(
     const uint32_t* __restrict__ w_v, const half2* __restrict__ s_v,
     size_t layer,
     size_t norm_stride, size_t q_stride,
+    size_t max_s,
     const size_t* __restrict__ d_positions
 ) {
     const size_t warp_id = threadIdx.x / 32;
@@ -579,7 +580,6 @@ __global__ void __launch_bounds__(128, 8) velox_cuda_fused_qkv_batched_q4(
     const size_t num_q = VELOX_NUM_HEADS * VELOX_HEAD_DIM;
     const size_t num_kv = VELOX_NUM_KV_HEADS * VELOX_HEAD_DIM;
     if (global_row >= num_q + 2ULL * num_kv) return;
-    const size_t max_s = VELOX_MODEL_MAX_SEQ_LEN;
     __half* k_layer = kv_pool + (layer * 2ULL * max_s * num_kv);
     __half* v_layer = k_layer + (max_s * num_kv);
 
@@ -663,6 +663,7 @@ __global__ void __launch_bounds__(128, 8) velox_cuda_rope_batched(
     __half* __restrict__ kv_pool,
     size_t layer, size_t prompt_len,
     size_t q_stride,
+    size_t max_s,
     const size_t* __restrict__ d_positions,
     float theta
 ) {
@@ -678,7 +679,6 @@ __global__ void __launch_bounds__(128, 8) velox_cuda_rope_batched(
     const size_t total_pairs = q_pairs + kv_pairs;
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total_pairs) return;
-    const size_t max_s = VELOX_MODEL_MAX_SEQ_LEN;
     const size_t safe_pos = (pos < max_s) ? pos : (max_s - 1);
     const size_t kv_dim = KV_H * D;
     const size_t layer_kv_stride = 2ULL * max_s * kv_dim;
@@ -727,6 +727,7 @@ __global__ void __launch_bounds__(32, 16) velox_cuda_gqa_attn_batched(
     const __half* __restrict__ kv_pool,
     size_t layer, size_t prompt_len,
     size_t q_stride,
+    size_t max_s,
     const size_t* __restrict__ d_positions
 ) {
     const size_t t = blockIdx.y;
@@ -737,7 +738,6 @@ __global__ void __launch_bounds__(32, 16) velox_cuda_gqa_attn_batched(
 
     const size_t KV_H = VELOX_NUM_KV_HEADS;
     const size_t D = VELOX_HEAD_DIM;
-    const size_t max_s = VELOX_MODEL_MAX_SEQ_LEN;
     const size_t pos = d_positions[t];
     const size_t safe_pos = (pos < max_s) ? pos : (max_s - 1);
     const size_t seq_len = safe_pos + 1;
@@ -1128,7 +1128,7 @@ static void velox_run_batched_layers_q4(
             VELOX_DEV_W_Q4_PTR(ctx, 320798720ULL), VELOX_DEV_S_Q4_PTR(ctx, 320798720ULL),
             VELOX_DEV_W_Q4_PTR(ctx, 509542400ULL), VELOX_DEV_S_Q4_PTR(ctx, 509542400ULL),
             VELOX_DEV_W_Q4_PTR(ctx, 556728320ULL), VELOX_DEV_S_Q4_PTR(ctx, 556728320ULL),
-            layer, dim, num_q, d_positions
+            layer, dim, num_q, VELOX_MODEL_MAX_SEQ_LEN, d_positions
         );
         VELOX_STAGE_END(1);
 
@@ -1136,7 +1136,7 @@ static void velox_run_batched_layers_q4(
         VELOX_STAGE_BEGIN(2);
         velox_cuda_rope_batched<<<dim3((unsigned int)rope_blocks, (unsigned int)B), dim3(128), 0, stream>>>(
             q_base, (__half*)ctx->kv_cache_pool,
-            layer, B, num_q, d_positions, VELOX_MODEL_ROPE_THETA
+            layer, B, num_q, VELOX_MODEL_MAX_SEQ_LEN, d_positions, VELOX_MODEL_ROPE_THETA
         );
         VELOX_STAGE_END(2);
 
@@ -1144,7 +1144,7 @@ static void velox_run_batched_layers_q4(
         VELOX_STAGE_BEGIN(3);
         velox_cuda_gqa_attn_batched<<<dim3((unsigned int)VELOX_NUM_HEADS, (unsigned int)B), dim3(32), 0, stream>>>(
             q_base, (__half*)ctx->kv_cache_pool,
-            layer, B, num_q, d_positions
+            layer, B, num_q, VELOX_MODEL_MAX_SEQ_LEN, d_positions
         );
         VELOX_STAGE_END(3);
 
