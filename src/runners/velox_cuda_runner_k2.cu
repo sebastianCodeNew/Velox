@@ -1070,6 +1070,25 @@ static void velox_stage_report(cudaStream_t stream) {
 #define VELOX_STAGE_BEGIN(IDX) cudaEventRecord(g_stage_ev[IDX][0], stream)
 #define VELOX_STAGE_END(IDX)   cudaEventRecord(g_stage_ev[IDX][1], stream)
 
+
+// Parity harness: fingerprint act_base after layer 0 so a kernel change can be
+// diffed against the FP32 reference. Only the eager path calls the layer
+// runner; graph replay bypasses it.
+static int g_dump_layer0 = 0;
+
+static void velox_dump_layer0(const float* act_base, size_t rows, cudaStream_t stream) {
+    cudaStreamSynchronize(stream);
+    const size_t n = 64;
+    float* h = (float*)malloc(n * sizeof(float));
+    if (!h) return;
+    cudaMemcpy(h, act_base, n * sizeof(float), cudaMemcpyDeviceToHost);
+    double sum = 0.0;
+    for (size_t i = 0; i < n; ++i) sum += (double)h[i];
+    fprintf(stderr, "[layer0] rows=%zu sum=%.6f first=%.6f,%.6f,%.6f,%.6f\n",
+            rows, sum, h[0], h[1], h[2], h[3]);
+    free(h);
+}
+
 // Template Batched Layer Runner: executes all 36 layers for B tokens in parallel
 template<int B>
 static void velox_run_batched_layers_q4(
@@ -1156,6 +1175,10 @@ static void velox_run_batched_layers_q4(
             layer, dim, inter_dim
         );
         VELOX_STAGE_END(6);
+
+        if (g_dump_layer0 && layer == 0) {
+            velox_dump_layer0(act_base, (size_t)B, stream);
+        }
 
         // 2h. Batched SwiGLU Down + Residual (Register-Tiled: 1D grid, weights loaded ONCE into registers)
         VELOX_STAGE_BEGIN(7);
@@ -1997,6 +2020,8 @@ int main(int argc, char** argv) {
             g_top_k = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--sample-seed") == 0 && i + 1 < argc) {
             g_sample_seed = (unsigned long long)strtoull(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--dump-layer0") == 0) {
+            g_dump_layer0 = 1;
         } else if (strcmp(argv[i], "--decode-path") == 0 && i + 1 < argc) {
             const char* v = argv[++i];
             g_decode_path = (strcmp(v, "dag") == 0) ? 0 : 1;
