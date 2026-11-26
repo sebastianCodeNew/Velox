@@ -155,3 +155,52 @@ kernel is neither DRAM-latency- nor occupancy-bound.
 Any further attempt should be preceded by a profiler measurement
 (`ncu --metrics l2_tex_read_bytes.sum`, `sm__inst_executed.sum`) to identify
 which of the three is binding, rather than another roofline guess.
+
+## 9. Row blocking does not apply (measured, with code evidence)
+
+The proposed "reuse the weight tile across output rows" is not possible here,
+because the weight row is indexed by the output row:
+
+```c
+size_t off = (layer * dim * inter_dim) + (o * inter_dim);   // o = output row
+```
+
+Each output row has a distinct weight row, so there is no tile shared across
+rows. The only reuse is across the **batch** dimension (`for t in 0..BATCH`
+uses one weight row for every token), and the kernels already exploit it.
+Adding row blocking would raise accumulator pressure with no traffic reduction.
+
+## 10. Two-warp row split for chunk 32: attempted, reverted
+
+Per-stage attribution (section 8) shows gate_up 39.2% and down 29.4% of layer
+time, and the implied 2.7 TB/s is L2 bandwidth. The intended fix was to raise
+the chunk from 16 to 32 tokens so the 26 MB weight matrix is read once per 32
+tokens instead of once per 16, with each row split across two warps (16
+accumulators each) to avoid the spills measured at chunk 32.
+
+Implementation: `velox_cuda_swiglu_gate_up_split_q4` and
+`velox_cuda_swiglu_down_split_q4`, dispatched for `B > 16`, plus template cases
+17..32 and `prefill_chunk = 32`.
+
+Two defects were found and fixed during bring-up:
+
+1. `HALF = BATCH / 2` is zero for B <= 16, which fails to compile the array
+   declarations. Guarded to `max(1, BATCH / 2)`.
+2. `g_prefill_graph[chunk]` was indexed with chunk = 32 while the array holds
+   capture widths 1..16, so the lookup read out of bounds and the prefill was
+   skipped entirely (`TTFT 0.000 ms`, token 0). Guarded with `chunk <= 16`.
+
+After both fixes the path still produced no valid output (`TTFT 0.000 ms`,
+`Generated Tokens (1) : [0]`), so it was reverted rather than committed. The
+row/token mapping (`row = blockIdx.x * 2 + warp_id >> 1`,
+`tok_off = (warp_id & 1) * HALF`) and the `act_base` indexing are the remaining
+suspects; the next step is to compare the first layer's `act_base` output for
+the same 16 tokens between the chunk-16 and chunk-32 paths to isolate it in one
+measurement.
+
+Verified restored state after revert:
+
+```
+TTFT (Prefill Latency) : 9457.945 ms (prompt len = 1024)
+Generated Tokens (1)  : [200]
+```
