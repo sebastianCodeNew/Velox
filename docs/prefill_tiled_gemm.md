@@ -204,3 +204,32 @@ Verified restored state after revert:
 TTFT (Prefill Latency) : 9457.945 ms (prompt len = 1024)
 Generated Tokens (1)  : [200]
 ```
+
+### Resolution: the split is correct but does not help
+
+The failure was a dispatch bug, not a mapping bug. The `DISPATCH_CASE(17..32)`
+entries had been inserted with 12-space indentation, but after the chunk body
+was extracted the switch lives in `velox_prefill_chunk_body` with 8-space
+indentation, so the insertion silently matched nothing. Chunk 32 fell through to
+`default:`, which calls the generated decode DAG (out-of-arena offsets) and
+therefore produced no valid output.
+
+With the correct indentation the split path works and preserves quality:
+
+| Prompt | chunk 16 | chunk 32 (split) |
+|---:|---:|---:|
+| 32 | 237 ms | 269 ms |
+| 256 | 1974 ms | 2223 ms |
+| 1024 | 8480 ms | 9178 ms |
+
+Chat output remains coherent, so the numerics are correct. But chunk 32 is
+**slower at every size**, so halving L2 weight traffic per token does not help:
+the L2-traffic hypothesis is falsified as well.
+
+Combined with the earlier results (shared-memory activation tiling slower,
+occupancy neutral, CUDA graphs neutral), the evidence now rules out DRAM
+traffic, L2 traffic, launch overhead, and occupancy as the binding constraint.
+The remaining candidate is the dequantization instruction mix or L2 *bandwidth*
+(2.7 TB/s measured) rather than L2 *traffic*, which would need a different
+kernel structure (vectorized dequant, dp4a, or tensor cores) rather than
+tiling or chunking.
