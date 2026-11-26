@@ -1447,6 +1447,10 @@ static void velox_evaluate_lm_head_batched_legacy(
 
 static int g_spec_stochastic = 0;
 static int g_suppress_report = 0;
+// Decode equivalence harness: 0 = generated decode DAG (production),
+// 1 = batched B=1 kernels. Used to find the first divergent token.
+static int g_decode_path = 0;
+
 static uint32_t g_stop_tokens[16];
 static int g_num_stop_tokens = 0;
 
@@ -1822,6 +1826,9 @@ int main(int argc, char** argv) {
             max_draft_len = atoi(argv[++i]);
             if (max_draft_len <= 0) max_draft_len = 3;
             if (max_draft_len > 7) max_draft_len = 7;
+        } else if (strcmp(argv[i], "--decode-path") == 0 && i + 1 < argc) {
+            const char* v = argv[++i];
+            g_decode_path = (strcmp(v, "batched") == 0) ? 1 : 0;
         } else if (strcmp(argv[i], "--stop-tokens") == 0 && i + 1 < argc) {
             const char* list = argv[++i];
             char* copy = _strdup(list);
@@ -1860,6 +1867,7 @@ int main(int argc, char** argv) {
             printf("  --spec-ema <x>         Adaptive drafting: EMA acceptance floor (default 0.20)\n");
             printf("  --serve-stdin          Persistent mode: load weights once, read prompts from stdin\n");
             printf("  --stop-tokens <ids>    Comma-separated token IDs that end generation\n");
+            printf("  --decode-path <p>      dag (default) or batched; debug equivalence harness\n");
             printf("  --spec-stochastic      Lossless stochastic verification (accept with p(draft))\n");
             printf("  --spec-seed <N>        Seed for stochastic verification nonces\n");
             printf("  --steps <N>            Autoregressive decode steps (default: 16)\n");
@@ -2193,7 +2201,15 @@ int main(int argc, char** argv) {
 
             size_t pos = n;
             for (size_t s = 1; s < turn_steps && gen < 1024 && !stopped; ++s) {
-                velox_K2_Horizon_3_7B_decode_cuda(&ctx, next_tok, pos, 1ULL, stream);
+                if (g_decode_path == 1) {
+                    // Batched B=1 path: static arena offsets, valid logits.
+                    cudaMemcpyAsync(d_tokens, &next_tok, sizeof(uint32_t), cudaMemcpyHostToDevice, stream);
+                    velox_cuda_init_positions<<<1, 32, 0, stream>>>(d_positions, pos, 1);
+                    velox_run_batched_layers_q4<1>(&ctx, hidden_base, norm_base, q_base, act_base, d_positions, stream);
+                    velox_evaluate_lm_head_batched(&ctx, hidden_base, 1, d_positions, d_tokens, stream);
+                } else {
+                    velox_K2_Horizon_3_7B_decode_cuda(&ctx, next_tok, pos, 1ULL, stream);
+                }
                 cudaStreamSynchronize(stream);
                 next_tok = ctx.host_pinned_ring[pos & (VELOX_HOST_RING_SLOTS - 1ULL)];
                 pos++;
