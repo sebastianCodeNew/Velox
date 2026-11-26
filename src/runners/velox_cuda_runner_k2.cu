@@ -2669,9 +2669,15 @@ int main(int argc, char** argv) {
     if (has_weights_file) {
         printf("Weight Stream to VRAM  : %.2f ms\n", weight_load_ms);
     }
-    printf("Device VRAM Allocated  : %.2f MiB (%.2f%% of 4096 MiB RTX 3050)\n",
-           (double)(weight_bytes + scales_bytes + act_arena_bytes) / (1024.0 * 1024.0),
-           ((double)(weight_bytes + scales_bytes + act_arena_bytes) / (double)prop.totalGlobalMem) * 100.0);
+    // Report the true total: weights + scales + activation arena + KV pool.
+    // The KV pool was previously omitted, understating VRAM by 576 MiB.
+    {
+        const double total_vram_bytes = (double)(weight_bytes + scales_bytes + act_arena_bytes)
+                                      + (double)kv_pool_bytes;
+        printf("Device VRAM Allocated  : %.2f MiB (%.2f%% of 4096 MiB RTX 3050)\n",
+               total_vram_bytes / (1024.0 * 1024.0),
+               (total_vram_bytes / (double)prop.totalGlobalMem) * 100.0);
+    }
     if (is_kv_in_vram) {
         printf("KV Cache Allocation    : %.2f MiB in Dedicated GPU VRAM (%llu Tokens, 155 GB/s GDDR6)\n",
                (double)kv_pool_bytes / (1024.0 * 1024.0), (unsigned long long)VELOX_MODEL_MAX_SEQ_LEN);
