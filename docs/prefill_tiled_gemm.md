@@ -118,3 +118,40 @@ The analysis is complete and the design is concrete, but the kernel is not
 written. The activation-traffic term is two orders of magnitude above the weight
 term, so this is the highest-leverage change available; it is also the largest
 and riskiest, which is why it is specified rather than half-implemented.
+
+## 8. Experimental result: hypothesis falsified
+
+The tiled kernel from section 4 was implemented and measured (4 rows per block,
+256-wide K tile, 8 KB shared, cooperative load, unchanged dequantization, 0
+register spills per `ptxas -v`):
+
+| Prompt | Original | Tiled | Verdict |
+|---:|---:|---:|---|
+| 256 | 1974 ms | 2155 ms | 9% slower |
+| 1024 | 8480 ms | 9060 ms | 7% slower |
+
+Correctness was preserved (identical coherent output), so the regression is
+performance, not numerics. The kernel was reverted.
+
+**Conclusion: the activation tile is already L2-resident.** If DRAM traffic were
+the limiter, cutting it 4x would have helped; it did not, so the shared-memory
+load and its `__syncthreads` are pure overhead. The real limiter is therefore
+L2 bandwidth or dequantization/ALU throughput, not DRAM traffic.
+
+This also explains why occupancy changes (2 -> 8 blocks/SM) did nothing: the
+kernel is neither DRAM-latency- nor occupancy-bound.
+
+### What the evidence now points to
+
+1. **L2 bandwidth** — the 164 KB tile is re-read from L2 once per output row.
+   Reducing L2 traffic requires *row blocking* (reuse the weight tile across
+   multiple output rows), not activation tiling.
+2. **Dequantization ALU** — each weight element costs a LOP3, a subtract, a
+   half2->float conversion, and two FMAs. That is ~6 instructions per 4-bit
+   weight, which caps throughput independently of memory.
+3. **Tensor cores** — the only way past the ALU ceiling, but Q4 requires
+   dequantization first, so it needs a fused dequant-then-mma pipeline.
+
+Any further attempt should be preceded by a profiler measurement
+(`ncu --metrics l2_tex_read_bytes.sum`, `sm__inst_executed.sum`) to identify
+which of the three is binding, rather than another roofline guess.
