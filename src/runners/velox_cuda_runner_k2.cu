@@ -1447,6 +1447,76 @@ static void velox_evaluate_lm_head_batched_legacy(
 
 static int g_spec_stochastic = 0;
 static int g_suppress_report = 0;
+// Host-side sampler over a readable logits row (temperature + min-p + top-k).
+static float g_temperature = 0.0f;
+static float g_min_p = 0.0f;
+static int   g_top_k = 0;
+static unsigned long long g_sample_seed = 0x5EED0F5EED0F5EULL;
+
+static unsigned long long velox_rng_next(void) {
+    unsigned long long z = (g_sample_seed += 0x9E3779B97F4A7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+
+static float velox_rng_f32(void) {
+    return (float)(velox_rng_next() >> 40) * (1.0f / 16777216.0f);
+}
+
+static uint32_t velox_sample_logits(const float* dev_logits, float* h) {
+    const size_t vocab = VELOX_VOCAB_SIZE;
+    cudaMemcpy(h, dev_logits, vocab * sizeof(float), cudaMemcpyDeviceToHost);
+
+    if (g_temperature <= 1e-5f) {
+        uint32_t best = 0; float bv = -INFINITY;
+        for (size_t i = 0; i < vocab; ++i) if (h[i] > bv) { bv = h[i]; best = (uint32_t)i; }
+        return best;
+    }
+
+    const float inv_t = 1.0f / g_temperature;
+    float mx = -INFINITY;
+    for (size_t i = 0; i < vocab; ++i) { float v = h[i] * inv_t; h[i] = v; if (v > mx) mx = v; }
+
+    double sum = 0.0;
+    for (size_t i = 0; i < vocab; ++i) { float w = expf(h[i] - mx); h[i] = w; sum += w; }
+    if (!(sum > 0.0) || !isfinite((float)sum)) return 0;
+
+    const float min_p_abs = (g_min_p > 0.0f) ? (g_min_p / (float)sum) : 0.0f;
+    int k = (g_top_k > 0 && g_top_k < (int)vocab) ? g_top_k : 0;
+
+    if (k > 0) {
+        uint32_t ti[64]; float tv[64]; int tn = 0;
+        for (size_t i = 0; i < vocab; ++i) {
+            float w = h[i];
+            if (w < min_p_abs) continue;
+            if (tn < k) {
+                int pos = tn++;
+                while (pos > 0 && tv[pos-1] < w) { tv[pos]=tv[pos-1]; ti[pos]=ti[pos-1]; pos--; }
+                tv[pos]=w; ti[pos]=(uint32_t)i;
+            } else if (w > tv[k-1]) {
+                int pos = k - 1;
+                while (pos > 0 && tv[pos-1] < w) { tv[pos]=tv[pos-1]; ti[pos]=ti[pos-1]; pos--; }
+                tv[pos]=w; ti[pos]=(uint32_t)i;
+            }
+        }
+        if (tn == 0) return 0;
+        double kept = 0.0; for (int i=0;i<tn;++i) kept += tv[i];
+        double target = velox_rng_f32() * kept, run = 0.0;
+        for (int i = 0; i < tn; ++i) { run += tv[i]; if (run >= target) return ti[i]; }
+        return ti[tn-1];
+    }
+
+    double target = velox_rng_f32() * sum, run = 0.0;
+    for (size_t i = 0; i < vocab; ++i) {
+        float w = h[i];
+        if (w < min_p_abs) continue;
+        run += w;
+        if (run >= target) return (uint32_t)i;
+    }
+    return 0;
+}
+
 // Decode equivalence harness: 0 = generated decode DAG (production),
 // 1 = batched B=1 kernels. Used to find the first divergent token.
 static int g_decode_path = 0;
@@ -1826,6 +1896,14 @@ int main(int argc, char** argv) {
             max_draft_len = atoi(argv[++i]);
             if (max_draft_len <= 0) max_draft_len = 3;
             if (max_draft_len > 7) max_draft_len = 7;
+        } else if (strcmp(argv[i], "--temperature") == 0 && i + 1 < argc) {
+            g_temperature = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--min-p") == 0 && i + 1 < argc) {
+            g_min_p = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--top-k") == 0 && i + 1 < argc) {
+            g_top_k = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--sample-seed") == 0 && i + 1 < argc) {
+            g_sample_seed = (unsigned long long)strtoull(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--decode-path") == 0 && i + 1 < argc) {
             const char* v = argv[++i];
             g_decode_path = (strcmp(v, "batched") == 0) ? 1 : 0;
@@ -1868,6 +1946,10 @@ int main(int argc, char** argv) {
             printf("  --serve-stdin          Persistent mode: load weights once, read prompts from stdin\n");
             printf("  --stop-tokens <ids>    Comma-separated token IDs that end generation\n");
             printf("  --decode-path <p>      dag (default) or batched; debug equivalence harness\n");
+            printf("  --temperature <t>      Sampling temperature; <= 0 keeps greedy argmax\n");
+            printf("  --top-k <n>            Keep only the n highest-logit tokens (0 disables)\n");
+            printf("  --min-p <p>            Minimum probability relative to the top token\n");
+            printf("  --sample-seed <n>      Seed for the sampling RNG\n");
             printf("  --spec-stochastic      Lossless stochastic verification (accept with p(draft))\n");
             printf("  --spec-seed <N>        Seed for stochastic verification nonces\n");
             printf("  --steps <N>            Autoregressive decode steps (default: 16)\n");
@@ -2163,6 +2245,9 @@ int main(int argc, char** argv) {
         uint32_t turn_tokens[16384];
         uint32_t turn_out[1024];
         size_t turn_steps = steps;
+        const int sampling = (g_temperature > 1e-5f);
+        float* h_logits = (float*)malloc(VELOX_VOCAB_SIZE * sizeof(float));
+        if (!h_logits) { fprintf(stderr, "[serve] logits buffer allocation failed\n"); return 1; }
 
         g_suppress_report = 1;
         fprintf(stderr, "[serve] ready: weights resident, awaiting prompts on stdin\n");
@@ -2195,23 +2280,35 @@ int main(int argc, char** argv) {
             cudaStreamSynchronize(stream);
 
             size_t gen = 0;
-            uint32_t next_tok = ctx.host_pinned_ring[(n - 1) & (VELOX_HOST_RING_SLOTS - 1ULL)];
+            uint32_t next_tok = sampling
+                ? velox_sample_logits((const float*)((uint8_t*)ctx.activation_arena + 6931456ULL), h_logits)
+                : ctx.host_pinned_ring[(n - 1) & (VELOX_HOST_RING_SLOTS - 1ULL)];
             int stopped = velox_is_stop_token(next_tok);
             if (turn_steps > 0 && gen < 1024 && !stopped) turn_out[gen++] = next_tok;
 
             size_t pos = n;
             for (size_t s = 1; s < turn_steps && gen < 1024 && !stopped; ++s) {
-                if (g_decode_path == 1) {
+                if (g_decode_path == 1 || sampling) {
                     // Batched B=1 path: static arena offsets, valid logits.
                     cudaMemcpyAsync(d_tokens, &next_tok, sizeof(uint32_t), cudaMemcpyHostToDevice, stream);
                     velox_cuda_init_positions<<<1, 32, 0, stream>>>(d_positions, pos, 1);
+                    // The batched layer runner consumes embeddings from
+                    // hidden_base; without this the decode step reuses the
+                    // prefill's stale hidden row.
+                    velox_cuda_embed_batched_q4<<<dim3((VELOX_HIDDEN_DIM / 8ULL + 255) / 256, 1), dim3(256), 0, stream>>>(
+                        hidden_base, d_tokens,
+                        VELOX_DEV_W_Q4_PTR(&ctx, 0ULL), VELOX_DEV_S_Q4_PTR(&ctx, 0ULL),
+                        1, VELOX_HIDDEN_DIM);
                     velox_run_batched_layers_q4<1>(&ctx, hidden_base, norm_base, q_base, act_base, d_positions, stream);
                     velox_evaluate_lm_head_batched(&ctx, hidden_base, 1, d_positions, d_tokens, stream);
                 } else {
                     velox_K2_Horizon_3_7B_decode_cuda(&ctx, next_tok, pos, 1ULL, stream);
                 }
                 cudaStreamSynchronize(stream);
-                next_tok = ctx.host_pinned_ring[pos & (VELOX_HOST_RING_SLOTS - 1ULL)];
+                next_tok = sampling
+                    ? velox_sample_logits(
+                          (const float*)((uint8_t*)ctx.activation_arena + VELOX_VERIFY_LOGITS_BASE), h_logits)
+                    : ctx.host_pinned_ring[pos & (VELOX_HOST_RING_SLOTS - 1ULL)];
                 pos++;
                 if (velox_is_stop_token(next_tok)) break;
                 turn_out[gen++] = next_tok;
@@ -2240,6 +2337,7 @@ int main(int argc, char** argv) {
             cudaFreeHost(h_kv_cache);
         }
         cudaFreeHost(h_ring);
+        free(h_logits);
         if (has_weights_file) {
             win32_gguf_close(&gguf_map);
         }

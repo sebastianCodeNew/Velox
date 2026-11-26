@@ -873,7 +873,17 @@ struct PersistentRunner {
 }
 
 impl PersistentRunner {
-    fn spawn(exe: &Path, weights: &str, steps: usize, stop_tokens: &[u32]) -> Result<Self, String> {
+    #[allow(clippy::too_many_arguments)]
+    fn spawn(
+        exe: &Path,
+        weights: &str,
+        steps: usize,
+        stop_tokens: &[u32],
+        temperature: f32,
+        top_k: usize,
+        min_p: f32,
+        seed: u64,
+    ) -> Result<Self, String> {
         use std::io::BufRead;
         let mut child = Command::new(exe)
             .arg("--weights")
@@ -889,6 +899,14 @@ impl PersistentRunner {
                     .collect::<Vec<_>>()
                     .join(","),
             )
+            .arg("--temperature")
+            .arg(temperature.to_string())
+            .arg("--top-k")
+            .arg(top_k.to_string())
+            .arg("--min-p")
+            .arg(min_p.to_string())
+            .arg("--sample-seed")
+            .arg(seed.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -1886,10 +1904,24 @@ fn execute_compilation(
                 .map(|(_, id)| *id)
                 .collect();
 
+            // Greedy argmax makes a reasoning model loop inside its thinking
+            // block, so chat defaults to sampling. Explicit flags still win.
+            let chat_temp = if cli_args.temperature > 1e-5 { cli_args.temperature } else { 0.7 };
+            let chat_top_k = if cli_args.top_k > 0 { cli_args.top_k } else { 40 };
+            let chat_min_p = if cli_args.min_p > 0.0 { cli_args.min_p } else { 0.05 };
+
             let mut persistent: Option<PersistentRunner> = match (effective_backend, runner_path.as_ref()) {
-                (ExecutionBackend::Cuda, Some(path)) => {
-                    PersistentRunner::spawn(path, &weights_file, chat_steps, &stop_ids).ok()
-                }
+                (ExecutionBackend::Cuda, Some(path)) => PersistentRunner::spawn(
+                    path,
+                    &weights_file,
+                    chat_steps,
+                    &stop_ids,
+                    chat_temp,
+                    chat_top_k,
+                    chat_min_p,
+                    cli_args.seed,
+                )
+                .ok(),
                 _ => None,
             };
             if persistent.is_none() && effective_backend == ExecutionBackend::Cuda {
