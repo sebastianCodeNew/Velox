@@ -194,3 +194,16 @@ Conclusion: the ALU is not the binding constraint for these kernels, so
 widening the datapath does not help. The remaining options are tensor cores
 (phase 3) or accepting the current prefill performance. This plan is closed
 without a landed change.
+## 11. Inline-conversion variant (also slower)
+
+Converting FP32 to half2 inline (no separate kernel, no scratch round-trip)
+removed the extra launch but made things worse:
+
+| Variant | Prefill 1024 |
+|---|---|
+| FP32 reference | 8463 ms |
+| half2, separate conversion kernel | 9708 ms |
+| half2, inline conversion | 13633 ms |
+
+Scalar half arithmetic (`__hmul`, `__hadd`) is emulated at 32-bit width on
+sm_86 and costs more than the float path it replaces. FP16 SwiGLU is closed.
