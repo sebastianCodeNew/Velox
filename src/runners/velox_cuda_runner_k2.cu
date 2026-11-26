@@ -2000,6 +2000,12 @@ int main(int argc, char** argv) {
         } else if (strcmp(argv[i], "--decode-path") == 0 && i + 1 < argc) {
             const char* v = argv[++i];
             g_decode_path = (strcmp(v, "dag") == 0) ? 0 : 1;
+            if (g_decode_path == 0) {
+                fprintf(stderr,
+                    "[warn] --decode-path dag uses the generated decode DAG, whose per-layer\n"
+                    "      activation offsets (~12.2 GB) exceed the 125 MiB arena. It is kept\n"
+                    "      only as a reference oracle; do not use it for real workloads.\n");
+            }
         } else if (strcmp(argv[i], "--stop-tokens") == 0 && i + 1 < argc) {
             const char* list = argv[++i];
             char* copy = _strdup(list);
